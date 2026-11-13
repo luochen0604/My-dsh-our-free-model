@@ -42681,6 +42681,8 @@ var LobsteraiAuth = class extends Service {
       ...this.options.fetcher === void 0 ? {} : { fetcher: this.options.fetcher }
     });
     this.identityStore = options.identityStore ?? createLobsteraiIdentityStore(ctx);
+    void lobsteraiTransport().then((transport) => this.ctx.logger?.info?.(`[lobsterai] \u63A7\u5236\u9762\u8BF7\u6C42\u4F20\u8F93\u5C42: ${transport.kind}`)).catch(() => {
+    });
   }
   /** 本实例所属的产品配置。 */
   product;

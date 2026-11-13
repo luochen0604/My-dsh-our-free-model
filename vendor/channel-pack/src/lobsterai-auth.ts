@@ -35,7 +35,7 @@ import {
   type LobsteraiIdentityFields,
 } from './lobsterai.js'
 import { LOBSTERAI_LOGOUT_PATH, LOBSTERAI_REFRESH_PATH } from './lobsterai.js'
-import { lobsteraiFetch } from './lobsterai-fetch.js'
+import { lobsteraiFetch, lobsteraiTransport } from './lobsterai-fetch.js'
 import { LOBSTERAI_PROFILE_SUMMARY_PATH } from './lobsterai-credits.js'
 import { createLobsteraiIdentityStore, type LobsteraiIdentity, type LobsteraiIdentityStore } from './lobsterai-identity.js'
 import { buildLobsteraiModelsUrl, parseLobsteraiModels, type LobsteraiRemoteModel } from './lobsterai-adapter.js'
@@ -203,6 +203,11 @@ export class LobsteraiAuth extends Service {
       ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
     })
     this.identityStore = options.identityStore ?? createLobsteraiIdentityStore(ctx)
+    // 记一条传输层事实：事后能把「参数问题」与「网络栈指纹问题」分开排查。
+    // 失败（纯 Node / 权限受限）由 lobsteraiTransport 自己回退，这里只报事实。
+    void lobsteraiTransport()
+      .then((transport) => this.ctx.logger?.info?.(`[lobsterai] 控制面请求传输层: ${transport.kind}`))
+      .catch(() => {})
   }
 
   /**
