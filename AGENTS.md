@@ -1,6 +1,6 @@
 # 本项目工作约定（agent 必读）
 
-`C:\Users\86189\Desktop\MyOurFreeModel` 是 `Ebony-Vinyl/dsh-our-free-model` 的本地 fork，用来加自己的功能。
+`E:\workbuddy\MyOurFreeModel`（本机 ASUS）与 `C:\Users\86189\Desktop\MyOurFreeModel`（另一台电脑）都是 `Ebony-Vinyl/dsh-our-free-model` 的本地 fork，用来加自己的功能。
 `origin` = `luochen0604/My-dsh-our-free-model`（我的分支），`upstream` = 上游（只读，push 已 `DISABLED`）。
 
 ## 硬性规则：所有改动必须经 GitHub 提交到我的分支
@@ -36,3 +36,17 @@
 
 - `FORK-WORKFLOW.md`：rebase 日常流程、回退办法
 - `SETUP-OTHER-PC.md`：换到另一台电脑时的完整配置步骤
+
+## 本机（ASUS / E:\workbuddy）专属规则
+
+本机仓库路径 `E:\workbuddy\MyOurFreeModel`；另一台电脑在 `C:\Users\86189\Desktop\MyOurFreeModel`。
+本机 DSH 宿主进程名是 `DeepSeek Harness`（`D:\Programs\DeepSeek Harness\DeepSeek Harness.exe`），主进程 = 启动时间最早的那个实例（有多个子进程，不要把子进程当主进程）。
+
+**规则一：本机所有 OFM 改动必须 commit 并 push 到 `origin`（GitHub）。**
+不允许只改工作区就收尾；改动必须进 GitHub，才能在两台电脑间同步。
+
+**规则二：每次改动后必须运行 `node scripts/check-ofm-process-freshness.mjs`**，与正在运行的 DSH 进程比对代码新鲜度。脚本做三方比对：仓库工作区指纹、profile 安装副本指纹（宿主实际加载的是 `C:\Users\ASUS\.dsh\profiles\desktop\node_modules\dsh-our-free-model`，不是仓库目录——硬链接易被"写新文件再替换"断开）、运行中主进程 StartTime。三种状态 `fresh` / `stale` / `unknown`，退出码 0 / 1 / 2；`--json` 输出机器可读结果；`--record` 只在明确 fresh 或用户确认重启后使用（把当前指纹记为已加载）。
+
+**规则三：结果为 `stale` 时，agent 必须主动、明确提醒用户「需要重启 DSH 才能生效」**（必要时在插件管理器里重装），不能默默结束。
+
+**本机推送凭证现状（push 会失败，如实处理）**：已生成 ed25519 key（`C:\Users\ASUS\.ssh\id_ed25519`，指纹 `SHA256:HbNRBaLgQ1UPy3hVv8/xMDE6pPvSL8YxtRkGvL4H68c`），等待用户把公钥加到 GitHub；`origin` 的 fetch 走 HTTPS + 代理 `http://127.0.0.1:7897`，push 计划改走 SSH。在公钥生效前 **push 会失败**，属正常状态，如实报告即可，不要反复重试。

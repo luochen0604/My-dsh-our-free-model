@@ -43,3 +43,6 @@ packages/desktop/src-tauri/.node-license-cache/
 packages/desktop/node_modules/
 
 _audit/
+
+# OFM 进程新鲜度检测的本机状态（含指纹记录），机器相关不进库
+.ofm-freshness-state.json
