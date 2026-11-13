@@ -76,6 +76,10 @@ const suites = [
   ['chan-relay', 'chan-relay-test.mjs', []],
   ['channel-pack', 'channel-pack-test.mjs', []],
   ['channel-pack-gate', 'channel-pack-gate-test.mjs', []],
+  // 凭据文档的读写：`records:` 段是 DSH 宿主自己的登录会话，插件脚本改
+  // `refs:` 时绝不能碰它（真实事故 2026-11-13：频繁掉登录）。
+  ['credentials-document', 'credentials-document-test.mjs', []],
+  ['credentials-scripts', 'credentials-scripts-test.mjs', []],
   ['auto-checkin-tick', 'auto-checkin-tick-test.mjs', []],
   ['channel-source', 'channel-pack-test.mjs', ['--source', '--channels-only']],
   ['channel-network', 'channel-network-test.mjs', []],

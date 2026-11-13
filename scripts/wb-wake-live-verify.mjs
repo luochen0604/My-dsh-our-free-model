@@ -17,6 +17,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import assert from 'node:assert/strict'
+import {
+  applyCredentialRefs,
+  readCredentialsDocument,
+  rewriteCredentialsFile,
+  unquoteYamlSingle,
+} from './lib/credentials-document.mjs'
 
 const homeFlag = process.argv.indexOf('--home')
 if (homeFlag === -1) throw new Error('用法: node scripts/wb-wake-live-verify.mjs --home <scratchDir>')
@@ -28,26 +34,36 @@ const redact = (value) => (typeof value === 'string'
   ? value.replace(/eyJ[A-Za-z0-9_.-]{20,}/g, '<jwt>')
   : value)
 
-/** `.credentials.yaml` 的最小实现（version:1 refs/records）。 */
+/**
+ * `.credentials.yaml` 的读写：读走共享模块，写只改被显式标记过的 ref。
+ *
+ * ⚠️ 早期这里手写「两空格 KEY: 'value'」解析 + 全量重写：读不到 `records:`
+ * （DSH 宿主自己的登录会话）→ 重写时整段删掉 → 宿主掉登录（真实事故
+ * 2026-11-13）。共享模块逐字节保留其它段，并在落盘前做结构自检。
+ */
 function readCredentials() {
-  const text = fs.readFileSync(CRED_FILE, 'utf8')
-  const match = text.match(/^(version: \d+\n(?:refs|records):\n)/)
-  if (!match) throw new Error('凭据文件结构不是 version:1 refs/records')
-  const header = match[0]
+  const doc = readCredentialsDocument(fs.readFileSync(CRED_FILE, 'utf8'))
   const records = new Map()
-  for (const line of text.slice(header.length).split('\n')) {
-    const m = line.match(/^  ([A-Za-z_][A-Za-z0-9_]*): '(.*)'$/)
-    if (!m) continue
-    records.set(m[1], m[2].replaceAll("''", "'"))
-  }
-  return { header, records }
+  for (const [ref, raw] of doc.refs) records.set(ref, unquoteYamlSingle(raw))
+  return { records }
 }
 
 const store = readCredentials()
+/** 本次运行改过的 ref；写盘时只提交这些，其余行（含 records:）原样保留。 */
+const dirtyRefs = new Set()
 function writeCredentials() {
-  const lines = [store.header.trimEnd()]
-  for (const [ref, raw] of store.records) lines.push(`  ${ref}: '${raw.replaceAll("'", "''")}'`)
-  fs.writeFileSync(CRED_FILE, lines.join('\n') + '\n', 'utf8')
+  const updates = {}
+  const remove = []
+  for (const ref of dirtyRefs) {
+    const raw = store.records.get(ref)
+    if (raw === undefined) remove.push(ref)
+    else updates[ref] = raw
+  }
+  rewriteCredentialsFile(CRED_FILE, (text) => applyCredentialRefs(text, updates, {
+    remove,
+    allowedRemovedRefs: remove,
+  }))
+  dirtyRefs.clear()
 }
 
 const services = {
@@ -60,10 +76,12 @@ const services = {
     describe: async () => undefined,
     set: async (ref, value) => {
       store.records.set(ref, value)
+      dirtyRefs.add(ref)
       writeCredentials()
     },
     unset: async (ref) => {
       store.records.delete(ref)
+      dirtyRefs.add(ref)
       writeCredentials()
     },
   },

@@ -19,6 +19,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import assert from 'node:assert/strict'
+import {
+  applyCredentialRefs,
+  readCredentialsDocument,
+  rewriteCredentialsFile,
+  unquoteYamlSingle,
+} from './lib/credentials-document.mjs'
 
 const argv = process.argv.slice(2)
 const arg = (name, fallback) => {
@@ -32,30 +38,26 @@ if (scratch === '' || ref === '') throw new Error('用法: --home <scratch> --re
 
 const redact = (value) => (typeof value === 'string' ? value.replace(/eyJ[A-Za-z0-9_.-]{20,}/g, '<jwt>') : value)
 
-function readCredentials(file) {
-  const text = fs.readFileSync(file, 'utf8')
-  const match = text.match(/^(version: \d+\n(?:refs|records):\n)/)
-  if (!match) throw new Error(`凭据文件结构不是 version:1 refs/records: ${file}`)
-  return { header: match[0], records: text.slice(match[0].length) }
-}
-const parseLines = (body) => {
+/**
+ * `.credentials.yaml` 的读写 —— 统一走共享模块。
+ *
+ * ⚠️ 这里曾手写「两空格 KEY: 'value'」解析 + 全量重写，读不到 `records:`
+ * （DSH 宿主自己的登录会话）→ 整段删除 → 宿主掉登录（真实事故 2026-11-13）。
+ * 共享模块只改点名 ref，其余段逐字节保留，落盘前做结构自检。
+ */
+function readCredentialRefs(file) {
+  const doc = readCredentialsDocument(fs.readFileSync(file, 'utf8'))
   const records = new Map()
-  for (const line of body.split('\n')) {
-    const m = line.match(/^  ([A-Za-z_][A-Za-z0-9_]*): '(.*)'$/)
-    if (!m) continue
-    records.set(m[1], m[2].replaceAll("''", "'"))
-  }
+  for (const [name, raw] of doc.refs) records.set(name, unquoteYamlSingle(raw))
   return records
 }
-const serialize = (header, records) => {
-  const lines = [header.trimEnd()]
-  for (const [name, raw] of records) lines.push(`  ${name}: '${raw.replaceAll("'", "''")}'`)
-  return lines.join('\n') + '\n'
+/** 只提交这一个 ref；其它行（含 records:）保持原样。 */
+function writeCredentialRef(file, name, raw) {
+  rewriteCredentialsFile(file, (text) => applyCredentialRefs(text, { [name]: raw }))
 }
 
 const credFile = path.join(scratch, '.credentials.yaml')
-const parsed = readCredentials(credFile)
-const records = parseLines(parsed.records)
+const records = readCredentialRefs(credFile)
 const originalRaw = records.get(ref)
 assert.ok(originalRaw, `scratch 副本里没有 ${ref}`)
 const unimplemented = JSON.parse(originalRaw)
@@ -71,7 +73,7 @@ const expiringAccessToken = [
   'artificial',
 ].join('.')
 records.set(ref, JSON.stringify({ ...original, accessToken: expiringAccessToken }))
-fs.writeFileSync(credFile, serialize(parsed.header, records), 'utf8')
+writeCredentialRef(credFile, ref, records.get(ref))
 console.log(`已将 ${ref} 的 accessToken 替换为「5 分钟后过期」的人造 JWT（refreshToken 保持真实值）`)
 
 // ── 挂载 pack，走真实 RPC ──
@@ -85,9 +87,15 @@ const services = {
     describe: async () => undefined,
     set: async (name, value) => {
       records.set(name, value)
-      fs.writeFileSync(credFile, serialize(parsed.header, records), 'utf8')
+      writeCredentialRef(credFile, name, value)
     },
-    unset: async (name) => { records.delete(name); fs.writeFileSync(credFile, serialize(parsed.header, records), 'utf8') },
+    unset: async (name) => {
+      records.delete(name)
+      rewriteCredentialsFile(credFile, (text) => applyCredentialRefs(text, {}, {
+        remove: [name],
+        allowedRemovedRefs: [name],
+      }))
+    },
   },
   llm: { registerAdapter() {}, listProviders: () => [] },
   connection: { fetch: { register() {} } },
@@ -162,15 +170,11 @@ assert.ok(row?.status !== null, '续期后探活必须成功（新 token 可用�
 console.log(`         探活成功：streak=${row.status.streakDays} today=${row.status.todayCheckedIn}`)
 
 if (persistTo !== '') {
-  const real = readCredentials(persistTo)
-  const realRecords = parseLines(real.records)
-  assert.ok(realRecords.has(ref), `真实凭据文件里没有 ${ref}`)
+  // ⚠️ 只写回这一个 ref；records:（宿主登录会话）逐字节保留 + 结构自检。
+  assert.ok(readCredentialRefs(persistTo).has(ref), `真实凭据文件里没有 ${ref}`)
   fs.copyFileSync(persistTo, `${persistTo}.bak-wbrenew-${Date.now()}`)
-  realRecords.set(ref, JSON.stringify(after))
-  const temp = `${persistTo}.wbrenew-tmp-${process.pid}`
-  fs.writeFileSync(temp, serialize(real.header, realRecords), 'utf8')
-  fs.renameSync(temp, persistTo)
-  const verify = parseLines(readCredentials(persistTo).records).get(ref)
+  writeCredentialRef(persistTo, ref, JSON.stringify(after))
+  const verify = readCredentialRefs(persistTo).get(ref)
   const verifyParsed = JSON.parse(verify)
   assert.equal(verifyParsed.accessToken, after.accessToken, '回写校验：accessToken 不一致')
   assert.equal(verifyParsed.refreshToken, after.refreshToken, '回写校验：refreshToken 不一致')

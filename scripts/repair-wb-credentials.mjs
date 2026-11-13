@@ -31,6 +31,10 @@
  *
  * - 只改 `provider=workbuddy` 对应 ref 的**编码形态**与 `expiresAt`，
  *   令牌值原样保留（轮换只发生在 OFM 唤醒时）。
+ * - ⚠️ 改写走 `scripts/lib/credentials-document.mjs`：它逐行保留 `records:`
+ *   段（DSH 宿主自己的登录会话）。本脚本早期手写的「两空格 KEY: 'value'」
+ *   解析器读不到 `records:` 的 `scope/id` 条目，重写会把整段删掉 —— 那会让
+ *   DSH 掉登录（真实事故，2026-11-13）。现在结构自检会在落盘前拦下这种改写。
  * - 所有输出对 token 做 redact；令牌绝不进仓库任何文件。
  * - 写前备份、写后读回校验；`persist-lost` 表示 DSH 宿主覆盖了写入，
  *   关闭 DSH 后重跑即可固化（幂等，重跑无副作用）。
@@ -40,6 +44,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { execFileSync } from 'node:child_process'
+import {
+  applyCredentialRefs,
+  readCredentialsDocument,
+  rewriteCredentialsFile,
+  unquoteYamlSingle,
+} from './lib/credentials-document.mjs'
 
 const DRY_RUN = process.argv.includes('--dry-run')
 
@@ -54,50 +64,45 @@ const redact = (value) => {
   return value.length <= 8 ? '<redacted>' : `${value.slice(0, 4)}…<redacted len=${value.length}>`
 }
 
-/** `.credentials.yaml` 的最小读写（version:1，`refs:`/`records:` 两种段名都见过）。 */
+/**
+ * `.credentials.yaml` 的读取 —— 委托给共享模块。
+ *
+ * ⚠️ 这里曾经有一份「只认两空格 `  KEY: 'value'`」的手写解析器 + 全量重写。
+ * `records:` 段（DSH 宿主自己的登录会话）的键形如
+ * `deepseek-account-platform/default`，正则匹配不上 → 被静默丢弃 →
+ * 重写后整段消失 → 宿主认为没登录 → **用户被要求重新登录**。
+ * 共享模块逐行保留该段，并在落盘前做结构自检。
+ *
+ * 返回 `{ header, records, rawByName }` 以保持调用方不变：
+ * - `records[ref]`：`JSON.parse` 后的值（失败则原样字符串）
+ * - `rawByName[ref]`：单引号内的原始文本（用于识别二次编码）
+ */
 function parseCredentialYaml(text) {
-  // ⚠️ 段名历史上出现过两种写法（本机现网是 `refs:`，旧文档/旧版本写 `records:`）。
-  // 只认一种会让脚本在真实文件上直接报「结构不符」—— 那是**脚本**失效，
-  // 而用户会把它读成「凭据文件坏了」。两种都接受，并原样保留段名。
-  const match = text.match(/^(version: \d+\n(?:refs|records):\n)/)
-  if (!match) throw new Error('凭据文件结构不是 version:1 refs/records，停止修复（不要猜）')
-  const header = match[0]
-  const body = text.slice(header.length)
+  const doc = readCredentialsDocument(text)
   const records = {}
-  // ⚠️ 这里刻意**记录原始文本** `raw`：修复的正是「原始文本被二次编码」，
-  // 只用 `JSON.parse` 后的值无法区分「本来就是字符串」与「被多包了一层」。
   const rawByName = {}
-  for (const line of body.split('\n')) {
-    const m = line.match(/^  ([A-Za-z_][A-Za-z0-9_]*): '(.*)'$/)
-    if (!m) continue
-    const raw = m[2].replaceAll("''", "'")
-    rawByName[m[1]] = raw
-    let value
+  for (const [ref, raw] of doc.refs) {
+    const unquoted = unquoteYamlSingle(raw)
+    rawByName[ref] = unquoted
     try {
-      value = JSON.parse(raw)
+      records[ref] = JSON.parse(unquoted)
     } catch {
-      value = raw // 非 JSON 的纯文本凭据（如 API key）原样保留
+      records[ref] = unquoted // 非 JSON 的纯文本凭据（如 API key）原样保留
     }
-    records[m[1]] = value
   }
-  return { header, records, rawByName }
+  return { header: `${doc.header}refs:\n`, records, rawByName }
 }
 
-/** 字符串原样写出、对象序列化 —— 与 import 脚本修复后的判据保持一致。 */
-function serializeCredentialYaml(header, records) {
-  const lines = [header.trimEnd()]
-  for (const [ref, value] of Object.entries(records)) {
-    const raw = typeof value === 'string' ? value : JSON.stringify(value)
-    const escaped = raw.replaceAll("'", "''")
-    lines.push(`  ${ref}: '${escaped}'`)
-  }
-  return lines.join('\n') + '\n'
-}
-
+/** 原子落盘（仅 state.json 用；凭据走共享模块的 rewriteCredentialsFile）。 */
 function atomicWrite(file, text) {
   const temp = `${file}.wbrepair-tmp-${process.pid}`
   fs.writeFileSync(temp, text, 'utf8')
   fs.renameSync(temp, file)
+}
+
+/** 原子落盘：走共享模块，带 `records:` 结构自检。 */
+function writeCredentialRefs(file, updates) {
+  return rewriteCredentialsFile(file, (text) => applyCredentialRefs(text, updates))
 }
 
 function backup(file) {
@@ -237,8 +242,9 @@ function main() {
 
   if (rewrites.length > 0) {
     console.log(`已备份: ${backup(CRED_FILE)}`)
-    for (const entry of rewrites) yaml.records[entry.ref] = entry.serialized
-    atomicWrite(CRED_FILE, serializeCredentialYaml(yaml.header, yaml.records))
+    const updates = Object.fromEntries(rewrites.map((entry) => [entry.ref, entry.serialized]))
+    // ⚠️ 只改这些 ref；records:（宿主登录会话）逐字节保留，结构自检不过就抛错不落盘。
+    writeCredentialRefs(CRED_FILE, updates)
   }
   if (stateFix.length > 0) {
     console.log(`已备份: ${backup(STATE_FILE)}`)

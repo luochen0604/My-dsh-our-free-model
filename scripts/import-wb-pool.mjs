@@ -33,6 +33,16 @@
  *
  * - token / refreshToken 只写进 `$DSH_HOME` 的凭据文件，绝不进仓库任何文件。
  * - 所有输出对 token 字段做 redact。
+ *
+ * ## ⚠️ 凭据文档的读写必须走共享模块
+ *
+ * 本脚本早期手写了一份「两空格 `  KEY: 'value'`」极简解析器 + 全量重写。
+ * `.credentials.yaml` 有两个段：`refs:`（插件凭据）与 `records:`（**DSH 宿主
+ * 自己的登录会话**，键形如 `deepseek-account-platform/default` + 嵌套 mapping）。
+ * 极简解析器读不到 `records:` 的条目 → 重写时整段删掉 → 宿主以为没登录 →
+ * 用户被要求重新登录（真实事故，2026-11-13）。现在统一走
+ * `scripts/lib/credentials-document.mjs`：只改点名的 ref，其余逐字节保留，
+ * 且落盘前做结构自检。
  */
 
 import fs from 'node:fs'
@@ -40,6 +50,7 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { applyCredentialRefs, readCredentialsDocument, rewriteCredentialsFile } from './lib/credentials-document.mjs'
 
 const DRY_RUN = process.argv.includes('--dry-run')
 
@@ -141,54 +152,34 @@ function backup(file) {
   return target
 }
 
-// ── .credentials.yaml 的最小读写（version:1 records 结构，单引号 JSON 字符串） ──
+// ── .credentials.yaml 读写：委托共享模块（逐行保留 records: 宿主登录会话） ──
 
+/**
+ * 读凭据文档，返回 `{ header, records }` 以保持调用方不变。
+ *
+ * ⚠️ 这里曾是一份「只认两空格 `  KEY: 'value'`」的手写解析器，读不到
+ * `records:`（宿主登录会话，键含 `/` 且是嵌套 mapping）→ 重写时整段丢失。
+ */
 function parseCredentialYaml(text) {
-  // ⚠️ 段名两种写法都见过（现网 `refs:`，旧文档 `records:`）：只认一种会让脚本
-  // 在真实文件上直接报「结构不符」，用户会误读成凭据文件损坏。两种都接受。
-  const match = text.match(/^(version: \d+\n(?:refs|records):\n)/)
-  if (!match) throw new Error('凭据文件结构不是 version:1 refs/records，停止导入（不要猜）')
-  const header = match[0]
-  const body = text.slice(header.length)
+  const doc = readCredentialsDocument(text)
   const records = {}
-  // 记录形如 `  REF_NAME: '<yaml 单引号字符串>'`（值内部的单引号会转义成两个单引号）。
-  // 为避免完整 YAML 解析器依赖，只处理我们关心的 _ACCOUNT_ 记录并原样保留其余行。
-  for (const line of body.split('\n')) {
-    const m = line.match(/^  ([A-Za-z_][A-Za-z0-9_]*): '(.*)'$/)
-    if (m) {
-      const raw = m[2].replaceAll("''", "'")
-      let value
-      try {
-        value = JSON.parse(raw)
-      } catch {
-        value = raw // 非 JSON 的纯文本凭据（如 API key）原样保留
-      }
-      records[m[1]] = value
+  for (const [ref, raw] of doc.refs) {
+    const unquoted = raw.replaceAll("''", "'")
+    try {
+      records[ref] = JSON.parse(unquoted)
+    } catch {
+      records[ref] = unquoted // 非 JSON 的纯文本凭据（如 API key）原样保留
     }
   }
-  return { header, records }
+  return { header: `${doc.header}refs:\n`, records }
 }
 
-function serializeCredentialYaml(header, records) {
-  const lines = [header.trimEnd()]
-  for (const [ref, value] of Object.entries(records)) {
-    /**
-     * ⚠️ **字符串值必须原样写出，绝不能再 `JSON.stringify` 一次**。
-     *
-     * 历史缺陷（真实事故：WorkBuddy 账号唤醒全失败）：旧判据是
-     * 「以 `{` 开头的就当对象再序列化」，而 `buildCredentialJson()` 产出的
-     * **就是**一段以 `{` 开头的 JSON 文本 —— 于是被二次编码成
-     * `'"{""uid"":""…""}"'`。读回 `JSON.parse` 只解一层得到 `string`，
-     * OFM 侧 `credential.accessToken` 因此是 `undefined`，唤醒直接抛
-     * 「凭据缺少 accessToken/uid」。
-     *
-     * 判据改为「按 JS 类型分派」：对象才序列化，字符串保持原样。
-     */
-    const raw = typeof value === 'string' ? value : JSON.stringify(value)
-    const escaped = raw.replaceAll("'", "''")
-    lines.push(`  ${ref}: '${escaped}'`)
-  }
-  return lines.join('\n') + '\n'
+/**
+ * 只写这些 ref（字符串原样写入、对象序列化一次），其余内容与 `records:` 段
+ * 逐字节保留；结构自检不过就抛错、不落盘。
+ */
+function writeCredentialRefs(file, updates) {
+  return rewriteCredentialsFile(file, (text) => applyCredentialRefs(text, updates))
 }
 
 function atomicWrite(file, text) {
@@ -260,15 +251,13 @@ function main() {
   state.accounts = accounts
   atomicWrite(STATE_FILE, JSON.stringify(state, null, 2) + '\n')
 
-  // ── 写凭据（读→改→整体写回，保留全部其它记录） ──
-  const yaml = parseCredentialYaml(fs.readFileSync(CRED_FILE, 'utf8'))
-  let updatedCreds = 0
+  // ── 写凭据：只改这些 ref；records:（宿主登录会话）逐字节保留 ──
+  const updates = {}
   for (const { account, entry } of planned) {
-    yaml.records[entry.credentialRef] = buildCredentialJson(account)
-    updatedCreds++
+    updates[entry.credentialRef] = buildCredentialJson(account)
   }
-  atomicWrite(CRED_FILE, serializeCredentialYaml(yaml.header, yaml.records))
-  console.log(`已写入账号 ${addedAccounts} 条（跳过 ${planned.length - addedAccounts}），凭据 ${updatedCreds} 条`)
+  writeCredentialRefs(CRED_FILE, updates)
+  console.log(`已写入账号 ${addedAccounts} 条（跳过 ${planned.length - addedAccounts}），凭据 ${Object.keys(updates).length} 条`)
 
   // ── 二次读回 + 3 秒存活窗口 ──
   const first = verify(alive, refNames)
