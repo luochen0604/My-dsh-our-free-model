@@ -193,7 +193,16 @@ try {
   if (sourceMode) await verifySourceRegressions({ ctx, adapters, call, creds })
   await verifyChannelCreditsRpc({ ctx, call, creds, adapters })
   console.log('ok  实际渠道 RPC：七渠道仅账号池凭据即可查余额，ZCode 账号池回退及缺凭据反馈')
-  await verifyChannelOps({ ctx, call, creds })
+  // 「自动唤醒也覆盖 WorkBuddy」的静态守护：--source 下能从 TS 源码读出两张
+  // 集合（bundle 模式不导出，交给构建同源保证，见 channel-ops-rpc-test.mjs）。
+  // ⚠️ 直接给 .ts 的 file URL：测试钩子的 load 分支负责转译，resolve 不参与。
+  const providerSets = sourceMode
+    ? await import(new URL('../vendor/channel-pack/src/channel-pack-rpc.ts', import.meta.url).href).then(m => ({
+      checkin: m.OPS_CHECKIN_PROVIDERS,
+      wakeExcluded: m.OPS_WAKE_EXCLUDED_PROVIDERS,
+    }))
+    : undefined
+  await verifyChannelOps({ ctx, call, creds, providerSets })
 
   // A failed browser callback must become a terminal, readable poll result.
   // Before this regression check, the Gemini placeholder was removed and

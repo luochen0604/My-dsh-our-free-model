@@ -70,10 +70,22 @@ export interface OpsRunnerDeps {
 export interface OpsRunner {
   /** 实时状态（深拷贝，调用方改不到内部对象）。 */
   status(): RpcOpsStatus
-  /** 启动一轮；`total === 0` 时直接回 `nothing`，不产生空任务。 */
-  run(kind: RpcOpsKind): Promise<RpcOpsRunResponse>
+  /**
+   * 启动一轮；`total === 0` 时直接回 `nothing`，不产生空任务。
+   *
+   * `options.excludeProviders` 把这些平台从**本轮计划**里摘掉（自动签到用它排除
+   * zcode 这类高代价渠道，见 `auto-checkin.ts` 的 `isAutoCheckinExcluded`）。
+   * ⚠️ 只有**自动触发**传它：手动一键是用户的显式操作，zcode 必须包含在计划里。
+   */
+  run(kind: RpcOpsKind, options?: OpsRunOptions): Promise<RpcOpsRunResponse>
   /** 等当前任务结束（供单测与卸载路径用）。 */
   whenIdle(): Promise<void>
+}
+
+/** `run()` 的可选参数。 */
+export interface OpsRunOptions {
+  /** 本轮要排除的平台 id（去重由调用方保证也行，这里再兜一层）。 */
+  excludeProviders?: readonly string[]
 }
 
 const IDLE_STATUS: RpcOpsStatus = {
@@ -146,13 +158,14 @@ export function createOpsRunner(deps: OpsRunnerDeps): OpsRunner {
     return cloneStatus(status)
   }
 
-  async function buildPlan(kind: RpcOpsKind): Promise<RunPlan> {
+  async function buildPlan(kind: RpcOpsKind, excluded: readonly string[]): Promise<RunPlan> {
     const today = utc8DateString(now())
     const entries = deps.journal()
     const all = await deps.accounts()
     const providers = [...new Set(all
       .filter((account) => kind === 'checkin' ? deps.isCheckinProvider(account.provider) : deps.isWakeProvider(account.provider))
       .map((account) => account.provider))].sort()
+      .filter((provider) => !excluded.includes(provider))
     const groups: PlanGroup[] = []
     for (const provider of providers) {
       const accounts = all.filter((account) => account.provider === provider
@@ -239,7 +252,8 @@ export function createOpsRunner(deps: OpsRunnerDeps): OpsRunner {
 
   return {
     status: snapshot,
-    async run(kind) {
+    async run(kind, options) {
+      const excluded = options?.excludeProviders ?? []
       if (starting || inflight !== null) {
         return { started: false, reason: 'running', status: snapshot() }
       }
@@ -254,7 +268,7 @@ export function createOpsRunner(deps: OpsRunnerDeps): OpsRunner {
         }
         let plan: RunPlan
         try {
-          plan = await buildPlan(kind)
+          plan = await buildPlan(kind, excluded)
         } catch (error) {
           finish(kind, `读取账号池失败：${error instanceof Error ? error.message : String(error)}`)
           starting = false

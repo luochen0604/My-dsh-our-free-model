@@ -357,6 +357,11 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   // `tests/unit/channel-pack-store.spec.ts` 的「恢复表覆盖客户端 PROVIDERS 的全部
   // provider（从真实清单派生）」用例锁死 —— 合并新增 provider 前**先跑它**。
   ['GEMINI', 'gemini'],
+  // ⚠️ 第 15 个 provider（workbuddy，2026-11-13）—— 同款坑第 **四** 次。
+  // 漏加 = `WORKBUDDY_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+  //（凭据还在，只是索引建不出来，用户只能重新授权）。
+  // WB 是「凭据直填」渠道（无浏览器登录流），但账号池/恢复表逻辑同构。
+  ['WORKBUDDY', 'workbuddy'],
 ]
 
 /** 已实现渠道的统一判定，拒绝未知渠道且不依赖旧产品黑名单。 */

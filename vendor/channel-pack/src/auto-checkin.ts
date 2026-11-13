@@ -4,9 +4,18 @@
  * ## 它做什么
  *
  * DSH 启动后延迟一小段（默认 30 秒，见下），若这个开关开着、且**今天（UTC+8）
- * 还没跑过**，就串行遍历「账号池里真的有账号的渠道」，逐个调内部
- * `credits.claimAll`；跑完把日期与**逐渠道结果**写进文档 ⇒ **当天不再触发**。
- * 用户手动点「全部渠道签到」不受此限（那是显式操作，永远放行）。
+ * 还没跑过**，就**复用「一键签到」的同一条执行路径**（`ops-runner`：逐账号执行、
+ * 同渠道 5 秒间隔、按流水幂等跳过，`origin` 记为 `auto`）跑一轮；跑完把日期与
+ * **逐渠道结果**写进文档 ⇒ **当天不再触发**。用户手动点「一键签到」不受此限
+ * （那是显式操作，永远放行）。
+ *
+ * ## 为什么自动与手动必须是同一条路径（2026-11 需求）
+ *
+ * 原实现是**两套**：自动逐渠道调 `credits.claimAll`（整平台一批），手动走
+ * `ops-runner`（逐账号 + 间隔 + 幂等）。同一账号在两边的行为不一致（自动没间隔、
+ * 自动跑过的账号手动还会再打一遍……），且自动的结果**不进逐账号流水**，页面上
+ * 查不到。现在自动只是「每天到点替用户点一次一键签到」：触发时机归本模块，
+ * 执行、间隔、幂等、流水全部由 `ops-runner` 一家负责 —— 天然一致。
  *
  * ⚠️ **开关默认打开**（用户 2026-10-02 明确要求：「自动签到默认保持打开状态」）。
  * 这与「这是代用户打上游的写操作」相权：该特性本身是用户要的，默认开启才符合
@@ -58,8 +67,7 @@ import { QODER_BILLING_UTC_OFFSET_MS } from './model-queue.js'
 import { resolveChannelPackHome } from './channel-pack-store.js'
 import { formatClaimGains } from './credits.js'
 import { ZCODE } from './zcode-product.js'
-import type { BadgeRpcResult } from './usage-badge.js'
-import type { RpcCreditsClaimAllResponse, RpcUsageAutoCheckinState } from './types.js'
+import type { RpcUsageAutoCheckinState } from './types.js'
 
 /** 独立文档的文件名（与 state.json / ui-preferences.json 同目录）。 */
 export const AUTO_CHECKIN_FILE = 'auto-checkin.json'
@@ -278,8 +286,8 @@ export function createAutoCheckinStore(ctx: Context): AutoCheckinStore {
   return new FileAutoCheckinStore(join(home, 'channel-pack', AUTO_CHECKIN_FILE), ctx.logger)
 }
 
-/** 一轮执行的累计口径（账号级计数来自各渠道的 `summary`）。 */
-interface RunTotals {
+/** 一轮执行的累计口径（账号级计数来自流水条目）。**导出**给注入的描述函数用。 */
+export interface RunTotals {
   /** 真正跑过 `claimAll` 的渠道数（不含被跳过的）。 */
   providers: number
   claimed: number
@@ -440,20 +448,82 @@ export function describeChannel(summary: {
   return parts.join('，')
 }
 
-/** 装配层注入的依赖（全部可替换 ⇒ 单测零网络、零文件系统、零等待）。 */
-export interface AutoCheckinDeps {
+/**
+ * 自动任务（签到 / 唤醒共用骨架）看到的**一条流水条目**。
+ *
+ * 只取统计要用的字段；`ops-journal` 的完整条目结构见 `types.ts`。此处刻意**不
+ * import** 它：骨架层不需要认识流水文件，注入方（channel-pack-rpc）负责把真实
+ * 流水映射成这个形状。
+ */
+export interface AutoScheduleEntry {
+  at: number
+  kind: 'checkin' | 'wake'
+  provider: string
+  outcome: 'ok' | 'already' | 'inactive' | 'failed'
+  message: string
+  credit?: number
+  unit?: 'token' | 'credit'
+  /** 与流水的 `coversToday` 同义；缺省按覆盖今天算。 */
+  coversToday?: boolean
+}
+
+/** `opsRunner.run()` 的回执里骨架层关心的字段（其余的留在调用方）。 */
+export interface AutoTriggerReply {
+  started: boolean
+  reason: 'started' | 'running' | 'nothing'
+  /** 本轮任务的开始时刻（毫秒）；收账用它做时间窗下限。 */
+  startedAt: number
+}
+
+/**
+ * 单渠道的流水统计（描述文字的输入，与 `RpcCreditsClaimSummary` 同口径：
+ * `claimed` / `alreadyClaimed` / `inactive` / `failed` / `coversToday` 逐项对应）。
+ */
+export interface AutoChannelTally {
+  claimed: number
+  totalCredit: number
+  totalByUnit: { token: number; credit: number }
+  alreadyClaimed: number
+  inactive: number
+  failed: number
+  coversToday: number
+}
+
+/**
+ * 自动任务（签到 / 唤醒）的**共享骨架**。
+ *
+ * 骨架只管三件事：每日一次的判据与文档、把一轮流水收账成总计与逐渠道统计、
+ * 以及「要不要记今天」的口径（`shouldMarkToday`）。**执行本身不在这里**：
+ * `trigger()` 由注入方接到 `opsRunner.run()` 上 —— 自动与手动于是共享同一执行
+ * 路径（逐账号、5 秒间隔、幂等、同一份流水）。
+ *
+ * 文案（总体摘要、逐渠道短句）也注入：签到的措辞是「领取」，唤醒是「唤醒」，
+ * 骨架不认任何具体动词。
+ */
+export interface AutoScheduleDeps {
   store: AutoCheckinStore
-  /**
-   * 列出**账号池里有账号**的渠道 id。
-   * 只遍历有账号的渠道：没有账号的渠道调 `claimAll` 只会拿到空结果，白白走一遍
-   * 12 条分支。
-   */
-  listProviderIds(): Promise<string[]>
-  /**
-   * 调某个渠道的签到 —— **必须复用 `credits.claimAll` 的实现**（装配层直接调内部
-   * `handleMethod`）。本模块不认任何具体渠道，只按返回的信封判「跳过 / 失败」。
-   */
-  claim(provider: string): Promise<BadgeRpcResult<RpcCreditsClaimAllResponse>>
+  /** 要自动执行的动作（`checkin` / `wake`），决定从流水里统计哪一类条目。 */
+  kind: 'checkin' | 'wake'
+  /** 启动一键任务（复用 `opsRunner.run` 的同一条执行路径）。 */
+  trigger(): Promise<AutoTriggerReply>
+  /** 等当前一键任务结束（`opsRunner.whenIdle`）。 */
+  whenIdle(): Promise<void>
+  /** 当前全部流水（升序；本模块按 `kind` + 本轮时间窗过滤）。 */
+  entries(): readonly AutoScheduleEntry[]
+  /** 一句话描述本轮总体结果（状态行的主文案）。 */
+  describeTotals(totals: RunTotals): string
+  /** 一句话描述单个渠道的结果。 */
+  describeChannel(tally: AutoChannelTally): string
+  /** 一键任务回 `nothing`（今天已全部处理）时写进文档的摘要文案。 */
+  emptyResultText: string
+  /** 日志前缀（如「自动签到」）。 */
+  runLabel: string
+  /** 列出账号池里有账号的渠道 id（给排除渠道出提示行；可选）。 */
+  listProviderIds?(): Promise<string[]>
+  /** 自动执行时排除的渠道（签到的高代价渠道；唤醒无需排除）。 */
+  isExcluded?(provider: string): boolean
+  /** 排除渠道在逐渠道状态里的文字（如「需手动签到」）。 */
+  excludedText?: string
   now?(): number
   /** 延迟毫秒数；默认读环境变量。 */
   delayMs?: number
@@ -465,7 +535,7 @@ export interface AutoCheckinDeps {
   warn?(message: string): void
 }
 
-/** 自动签到执行体。 */
+/** 自动任务执行体（签到与唤醒共用同一接口形态）。 */
 export interface AutoCheckin {
   /** 实时状态（供 RPC 与状态灯；`enabled` 等取自内存，不重新读盘）。 */
   state(): RpcUsageAutoCheckinState
@@ -487,8 +557,8 @@ export interface AutoCheckin {
   stop(): void
 }
 
-/** 创建自动签到执行体。 */
-export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
+/** 创建自动任务执行体（签到 / 唤醒共用骨架，文案与排除表由注入方给出）。 */
+export function createAutoSchedule(deps: AutoScheduleDeps): AutoCheckin {
   const now = deps.now ?? (() => Date.now())
   let doc = deps.store.load()
   let running = false
@@ -516,76 +586,132 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
     }
   }
 
-  async function performRun(): Promise<void> {
-    lastAttemptAt = now()
-    const totals = emptyTotals()
+  /** 把一条流水条目累进单渠道统计。 */
+  function tallyOf(entry: AutoScheduleEntry): Pick<AutoChannelTally, 'claimed' | 'totalCredit' | 'alreadyClaimed' | 'inactive' | 'failed' | 'coversToday'> & { unit: 'token' | 'credit' } {
+    const credit = entry.outcome === 'ok' ? Math.max(0, entry.credit ?? 0) : 0
+    const unit = entry.unit === 'token' ? 'token' as const : 'credit' as const
+    switch (entry.outcome) {
+      case 'ok':
+        return { claimed: 1, totalCredit: credit, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: entry.coversToday !== false ? 1 : 0, unit }
+      case 'already':
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0, coversToday: entry.coversToday !== false ? 1 : 0, unit }
+      case 'inactive':
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 1, failed: 0, coversToday: 0, unit }
+      default:
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1, coversToday: 0, unit }
+    }
+  }
+
+  /** 排除渠道的提示行（账号池枚举失败时只丢提示，不影响记账）。 */
+  async function excludedRows(): Promise<Array<{ provider: string; text: string }>> {
+    if (deps.isExcluded === undefined || deps.excludedText === undefined) return []
     let providers: string[] = []
     try {
-      providers = [...new Set(await deps.listProviderIds())].sort()
-    } catch (error) {
-      // 账号池读不出来：不记日期，下次启动重试。
-      deps.warn?.(`[channel-pack] 自动签到：读取账号池失败，本次跳过: ${String(error)}`)
-      return
+      providers = deps.listProviderIds ? await deps.listProviderIds() : []
+    } catch {
+      return []
+    }
+    const rows: Array<{ provider: string; text: string }> = []
+    for (const provider of [...new Set(providers)].sort()) {
+      if (deps.isExcluded(provider) !== true) continue
+      rows.push({ provider, text: deps.excludedText })
+    }
+    return rows
+  }
+
+  /**
+   * 收账：本轮时间窗（`at >= startedAt`）内的流水条目 → 总计 + 逐渠道统计。
+   *
+   * ⚠️ **必须按时间窗过滤**，不能拿「今天的全部流水」来算：今天早些时候的手动
+   * 一键 / 上一轮自动的条目也都在流水里，按日累计会把同一账号的结果算两遍
+   * （摘要虚胖），且手动轮次里的 ok 条目会让 `shouldMarkToday` 把**失败的本轮**
+   * 误记成已完成 —— 恰恰是「记了日期就整天不再重试」的大坑。
+   */
+  function collect(startedAt: number, excluded: Array<{ provider: string; text: string }>): { totals: RunTotals; channels: Array<{ provider: string; text: string }> } {
+    const totals = emptyTotals()
+    const perProvider = new Map<string, AutoChannelTally>()
+    for (const entry of deps.entries()) {
+      if (entry.kind !== deps.kind || entry.at < startedAt) continue
+      const tally = perProvider.get(entry.provider) ?? {
+        claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 },
+        alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
+      }
+      const add = tallyOf(entry)
+      tally.claimed += add.claimed
+      tally.totalCredit += add.totalCredit
+      tally.totalByUnit[add.unit] += add.totalCredit
+      tally.alreadyClaimed += add.alreadyClaimed
+      tally.inactive += add.inactive
+      tally.failed += add.failed
+      tally.coversToday += add.coversToday
+      perProvider.set(entry.provider, tally)
     }
     const channels: Array<{ provider: string; text: string }> = []
-    for (const provider of providers) {
-      // ⚠️ 排除表先于**任何**上游请求生效（见 isAutoCheckinExcluded 的说明）：
-      // zcode 的代价发生在**调用期间**（拉起浏览器产 captcha），事后再判断已经
-      // 太晚 —— 必须在调 `claim` 之前就把它摘掉。
-      if (isAutoCheckinExcluded(provider)) {
-        totals.skipped += 1
-        channels.push({ provider, text: '需手动签到' })
-        continue
-      }
-      let result: BadgeRpcResult<RpcCreditsClaimAllResponse>
-      try {
-        result = await deps.claim(provider)
-      } catch (error) {
-        totals.errors += 1
-        channels.push({ provider, text: '出错' })
-        deps.warn?.(`[channel-pack] 自动签到：${provider} 调用异常: ${String(error)}`)
-        continue
-      }
-      if (!result.ok) {
-        const message = typeof result.error?.message === 'string' ? result.error.message : ''
-        if (isUnsupportedCheckin(message)) {
-          totals.skipped += 1
-          channels.push({ provider, text: '无签到接口' })
-          continue
-        }
-        totals.errors += 1
-        channels.push({ provider, text: '出错' })
-        deps.warn?.(`[channel-pack] 自动签到：${provider} 失败: ${message || '未知错误'}`)
-        continue
-      }
+    for (const [provider, tally] of perProvider) {
       totals.providers += 1
-      const summary = result.value?.summary
-      if (summary === undefined) {
-        channels.push({ provider, text: '无可领' })
-        continue
-      }
-      totals.claimed += summary.claimed
-      totals.totalCredit += summary.totalCredit
-      // ★ 按单位累加（2026-10-04）：`totalByUnit` 缺省时回落到「全部按积分」，
-      //   兼容尚未上报该字段的旧宿主响应 —— 与 `coversToday` 的兜底同思路。
-      const byUnit = summary.totalByUnit ?? { credit: summary.totalCredit, token: 0 }
-      totals.totalByUnit.credit += Number(byUnit.credit) || 0
-      totals.totalByUnit.token += Number(byUnit.token) || 0
-      totals.alreadyClaimed += summary.alreadyClaimed
-      totals.inactive += summary.inactive
-      totals.failed += summary.failed
-      // ⚠️ 记账口径**只认**这一项：渠道用 `coversToday` 自己声明「这条痕迹是不是
-      // 今天这一轮的」。缺省回落到 `claimed + alreadyClaimed`，是为了兼容尚未
-      // 上报该字段的旧响应（缺字段 ≠ 0，否则整轮会被判成「什么都没证明」）。
-      totals.coversToday += summary.coversToday ?? (summary.claimed + summary.alreadyClaimed)
-      channels.push({ provider, text: describeChannel(summary) })
+      totals.claimed += tally.claimed
+      totals.totalCredit += tally.totalCredit
+      totals.totalByUnit.token += tally.totalByUnit.token
+      totals.totalByUnit.credit += tally.totalByUnit.credit
+      totals.alreadyClaimed += tally.alreadyClaimed
+      totals.inactive += tally.inactive
+      totals.failed += tally.failed
+      totals.coversToday += tally.coversToday
+      channels.push({ provider, text: deps.describeChannel(tally) })
     }
+    // 排除渠道（签到的高代价渠道）不在流水里 —— 手动一键签到仍会包含它们，
+    // 自动这一轮是**刻意没跑**，要如实给一行提示而不是让用户以为漏了。
+    for (const row of excluded) {
+      totals.skipped += 1
+      channels.push(row)
+    }
+    return { totals, channels }
+  }
+
+  async function performRun(): Promise<void> {
+    lastAttemptAt = now()
+    let reply: AutoTriggerReply
+    try {
+      reply = await deps.trigger()
+    } catch (error) {
+      // 启动失败（账号池读不出等）：不记日期，下次启动重试。
+      deps.warn?.(`[channel-pack] ${deps.runLabel}：启动执行任务失败，本次跳过: ${String(error)}`)
+      return
+    }
+    if (!reply.started) {
+      if (reply.reason === 'nothing') {
+        // 流水已经证明今天全部账号都处理完了：记日期，否则每天都会反复空跑。
+        // ⚠️ `nothing` 的判据在 ops-runner（`succeededToday`，coversToday=false
+        // 不算成功），与 shouldMarkToday 的口径同源 —— 这里记日期是安全的。
+        doc = {
+          ...doc,
+          lastDate: today(),
+          lastResult: deps.emptyResultText,
+          lastAt: now(),
+          channels: [],
+          dismissedRunAt: 0,
+        }
+        try {
+          await deps.store.save(doc)
+        } catch (error) {
+          deps.warn?.(`[channel-pack] ${deps.runLabel}结果写入失败（今天可能重复触发一次）: ${String(error)}`)
+        }
+        return
+      }
+      // `running`：已有一轮在跑（多半是用户手动点的）。它的结果走同一条流水，
+      // 但完成时刻未知 —— 不记日期，等退避后的下一轮自然收口（那轮多半直接
+      // `nothing`）。
+      deps.warn?.(`[channel-pack] ${deps.runLabel}：已有任务进行中，本轮不记日期`)
+      return
+    }
+    await deps.whenIdle()
+    const { totals, channels } = collect(reply.startedAt, await excludedRows())
 
     if (!shouldMarkToday(totals)) {
       // ⚠️ 刻意**不写** lastDate：让「凭据还没续上 / 网络不通 / 赶在渠道刷新前
       // 跑的那一轮」能在下次启动重试，而不是当天就此放弃（判据见 shouldMarkToday）。
       deps.warn?.(
-        `[channel-pack] 自动签到未记入今日（下次启动会重试）：${describeRun(totals)}`,
+        `[channel-pack] ${deps.runLabel}未记入今日（下次启动会重试）：${deps.describeTotals(totals)}`,
       )
       return
     }
@@ -593,7 +719,7 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
     doc = {
       ...doc,
       lastDate: today(),
-      lastResult: describeRun(totals),
+      lastResult: deps.describeTotals(totals),
       lastAt: now(),
       channels,
       // ⚠️ 新一轮跑完要**清掉上一次的「已关闭」标记**：否则用户关过一次后，
@@ -604,9 +730,9 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       await deps.store.save(doc)
     } catch (error) {
       // 写盘失败 ⇒ 今天可能再跑一次（幂等，代价是多发一轮请求），如实告警。
-      deps.warn?.(`[channel-pack] 自动签到结果写入失败（今天可能重复触发一次）: ${String(error)}`)
+      deps.warn?.(`[channel-pack] ${deps.runLabel}结果写入失败（今天可能重复触发一次）: ${String(error)}`)
     }
-    deps.warn?.(`[channel-pack] 自动签到完成（${today()}）：${doc.lastResult}`)
+    deps.warn?.(`[channel-pack] ${deps.runLabel}完成（${today()}）：${doc.lastResult}`)
   }
 
   function runIfDue(): Promise<void> {
@@ -615,7 +741,7 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
     if (doc.lastDate !== '' && doc.lastDate === today()) return Promise.resolve()
     running = true
     const task = performRun().catch((error: unknown) => {
-      deps.warn?.(`[channel-pack] 自动签到异常: ${String(error)}`)
+      deps.warn?.(`[channel-pack] ${deps.runLabel}异常: ${String(error)}`)
     }).finally(() => {
       running = false
       inflight = null

@@ -5,8 +5,23 @@ import assert from 'node:assert/strict'
  * 触发 → 后台执行 → 流水落账 → 第二次触发因「今天已成功」而 nothing。
  *
  * 用 Loomy 的领取 / 续期替身，零网络；账号在测试结束时删除。
+ *
+ * 另含「自动唤醒覆盖 WorkBuddy」的静态守护：WB 有签到接口（task-5 落地）且
+ * 唤醒走「重读凭据 + 探活」分支 —— 两个集合必须都覆盖它（2026-11 需求）。
  */
-export async function verifyChannelOps({ ctx, call, creds }) {
+export async function verifyChannelOps({ ctx, call, creds, providerSets }) {
+  /**
+   * 「自动唤醒覆盖 WorkBuddy」的静态守护（2026-11 需求）：WB 有签到接口
+   * （task-5 落地）且唤醒走「重读凭据 + 探活」分支 —— 两个集合必须都覆盖它。
+   *
+   * ⚠️ 集合由调用方传入：`--source` 模式下从 TS 源码导入（测试钩子能解析）；
+   * bundle 模式下 pack.js 不导出它们（产物由构建流程保证与源码同源），跳过。
+   */
+  if (providerSets !== undefined) {
+    assert.equal(providerSets.checkin.has('workbuddy'), true, 'WorkBuddy 必须在签到平台集合里（一键签到与自动签到覆盖它）')
+    assert.equal(providerSets.wakeExcluded.has('workbuddy'), false, 'WorkBuddy 不得进唤醒排除集合（一键唤醒与自动唤醒覆盖它）')
+  }
+
   const provider = 'loomy'
   const accountId = 'ops-fixture-loomy'
   const ref = 'OPS_ACCOUNT_FIXTURE'

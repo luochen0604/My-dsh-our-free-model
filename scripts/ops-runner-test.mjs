@@ -147,6 +147,21 @@ await check('唤醒覆盖无需签到的平台并跳过今天已唤醒的账号'
   assert.equal(state.calls.every(call => call.kind === 'wake'), true)
 })
 
+await check('excludeProviders 把平台从本轮计划里摘掉（自动签到排除高代价渠道）', async () => {
+  const { runner, state } = harness({ accounts, spacingMs: 5 })
+  const reply = await runner.run('checkin', { excludeProviders: ['alpha'] })
+  assert.equal(reply.started, true)
+  await runner.whenIdle()
+  assert.equal(state.calls.some(call => call.provider === 'alpha'), false, '被排除的平台不得进入计划')
+  assert.equal(state.calls.length, 2, '只剩 beta 的 2 个账号')
+  assert.deepEqual(state.calls.map(call => call.provider), ['beta', 'beta'])
+  // 默认不排除（手动一键仍包含所有有签到能力的平台）。
+  const second = await runner.run('checkin')
+  assert.equal(second.started, true)
+  await runner.whenIdle()
+  assert.equal(state.calls.some(call => call.provider === 'alpha'), true, '不传排除参数时照常包含被排除过的平台')
+})
+
 await check('全部已成功时返回 nothing，不产生空任务', async () => {
   const day = today()
   const journal = accounts.filter(row => row.provider !== 'opencode').map((row, index) => ({

@@ -32249,7 +32249,12 @@ var REF_PREFIX_TO_PROVIDER = [
   // 本表与客户端 `PROVIDERS` 的一致性由
   // `tests/unit/channel-pack-store.spec.ts` 的「恢复表覆盖客户端 PROVIDERS 的全部
   // provider（从真实清单派生）」用例锁死 —— 合并新增 provider 前**先跑它**。
-  ["GEMINI", "gemini"]
+  ["GEMINI", "gemini"],
+  // ⚠️ 第 15 个 provider（workbuddy，2026-11-13）—— 同款坑第 **四** 次。
+  // 漏加 = `WORKBUDDY_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+  //（凭据还在，只是索引建不出来，用户只能重新授权）。
+  // WB 是「凭据直填」渠道（无浏览器登录流），但账号池/恢复表逻辑同构。
+  ["WORKBUDDY", "workbuddy"]
 ];
 function isSupportedProvider(provider) {
   return typeof provider === "string" && REF_PREFIX_TO_PROVIDER.some(([, id]) => id === provider);
@@ -52330,9 +52335,9 @@ function buildEnvironmentSection(options) {
 }
 function isGitRepo(cwd) {
   try {
-    const { existsSync: existsSync13 } = __require("node:fs");
-    const { join: join15 } = __require("node:path");
-    return existsSync13(join15(cwd, ".git"));
+    const { existsSync: existsSync14 } = __require("node:fs");
+    const { join: join16 } = __require("node:path");
+    return existsSync14(join16(cwd, ".git"));
   } catch {
     return false;
   }
@@ -54594,6 +54599,129 @@ function normalizeBase64(data) {
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned)) return void 0;
   if (cleaned.length % 4 !== 0) return void 0;
   return cleaned;
+}
+
+// vendor/channel-pack/src/workbuddy-credits.ts
+var WORKBUDDY_ID = "workbuddy";
+var WORKBUDDY_DEFAULT_DOMAIN = "www.workbuddy.cn";
+var WORKBUDDY_REQUEST_TIMEOUT_MS = 3e4;
+var WORKBUDDY_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+var WORKBUDDY_CHECKIN_STATUS_PATH = "/billing/meter/checkin-activity-status";
+var WORKBUDDY_DAILY_CHECKIN_PATH = "/billing/meter/daily-checkin";
+function workbuddyHeaders(credential) {
+  const headers = new Headers();
+  headers.set("Content-Type", "application/json");
+  headers.set("Accept", "application/json");
+  headers.set("X-Domain", credential.domain ?? WORKBUDDY_DEFAULT_DOMAIN);
+  headers.set("User-Agent", WORKBUDDY_USER_AGENT);
+  headers.set("Authorization", `Bearer ${credential.accessToken}`);
+  headers.set("X-User-Id", credential.uid);
+  return headers;
+}
+async function requestEnvelope2(credential, path2, fetcher) {
+  const base = `https://${credential.domain?.length ? credential.domain : WORKBUDDY_DEFAULT_DOMAIN}`;
+  try {
+    const response = await fetcher(`${base}${path2}`, {
+      method: "POST",
+      headers: workbuddyHeaders(credential),
+      body: "{}",
+      signal: AbortSignal.timeout(WORKBUDDY_REQUEST_TIMEOUT_MS)
+    });
+    const text = await response.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return {
+        ok: false,
+        status: response.status,
+        message: response.status === 401 || response.status === 403 ? `\u51ED\u636E\u5DF2\u5931\u6548\uFF08HTTP ${response.status}\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u8BE5\u8D26\u53F7` : `\u670D\u52A1\u7AEF\u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08HTTP ${response.status}\uFF09`
+      };
+    }
+    if (typeof parsed !== "object" || parsed === null) {
+      return { ok: false, status: response.status, message: "\u54CD\u5E94\u65E0\u6CD5\u89E3\u6790" };
+    }
+    const record = parsed;
+    return {
+      ok: true,
+      status: response.status,
+      envelope: {
+        code: typeof record.code === "number" && Number.isFinite(record.code) ? record.code : -1,
+        msg: typeof record.msg === "string" ? record.msg : void 0,
+        data: record.data
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: -1,
+      message: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+function dataOf(envelope) {
+  return typeof envelope.data === "object" && envelope.data !== null && !Array.isArray(envelope.data) ? envelope.data : {};
+}
+function finiteNumber2(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : void 0;
+}
+function isWorkbuddyAlreadyChecked(envelope) {
+  const msg = typeof envelope.msg === "string" ? envelope.msg : "";
+  if (/已签|已领取|already/i.test(msg)) return true;
+  return dataOf(envelope).today_checked_in === true;
+}
+async function fetchWorkbuddyCheckinStatus(credential, fetcher = fetch) {
+  const result = await requestEnvelope2(credential, WORKBUDDY_CHECKIN_STATUS_PATH, fetcher);
+  if (!result.ok) return null;
+  if (result.status !== 200 || result.envelope.code !== 0) return null;
+  const data = dataOf(result.envelope);
+  const readNumber8 = (key) => finiteNumber2(data[key]) ?? 0;
+  return {
+    active: data.active === true,
+    todayCheckedIn: data.today_checked_in === true,
+    streakDays: readNumber8("streak_days"),
+    dailyCredit: readNumber8("daily_credit"),
+    todayCredit: data.today_checked_in === true ? readNumber8("daily_credit") : 0,
+    isStreakDay: false,
+    // ⚠️ 活动制积分：如实放进 totalCredits（该字段语义就是「活动累计」），
+    // 但**不得**映射成 CreditBalance.total（见文件头）。
+    totalCredits: readNumber8("total_credits"),
+    checkinDates: [],
+    activityName: "",
+    themeName: "",
+    endTime: ""
+  };
+}
+async function claimWorkbuddyDailyCheckin(credential, fetcher = fetch) {
+  const result = await requestEnvelope2(credential, WORKBUDDY_DAILY_CHECKIN_PATH, fetcher);
+  if (!result.ok) {
+    return { kind: "failed", code: result.status === -1 ? -1 : result.status, message: result.message };
+  }
+  const envelope = result.envelope;
+  if (isWorkbuddyAlreadyChecked(envelope)) {
+    return { kind: "already-claimed", message: "\u4ECA\u65E5\u5DF2\u7B7E\u5230" };
+  }
+  if (result.status === 401) {
+    return { kind: "failed", code: -1, message: "\u51ED\u636E\u5DF2\u5931\u6548\uFF08HTTP 401\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u8BE5\u8D26\u53F7" };
+  }
+  if (result.status === 403 && envelope.code === 11140) {
+    return { kind: "failed", code: 11140, message: "\u7B7E\u5230\u51B7\u5374\u4E2D\uFF0811140\uFF09\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5" };
+  }
+  if (result.status === 429 && envelope.code === 6004) {
+    return { kind: "failed", code: 6004, message: "\u8BF7\u6C42\u8FC7\u4E8E\u9891\u7E41\uFF086004\uFF09\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5" };
+  }
+  if (result.status !== 200 || envelope.code !== 0) {
+    const message = envelope.msg?.length ? envelope.msg : `\u7B7E\u5230\u5931\u8D25\uFF08HTTP ${result.status}\uFF0Ccode=${envelope.code}\uFF09`;
+    return { kind: "failed", code: envelope.code, message };
+  }
+  const data = dataOf(envelope);
+  const credit = finiteNumber2(data.daily_credit) ?? finiteNumber2(data.credit) ?? 0;
+  return {
+    kind: "claimed",
+    credit,
+    streakDays: finiteNumber2(data.streak_days) ?? 0,
+    isStreakDay: false
+  };
 }
 
 // vendor/channel-pack/src/gemini-credits.ts
@@ -57450,9 +57578,6 @@ function createAutoCheckinStore(ctx) {
 function emptyTotals2() {
   return { providers: 0, claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 }, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 };
 }
-function isUnsupportedCheckin(message) {
-  return message.includes("\u4E0D\u652F\u6301\u6BCF\u65E5\u7B7E\u5230") || message.includes("unsupported provider");
-}
 function isAutoCheckinExcluded(provider) {
   return provider === ZCODE.id;
 }
@@ -57488,7 +57613,7 @@ function describeChannel(summary) {
   }
   return parts.join("\uFF0C");
 }
-function createAutoCheckin(deps) {
+function createAutoSchedule(deps) {
   const now = deps.now ?? (() => Date.now());
   let doc = deps.store.load();
   let running2 = false;
@@ -57510,71 +57635,119 @@ function createAutoCheckin(deps) {
       dismissed: doc.lastAt > 0 && doc.dismissedRunAt === doc.lastAt
     };
   }
-  async function performRun() {
-    lastAttemptAt = now();
-    const totals = emptyTotals2();
+  function tallyOf(entry) {
+    const credit = entry.outcome === "ok" ? Math.max(0, entry.credit ?? 0) : 0;
+    const unit = entry.unit === "token" ? "token" : "credit";
+    switch (entry.outcome) {
+      case "ok":
+        return { claimed: 1, totalCredit: credit, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: entry.coversToday !== false ? 1 : 0, unit };
+      case "already":
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0, coversToday: entry.coversToday !== false ? 1 : 0, unit };
+      case "inactive":
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 1, failed: 0, coversToday: 0, unit };
+      default:
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1, coversToday: 0, unit };
+    }
+  }
+  async function excludedRows() {
+    if (deps.isExcluded === void 0 || deps.excludedText === void 0) return [];
     let providers = [];
     try {
-      providers = [...new Set(await deps.listProviderIds())].sort();
-    } catch (error) {
-      deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\uFF1A\u8BFB\u53D6\u8D26\u53F7\u6C60\u5931\u8D25\uFF0C\u672C\u6B21\u8DF3\u8FC7: ${String(error)}`);
-      return;
+      providers = deps.listProviderIds ? await deps.listProviderIds() : [];
+    } catch {
+      return [];
+    }
+    const rows = [];
+    for (const provider of [...new Set(providers)].sort()) {
+      if (deps.isExcluded(provider) !== true) continue;
+      rows.push({ provider, text: deps.excludedText });
+    }
+    return rows;
+  }
+  function collect(startedAt, excluded) {
+    const totals = emptyTotals2();
+    const perProvider = /* @__PURE__ */ new Map();
+    for (const entry of deps.entries()) {
+      if (entry.kind !== deps.kind || entry.at < startedAt) continue;
+      const tally = perProvider.get(entry.provider) ?? {
+        claimed: 0,
+        totalCredit: 0,
+        totalByUnit: { token: 0, credit: 0 },
+        alreadyClaimed: 0,
+        inactive: 0,
+        failed: 0,
+        coversToday: 0
+      };
+      const add = tallyOf(entry);
+      tally.claimed += add.claimed;
+      tally.totalCredit += add.totalCredit;
+      tally.totalByUnit[add.unit] += add.totalCredit;
+      tally.alreadyClaimed += add.alreadyClaimed;
+      tally.inactive += add.inactive;
+      tally.failed += add.failed;
+      tally.coversToday += add.coversToday;
+      perProvider.set(entry.provider, tally);
     }
     const channels = [];
-    for (const provider of providers) {
-      if (isAutoCheckinExcluded(provider)) {
-        totals.skipped += 1;
-        channels.push({ provider, text: "\u9700\u624B\u52A8\u7B7E\u5230" });
-        continue;
-      }
-      let result;
-      try {
-        result = await deps.claim(provider);
-      } catch (error) {
-        totals.errors += 1;
-        channels.push({ provider, text: "\u51FA\u9519" });
-        deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\uFF1A${provider} \u8C03\u7528\u5F02\u5E38: ${String(error)}`);
-        continue;
-      }
-      if (!result.ok) {
-        const message = typeof result.error?.message === "string" ? result.error.message : "";
-        if (isUnsupportedCheckin(message)) {
-          totals.skipped += 1;
-          channels.push({ provider, text: "\u65E0\u7B7E\u5230\u63A5\u53E3" });
-          continue;
-        }
-        totals.errors += 1;
-        channels.push({ provider, text: "\u51FA\u9519" });
-        deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\uFF1A${provider} \u5931\u8D25: ${message || "\u672A\u77E5\u9519\u8BEF"}`);
-        continue;
-      }
+    for (const [provider, tally] of perProvider) {
       totals.providers += 1;
-      const summary = result.value?.summary;
-      if (summary === void 0) {
-        channels.push({ provider, text: "\u65E0\u53EF\u9886" });
-        continue;
-      }
-      totals.claimed += summary.claimed;
-      totals.totalCredit += summary.totalCredit;
-      const byUnit = summary.totalByUnit ?? { credit: summary.totalCredit, token: 0 };
-      totals.totalByUnit.credit += Number(byUnit.credit) || 0;
-      totals.totalByUnit.token += Number(byUnit.token) || 0;
-      totals.alreadyClaimed += summary.alreadyClaimed;
-      totals.inactive += summary.inactive;
-      totals.failed += summary.failed;
-      totals.coversToday += summary.coversToday ?? summary.claimed + summary.alreadyClaimed;
-      channels.push({ provider, text: describeChannel(summary) });
+      totals.claimed += tally.claimed;
+      totals.totalCredit += tally.totalCredit;
+      totals.totalByUnit.token += tally.totalByUnit.token;
+      totals.totalByUnit.credit += tally.totalByUnit.credit;
+      totals.alreadyClaimed += tally.alreadyClaimed;
+      totals.inactive += tally.inactive;
+      totals.failed += tally.failed;
+      totals.coversToday += tally.coversToday;
+      channels.push({ provider, text: deps.describeChannel(tally) });
     }
+    for (const row of excluded) {
+      totals.skipped += 1;
+      channels.push(row);
+    }
+    return { totals, channels };
+  }
+  async function performRun() {
+    lastAttemptAt = now();
+    let reply2;
+    try {
+      reply2 = await deps.trigger();
+    } catch (error) {
+      deps.warn?.(`[channel-pack] ${deps.runLabel}\uFF1A\u542F\u52A8\u6267\u884C\u4EFB\u52A1\u5931\u8D25\uFF0C\u672C\u6B21\u8DF3\u8FC7: ${String(error)}`);
+      return;
+    }
+    if (!reply2.started) {
+      if (reply2.reason === "nothing") {
+        doc = {
+          ...doc,
+          lastDate: today(),
+          lastResult: deps.emptyResultText,
+          lastAt: now(),
+          channels: [],
+          dismissedRunAt: 0
+        };
+        try {
+          await deps.store.save(doc);
+        } catch (error) {
+          deps.warn?.(`[channel-pack] ${deps.runLabel}\u7ED3\u679C\u5199\u5165\u5931\u8D25\uFF08\u4ECA\u5929\u53EF\u80FD\u91CD\u590D\u89E6\u53D1\u4E00\u6B21\uFF09: ${String(error)}`);
+        }
+        return;
+      }
+      deps.warn?.(`[channel-pack] ${deps.runLabel}\uFF1A\u5DF2\u6709\u4EFB\u52A1\u8FDB\u884C\u4E2D\uFF0C\u672C\u8F6E\u4E0D\u8BB0\u65E5\u671F`);
+      return;
+    }
+    await deps.whenIdle();
+    const { totals, channels } = collect(reply2.startedAt, await excludedRows());
     if (!shouldMarkToday(totals)) {
       deps.warn?.(
-        `[channel-pack] \u81EA\u52A8\u7B7E\u5230\u672A\u8BB0\u5165\u4ECA\u65E5\uFF08\u4E0B\u6B21\u542F\u52A8\u4F1A\u91CD\u8BD5\uFF09\uFF1A${describeRun(totals)}`
+        `[channel-pack] ${deps.runLabel}\u672A\u8BB0\u5165\u4ECA\u65E5\uFF08\u4E0B\u6B21\u542F\u52A8\u4F1A\u91CD\u8BD5\uFF09\uFF1A${deps.describeTotals(totals)}`
       );
       return;
     }
     doc = {
       ...doc,
       lastDate: today(),
-      lastResult: describeRun(totals),
+      lastResult: deps.describeTotals(totals),
       lastAt: now(),
       channels,
       // ⚠️ 新一轮跑完要**清掉上一次的「已关闭」标记**：否则用户关过一次后，
@@ -57584,9 +57757,9 @@ function createAutoCheckin(deps) {
     try {
       await deps.store.save(doc);
     } catch (error) {
-      deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\u7ED3\u679C\u5199\u5165\u5931\u8D25\uFF08\u4ECA\u5929\u53EF\u80FD\u91CD\u590D\u89E6\u53D1\u4E00\u6B21\uFF09: ${String(error)}`);
+      deps.warn?.(`[channel-pack] ${deps.runLabel}\u7ED3\u679C\u5199\u5165\u5931\u8D25\uFF08\u4ECA\u5929\u53EF\u80FD\u91CD\u590D\u89E6\u53D1\u4E00\u6B21\uFF09: ${String(error)}`);
     }
-    deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\u5B8C\u6210\uFF08${today()}\uFF09\uFF1A${doc.lastResult}`);
+    deps.warn?.(`[channel-pack] ${deps.runLabel}\u5B8C\u6210\uFF08${today()}\uFF09\uFF1A${doc.lastResult}`);
   }
   function runIfDue() {
     if (inflight !== null) return inflight;
@@ -57594,7 +57767,7 @@ function createAutoCheckin(deps) {
     if (doc.lastDate !== "" && doc.lastDate === today()) return Promise.resolve();
     running2 = true;
     const task = performRun().catch((error) => {
-      deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\u5F02\u5E38: ${String(error)}`);
+      deps.warn?.(`[channel-pack] ${deps.runLabel}\u5F02\u5E38: ${String(error)}`);
     }).finally(() => {
       running2 = false;
       inflight = null;
@@ -57661,15 +57834,137 @@ function defaultScheduleTick(fn, ms) {
   return { cancel: () => clearInterval(timer) };
 }
 
-// vendor/channel-pack/src/ops-journal.ts
+// vendor/channel-pack/src/auto-wake.ts
 import { existsSync as existsSync9, mkdirSync as mkdirSync7, readFileSync as readFileSync9, renameSync as renameSync7, writeFileSync as writeFileSync8 } from "node:fs";
 import { join as join9 } from "node:path";
+var AUTO_WAKE_FILE = "auto-wake.json";
+var SCHEMA5 = "channel-pack/auto-wake/v1";
+var DEFAULT_AUTO_WAKE = {
+  enabled: false,
+  lastDate: "",
+  lastResult: "",
+  lastAt: 0,
+  channels: [],
+  dismissedRunAt: 0
+};
+var DATE_RE2 = /^\d{4}-\d{2}-\d{2}$/;
+var MAX_CHANNEL_ENTRIES2 = 24;
+function sanitizeChannels2(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const record = item;
+    if (typeof record.provider !== "string" || record.provider.length === 0) continue;
+    if (typeof record.text !== "string") continue;
+    out.push({ provider: record.provider, text: record.text.slice(0, 120) });
+    if (out.length >= MAX_CHANNEL_ENTRIES2) break;
+  }
+  return out;
+}
+function sanitizeAutoWake(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { ...DEFAULT_AUTO_WAKE };
+  const record = raw;
+  const ms = (value) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+  return {
+    enabled: record.enabled === true,
+    lastDate: typeof record.lastDate === "string" && DATE_RE2.test(record.lastDate) ? record.lastDate : "",
+    lastResult: typeof record.lastResult === "string" ? record.lastResult : "",
+    lastAt: ms(record.lastAt),
+    channels: sanitizeChannels2(record.channels),
+    dismissedRunAt: ms(record.dismissedRunAt)
+  };
+}
+var MemoryAutoWakeStore = class {
+  kind = "memory";
+  doc = { ...DEFAULT_AUTO_WAKE };
+  load() {
+    return { ...this.doc };
+  }
+  async save(doc) {
+    this.doc = { ...doc };
+  }
+};
+var FileAutoWakeStore = class {
+  constructor(path2, logger2) {
+    this.path = path2;
+    this.logger = logger2;
+  }
+  kind = "file";
+  load() {
+    try {
+      if (!existsSync9(this.path)) return { ...DEFAULT_AUTO_WAKE };
+      return sanitizeAutoWake(JSON.parse(readFileSync9(this.path, "utf-8")));
+    } catch (error) {
+      this.logger?.warn(`[channel-pack] \u8BFB\u53D6 ${this.path} \u5931\u8D25\uFF0C\u81EA\u52A8\u5524\u9192\u6309\u9ED8\u8BA4\u8BBE\u7F6E\uFF08\u5173\u95ED\uFF09\u5904\u7406: ${String(error)}`);
+      return { ...DEFAULT_AUTO_WAKE };
+    }
+  }
+  async save(doc) {
+    mkdirSync7(join9(this.path, ".."), { recursive: true });
+    const tmp = `${this.path}.tmp`;
+    writeFileSync8(tmp, JSON.stringify({
+      schema: SCHEMA5,
+      enabled: doc.enabled,
+      lastDate: doc.lastDate,
+      lastResult: doc.lastResult,
+      lastAt: doc.lastAt,
+      channels: doc.channels,
+      dismissedRunAt: doc.dismissedRunAt
+    }, null, 2), "utf-8");
+    renameSync7(tmp, this.path);
+  }
+};
+function createAutoWakeStore(ctx) {
+  const home = resolveChannelPackHome(ctx);
+  if (home === void 0) {
+    ctx.logger?.warn?.("[channel-pack] \u65E0\u6CD5\u5B9A\u4F4D DSH home\uFF0C\u81EA\u52A8\u5524\u9192\u5F00\u5173\u4EC5\u5B58\u5728\u4E8E\u5185\u5B58\u4E2D");
+    return new MemoryAutoWakeStore();
+  }
+  return new FileAutoWakeStore(join9(home, "channel-pack", AUTO_WAKE_FILE), ctx.logger);
+}
+function describeWakeRun(totals) {
+  const parts = [];
+  if (totals.claimed > 0) parts.push(`${totals.claimed} \u4E2A\u8D26\u53F7\u5524\u9192\u6210\u529F`);
+  if (totals.failed > 0) parts.push(`${totals.failed} \u4E2A\u5931\u8D25`);
+  if (totals.skipped > 0) parts.push(`${totals.skipped} \u4E2A\u6E20\u9053\u9700\u624B\u52A8\u5904\u7406`);
+  if (parts.length === 0) return `${totals.providers} \u4E2A\u6E20\u9053\uFF1A\u6CA1\u6709\u9700\u8981\u5524\u9192\u7684\u8D26\u53F7`;
+  return `${totals.providers} \u4E2A\u6E20\u9053\uFF1A${parts.join("\uFF0C")}`;
+}
+function describeWakeChannel(tally) {
+  const parts = [];
+  if (tally.claimed > 0) parts.push(`${tally.claimed} \u4E2A\u5DF2\u5524\u9192`);
+  if (tally.failed > 0) parts.push(`${tally.failed} \u4E2A\u5931\u8D25`);
+  if (parts.length === 0) return "\u65E0\u9700\u5524\u9192";
+  return parts.join("\uFF0C");
+}
+function wakeStoreAdapter(store2) {
+  return { load: () => store2.load(), save: (doc) => store2.save(doc) };
+}
+function createAutoWake(deps) {
+  const schedule = {
+    ...deps,
+    store: wakeStoreAdapter(deps.store),
+    kind: "wake",
+    describeTotals: describeWakeRun,
+    describeChannel: (tally) => describeWakeChannel(tally),
+    // `nothing` = 流水已证明今天全部账号都唤醒成功：如实记一句，别让用户以为没跑。
+    emptyResultText: "\u4ECA\u5929\u6240\u6709\u8D26\u53F7\u90FD\u5DF2\u5524\u9192\u6210\u529F",
+    runLabel: "\u81EA\u52A8\u5524\u9192"
+    // 唤醒无排除表：唤醒覆盖除 OpenCode 外的全部已接入平台（见 ops-runner）。
+  };
+  return createAutoSchedule(schedule);
+}
+
+// vendor/channel-pack/src/ops-journal.ts
+import { existsSync as existsSync10, mkdirSync as mkdirSync8, readFileSync as readFileSync10, renameSync as renameSync8, writeFileSync as writeFileSync9 } from "node:fs";
+import { join as join10 } from "node:path";
 var OPS_JOURNAL_FILE = "ops-journal.json";
-var SCHEMA5 = "channel-pack/ops-journal/v1";
+var SCHEMA6 = "channel-pack/ops-journal/v1";
 var OPS_JOURNAL_MAX_ENTRIES = 2e3;
 var OPS_JOURNAL_MAX_DAYS = 90;
 var DAY_MS = 864e5;
-var DATE_RE2 = /^\d{4}-\d{2}-\d{2}$/;
+var DATE_RE3 = /^\d{4}-\d{2}-\d{2}$/;
 var KINDS = /* @__PURE__ */ new Set(["checkin", "wake"]);
 var OUTCOMES = /* @__PURE__ */ new Set(["ok", "already", "inactive", "failed"]);
 var ORIGINS = /* @__PURE__ */ new Set(["auto", "manual"]);
@@ -57688,7 +57983,7 @@ function sanitizeEntry(raw) {
   const origin = record.origin === "auto" ? "auto" : "manual";
   if (provider === "" || accountId === "" || !KINDS.has(kind) || !OUTCOMES.has(outcome) || !ORIGINS.has(origin)) return null;
   const at = typeof record.at === "number" && Number.isFinite(record.at) && record.at > 0 ? record.at : 0;
-  const day = typeof record.day === "string" && DATE_RE2.test(record.day) ? record.day : at > 0 ? utc8DateString(at) : "";
+  const day = typeof record.day === "string" && DATE_RE3.test(record.day) ? record.day : at > 0 ? utc8DateString(at) : "";
   if (day === "") return null;
   const credit = typeof record.credit === "number" && Number.isFinite(record.credit) && record.credit >= 0 ? record.credit : void 0;
   const unit = record.unit === "token" ? "token" : record.unit === "credit" ? "credit" : void 0;
@@ -57808,8 +58103,8 @@ var FileOpsJournalStore = class {
   queue = Promise.resolve();
   load() {
     try {
-      if (!existsSync9(this.path)) return [];
-      const parsed = JSON.parse(readFileSync9(this.path, "utf-8"));
+      if (!existsSync10(this.path)) return [];
+      const parsed = JSON.parse(readFileSync10(this.path, "utf-8"));
       const raw = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed.entries : void 0;
       if (!Array.isArray(raw)) return [];
       const entries = [];
@@ -57831,10 +58126,10 @@ var FileOpsJournalStore = class {
     const task = async () => {
       this.entries = trimEntries([...this.entries, ...entries.map((entry) => ({ ...entry }))]);
       try {
-        mkdirSync7(join9(this.path, ".."), { recursive: true });
+        mkdirSync8(join10(this.path, ".."), { recursive: true });
         const tmp = `${this.path}.tmp`;
-        writeFileSync8(tmp, JSON.stringify({ schema: SCHEMA5, entries: this.entries }, null, 2), "utf-8");
-        renameSync7(tmp, this.path);
+        writeFileSync9(tmp, JSON.stringify({ schema: SCHEMA6, entries: this.entries }, null, 2), "utf-8");
+        renameSync8(tmp, this.path);
       } catch (error) {
         this.logger?.warn?.(`[channel-pack] \u5199\u5165 ${this.path} \u5931\u8D25\uFF08\u672C\u6B21\u6D41\u6C34\u4EC5\u5B58\u5728\u4E8E\u5185\u5B58\uFF09: ${String(error)}`);
       }
@@ -57849,7 +58144,7 @@ function createOpsJournalStore(ctx) {
     ctx.logger?.warn?.("[channel-pack] \u65E0\u6CD5\u5B9A\u4F4D DSH home\uFF0C\u7B7E\u5230/\u5524\u9192\u6D41\u6C34\u4EC5\u5B58\u5728\u4E8E\u5185\u5B58\u4E2D");
     return new MemoryOpsJournalStore();
   }
-  return new FileOpsJournalStore(join9(home, "channel-pack", OPS_JOURNAL_FILE), ctx.logger);
+  return new FileOpsJournalStore(join10(home, "channel-pack", OPS_JOURNAL_FILE), ctx.logger);
 }
 
 // vendor/channel-pack/src/ops-runner.ts
@@ -57894,11 +58189,11 @@ function createOpsRunner(deps) {
   function snapshot() {
     return cloneStatus(status);
   }
-  async function buildPlan(kind) {
+  async function buildPlan(kind, excluded) {
     const today = utc8DateString(now());
     const entries = deps.journal();
     const all = await deps.accounts();
-    const providers = [...new Set(all.filter((account) => kind === "checkin" ? deps.isCheckinProvider(account.provider) : deps.isWakeProvider(account.provider)).map((account) => account.provider))].sort();
+    const providers = [...new Set(all.filter((account) => kind === "checkin" ? deps.isCheckinProvider(account.provider) : deps.isWakeProvider(account.provider)).map((account) => account.provider))].sort().filter((provider) => !excluded.includes(provider));
     const groups = [];
     for (const provider of providers) {
       const accounts = all.filter((account) => account.provider === provider && !succeededToday(entries, kind, provider, account.id, today));
@@ -57976,7 +58271,8 @@ function createOpsRunner(deps) {
   }
   return {
     status: snapshot,
-    async run(kind) {
+    async run(kind, options) {
+      const excluded = options?.excludeProviders ?? [];
       if (starting || inflight !== null) {
         return { started: false, reason: "running", status: snapshot() };
       }
@@ -57991,7 +58287,7 @@ function createOpsRunner(deps) {
         };
         let plan;
         try {
-          plan = await buildPlan(kind);
+          plan = await buildPlan(kind, excluded);
         } catch (error) {
           finish(kind, `\u8BFB\u53D6\u8D26\u53F7\u6C60\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
           starting = false;
@@ -58019,6 +58315,19 @@ function createOpsRunner(deps) {
 }
 
 // vendor/channel-pack/src/channel-pack-rpc.ts
+var OPS_CHECKIN_PROVIDERS = /* @__PURE__ */ new Set([
+  LOBSTERAI.id,
+  QODER.id,
+  QODER_CN.id,
+  TRAE.id,
+  LOOMY.id,
+  MINIMAX.id,
+  ZCODE.id,
+  WORKBUDDY_ID
+]);
+var OPS_WAKE_EXCLUDED_PROVIDERS = /* @__PURE__ */ new Set([
+  OPENCODE.id
+]);
 var CHANNEL_PACK_API_PATH = "/api/channel-pack";
 var CAPTCHA_CARRIER_PATH = "/api/channel-pack/captcha-carrier";
 var CHANNEL_PACK_ENDPOINT = "channel-pack";
@@ -58334,30 +58643,7 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
   const pendingSmsMsgid = /* @__PURE__ */ new Map();
   const pendingLoginFailures = /* @__PURE__ */ new Map();
   const badgePreferences = createBadgePreferenceStore(ctx);
-  const autoCheckin = createAutoCheckin({
-    store: createAutoCheckinStore(ctx),
-    listProviderIds: async () => {
-      const accounts = await pool.listAllAccounts();
-      return [...new Set(accounts.filter((entry) => isSupportedProvider(entry.provider)).map((entry) => entry.provider))].sort();
-    },
-    claim: (provider) => (
-      // `origin: 'auto'` 只影响流水来源标记；自动签到仍然串行遍历平台。
-      handleMethod("credits.claimAll", { provider, origin: "auto" })
-    ),
-    warn: (message) => ctx.logger?.warn?.(message)
-  });
-  autoCheckin.start();
-  ctx.effect?.(() => () => autoCheckin.stop(), "channel-pack: auto checkin");
   const opsJournal = createOpsJournalStore(ctx);
-  const OPS_CHECKIN_PROVIDERS = /* @__PURE__ */ new Set([
-    LOBSTERAI.id,
-    QODER.id,
-    QODER_CN.id,
-    TRAE.id,
-    LOOMY.id,
-    MINIMAX.id,
-    ZCODE.id
-  ]);
   function checkinOutcomeOf(row) {
     switch (row.outcome.kind) {
       case "claimed":
@@ -58399,9 +58685,55 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
     journal: () => opsJournal.read(),
     isCheckinProvider: (provider) => OPS_CHECKIN_PROVIDERS.has(provider),
     // OpenCode 在本宿主的账号集成被禁用；`account.refresh` 也没有它的分支。
-    isWakeProvider: (provider) => isSupportedProvider(provider) && provider !== OPENCODE.id,
+    isWakeProvider: (provider) => isSupportedProvider(provider) && !OPS_WAKE_EXCLUDED_PROVIDERS.has(provider),
     warn: (message) => ctx.logger?.warn?.(message)
   });
+  const scheduleEntries = () => opsJournal.read().map((entry) => ({
+    at: entry.at,
+    kind: entry.kind,
+    provider: entry.provider,
+    outcome: entry.outcome,
+    message: entry.message,
+    ...entry.credit === void 0 ? {} : { credit: entry.credit },
+    ...entry.unit === void 0 ? {} : { unit: entry.unit },
+    ...entry.coversToday === void 0 ? {} : { coversToday: entry.coversToday }
+  }));
+  const toTriggerReply = (reply2) => ({
+    started: reply2.started,
+    reason: reply2.reason,
+    startedAt: reply2.status.startedAt
+  });
+  const autoCheckin = createAutoSchedule({
+    store: createAutoCheckinStore(ctx),
+    kind: "checkin",
+    trigger: async () => toTriggerReply(await opsRunner.run("checkin", { excludeProviders: [ZCODE.id] })),
+    whenIdle: () => opsRunner.whenIdle(),
+    entries: scheduleEntries,
+    describeTotals: describeRun,
+    describeChannel,
+    emptyResultText: "\u4ECA\u5929\u6240\u6709\u8D26\u53F7\u90FD\u5DF2\u7B7E\u5230\u6210\u529F",
+    runLabel: "\u81EA\u52A8\u7B7E\u5230",
+    listProviderIds: async () => {
+      const accounts = await pool.listAllAccounts();
+      return [...new Set(accounts.filter((entry) => isSupportedProvider(entry.provider)).map((entry) => entry.provider))].sort();
+    },
+    isExcluded: (provider) => isAutoCheckinExcluded(provider),
+    excludedText: "\u9700\u624B\u52A8\u7B7E\u5230",
+    warn: (message) => ctx.logger?.warn?.(message)
+  });
+  const autoWake = createAutoWake({
+    store: createAutoWakeStore(ctx),
+    trigger: async () => toTriggerReply(await opsRunner.run("wake")),
+    whenIdle: () => opsRunner.whenIdle(),
+    entries: scheduleEntries,
+    warn: (message) => ctx.logger?.warn?.(message)
+  });
+  autoCheckin.start();
+  autoWake.start();
+  ctx.effect?.(() => () => {
+    autoCheckin.stop();
+    autoWake.stop();
+  }, "channel-pack: auto checkin/wake");
   const usageBadge = createUsageBadge({
     collectBalances: (provider) => handleMethod("credits.balances", { provider }),
     collectQuota: (provider) => provider === CLINE.id ? handleMethod("cline.quota", { provider }) : void 0,
@@ -58966,6 +59298,24 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
             case GEMINI.id:
               await gemini.refreshAccountCredential(entry.credentialRef, pool, entry.id);
               break;
+            case WORKBUDDY_ID: {
+              const resolved2 = await ctx.credentials.resolve(credentialRef11(entry.credentialRef));
+              if (!resolved2) throw new Error("\u51ED\u636E\u672A\u914D\u7F6E");
+              let credential;
+              try {
+                credential = JSON.parse(resolved2.value);
+              } catch {
+                throw new Error("\u51ED\u636E\u89E3\u6790\u5931\u8D25");
+              }
+              if (typeof credential.accessToken !== "string" || credential.accessToken.length === 0 || typeof credential.uid !== "string" || credential.uid.length === 0) {
+                throw new Error("WorkBuddy \u51ED\u636E\u7F3A\u5C11 accessToken/uid\uFF0C\u8BF7\u91CD\u65B0\u5BFC\u5165\u8BE5\u8D26\u53F7");
+              }
+              const probe = await fetchWorkbuddyCheckinStatus(credential);
+              if (probe === null) {
+                throw new Error("WorkBuddy \u63A2\u6D3B\u5931\u8D25\uFF08\u51ED\u636E\u5931\u6548\u6216\u7F51\u7EDC\u5F02\u5E38\uFF09\uFF0C\u8BF7\u68C0\u67E5\u8BE5\u8D26\u53F7");
+              }
+              break;
+            }
             default:
               throw new Error(`Unknown provider: ${entry.provider}`);
           }
@@ -59368,6 +59718,19 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
           );
           return { ok: true, value: { accounts: value } };
         }
+        if (req.provider === WORKBUDDY_ID) {
+          const wbStatusAccounts = await pool.listAccounts(req.provider);
+          const value = await collectCreditsStatus(
+            wbStatusAccounts,
+            void 0,
+            {
+              resolve: (ref) => ctx.credentials.resolve(ref),
+              fetchStatus: (credential) => fetchWorkbuddyCheckinStatus(credential),
+              warn: (msg) => ctx.logger?.warn?.(msg)
+            }
+          );
+          return { ok: true, value: { accounts: value } };
+        }
         return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
       }
       // 一键领取：逐账号顺序执行（并发易触发风控），单个账号失败不中断整体。
@@ -59513,6 +59876,15 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
             }
           }
           const value = { results, summary: computeClaimSummary(outcomes) };
+          return record(value);
+        }
+        if (req.provider === WORKBUDDY_ID) {
+          const value = await collectClaimResults(accounts, void 0, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential) => fetchWorkbuddyCheckinStatus(credential),
+            claim: (credential) => claimWorkbuddyDailyCheckin(credential),
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
           return record(value);
         }
         return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
@@ -59827,6 +60199,16 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
               balance: buildZcodeBalance(result)
             });
           }
+          return { ok: true, value: { accounts: values } };
+        }
+        if (req.provider === WORKBUDDY_ID) {
+          const accounts2 = await pool.listAccounts(req.provider);
+          const values = accounts2.map((account2) => ({
+            accountId: account2.id,
+            nickname: account2.nickname,
+            balance: null,
+            error: "WorkBuddy \u65E0\u4F59\u989D\u67E5\u8BE2\u63A5\u53E3\uFF08balance \u7AEF\u70B9 404\uFF09\uFF1B\u7B7E\u5230\u79EF\u5206\u53EF\u5728\u7B7E\u5230\u9762\u677F\u67E5\u770B"
+          }));
           return { ok: true, value: { accounts: values } };
         }
         return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
@@ -60583,6 +60965,47 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
         return { ok: true, value };
       }
       /**
+       * 「每日自动唤醒」开关（读 / 写，**全局一个**）。校验口径与
+       * `usage.autoCheckin` 完全一致（省略 = 只读；非法值拒绝不回落）。
+       *
+       * ⚠️ 开关**默认关闭**（`auto-wake.ts` 的 `DEFAULT_AUTO_WAKE`）：唤醒是
+       * 逐账号刷新/探活凭据的写操作，用户必须在「签到与唤醒」页显式打开。
+       * 打开时宿主同样**立刻尝试一轮**（今天已跑过则内部拦住）。
+       */
+      case "usage.autoWake": {
+        const req = payload;
+        if (req.dismiss !== void 0) {
+          if (typeof req.dismiss !== "boolean") {
+            return {
+              ok: false,
+              error: {
+                code: "bad-request",
+                message: `dismiss \u5FC5\u987B\u662F\u5E03\u5C14\u503C\uFF08\u6536\u5230\uFF1A${JSON.stringify(req.dismiss)}\uFF09`
+              }
+            };
+          }
+          if (req.dismiss) {
+            const value2 = { autoWake: await autoWake.dismiss() };
+            return { ok: true, value: value2 };
+          }
+        }
+        if (req.enabled === void 0) {
+          const value2 = { autoWake: autoWake.state() };
+          return { ok: true, value: value2 };
+        }
+        if (typeof req.enabled !== "boolean") {
+          return {
+            ok: false,
+            error: {
+              code: "bad-request",
+              message: `enabled \u5FC5\u987B\u662F\u5E03\u5C14\u503C\uFF08\u6536\u5230\uFF1A${JSON.stringify(req.enabled)}\uFF09`
+            }
+          };
+        }
+        const value = { autoWake: await autoWake.setEnabled(req.enabled) };
+        return { ok: true, value };
+      }
+      /**
        * 签到与唤醒流水（设置页「签到与唤醒流水」页）。
        *
        * 纯内存 + 落盘文档读取（`ops-journal.json`），不打上游。`date` / `provider` /
@@ -60644,22 +61067,22 @@ function reply(rpcId, result) {
 import { createServer as createServer6 } from "node:http";
 import { randomUUID as randomUUID12 } from "node:crypto";
 import { homedir as homedir4 } from "node:os";
-import { join as join11 } from "node:path";
+import { join as join12 } from "node:path";
 
 // vendor/channel-pack/src/openai-gateway/auth.ts
-import { mkdirSync as mkdirSync8, readFileSync as readFileSync10, renameSync as renameSync8, writeFileSync as writeFileSync9, existsSync as existsSync10 } from "node:fs";
+import { mkdirSync as mkdirSync9, readFileSync as readFileSync11, renameSync as renameSync9, writeFileSync as writeFileSync10, existsSync as existsSync11 } from "node:fs";
 import { randomBytes as randomBytes10 } from "node:crypto";
-import { join as join10 } from "node:path";
+import { join as join11 } from "node:path";
 var KEY_FILE = "api-key";
 var KEY_PATTERN2 = /^[A-Za-z0-9_-]{43}$/;
 function loadOrCreateApiKey(home, env = process.env) {
   const configured = env.DSH_OPENAI_GATEWAY_API_KEY?.trim();
   if (configured) return { value: configured, fromEnv: true, path: null };
-  const directory = join10(home, "openai-gateway");
-  const path2 = join10(directory, KEY_FILE);
+  const directory = join11(home, "openai-gateway");
+  const path2 = join11(directory, KEY_FILE);
   let stored;
   try {
-    stored = readFileSync10(path2, "utf8").trim();
+    stored = readFileSync11(path2, "utf8").trim();
   } catch {
   }
   if (stored) {
@@ -60669,14 +61092,14 @@ function loadOrCreateApiKey(home, env = process.env) {
     );
   }
   const key = randomBytes10(32).toString("base64url");
-  mkdirSync8(directory, { recursive: true });
+  mkdirSync9(directory, { recursive: true });
   const temporary = `${path2}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync9(temporary, key, { encoding: "utf8", mode: 384 });
+  writeFileSync10(temporary, key, { encoding: "utf8", mode: 384 });
   try {
-    renameSync8(temporary, path2);
+    renameSync9(temporary, path2);
   } catch (error) {
-    if (existsSync10(path2)) {
-      const existing = readFileSync10(path2, "utf8").trim();
+    if (existsSync11(path2)) {
+      const existing = readFileSync11(path2, "utf8").trim();
       if (KEY_PATTERN2.test(existing)) return { value: existing, fromEnv: false, path: path2 };
     }
     throw error;
@@ -62081,7 +62504,7 @@ function authorized(request, key) {
   return typeof value === "string" && value === `Bearer ${key}`;
 }
 function getHome(options) {
-  return options.home ?? options.env?.DSH_HOME ?? process.env.DSH_HOME ?? join11(homedir4(), ".dsh");
+  return options.home ?? options.env?.DSH_HOME ?? process.env.DSH_HOME ?? join12(homedir4(), ".dsh");
 }
 function createOpenAiGateway(options) {
   const env = options.env ?? process.env;
@@ -62587,12 +63010,12 @@ function installLoopResume(ctx) {
 }
 
 // vendor/channel-pack/src/token-ledger-store.ts
-import { existsSync as existsSync11, mkdirSync as mkdirSync9, readFileSync as readFileSync11, renameSync as renameSync9, writeFileSync as writeFileSync10 } from "node:fs";
-import { join as join12 } from "node:path";
+import { existsSync as existsSync12, mkdirSync as mkdirSync10, readFileSync as readFileSync12, renameSync as renameSync10, writeFileSync as writeFileSync11 } from "node:fs";
+import { join as join13 } from "node:path";
 var TOKEN_LEDGER_FILE = "token-ledger.json";
 var TOKEN_LEDGER_DAYS = 90;
 var TOKEN_LEDGER_FLUSH_MS = 2e3;
-var SCHEMA6 = "channel-pack/token-ledger/v1";
+var SCHEMA7 = "channel-pack/token-ledger/v1";
 function pruneDays(days) {
   const cutoff = Date.now() + 8 * 60 * 60 * 1e3 - TOKEN_LEDGER_DAYS * 24 * 60 * 60 * 1e3;
   const pruned = /* @__PURE__ */ new Map();
@@ -62637,8 +63060,8 @@ var FileLedgerStore = class {
   readFile() {
     const out = /* @__PURE__ */ new Map();
     try {
-      if (!existsSync11(this.path)) return out;
-      const parsed = JSON.parse(readFileSync11(this.path, "utf-8"));
+      if (!existsSync12(this.path)) return out;
+      const parsed = JSON.parse(readFileSync12(this.path, "utf-8"));
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return out;
       const record = parsed;
       if (typeof record.days !== "object" || record.days === null || Array.isArray(record.days)) return out;
@@ -62729,7 +63152,7 @@ var FileLedgerStore = class {
    */
   flush() {
     try {
-      mkdirSync9(join12(this.path, ".."), { recursive: true });
+      mkdirSync10(join13(this.path, ".."), { recursive: true });
       const merged = this.readFile();
       let hasDelta = false;
       for (const [day, buckets] of this.days) {
@@ -62757,8 +63180,8 @@ var FileLedgerStore = class {
         days[day] = Object.fromEntries(buckets);
       }
       const tmp = `${this.path}.tmp`;
-      writeFileSync10(tmp, JSON.stringify({ schema: SCHEMA6, days }, null, 2), "utf-8");
-      renameSync9(tmp, this.path);
+      writeFileSync11(tmp, JSON.stringify({ schema: SCHEMA7, days }, null, 2), "utf-8");
+      renameSync10(tmp, this.path);
       this.written = cloneDays(this.days);
     } catch (error) {
       this.logger?.warn(`[channel-pack] \u5199\u5165 ${this.path} \u5931\u8D25\uFF08\u672C\u6B21\u7EDF\u8BA1\u4E0D\u5165\u76D8\uFF09: ${String(error)}`);
@@ -62818,7 +63241,7 @@ function createTokenLedgerStore(ctx) {
     ctx.logger?.warn?.("[channel-pack] \u65E0\u6CD5\u5B9A\u4F4D DSH home\uFF0CToken \u7528\u91CF\u5386\u53F2\u4EC5\u5B58\u5728\u4E8E\u5185\u5B58\u4E2D");
     return new MemoryLedgerStore();
   }
-  return new FileLedgerStore(join12(home, "channel-pack", TOKEN_LEDGER_FILE), ctx.logger);
+  return new FileLedgerStore(join13(home, "channel-pack", TOKEN_LEDGER_FILE), ctx.logger);
 }
 
 // vendor/channel-pack/src/minimax-auth.ts
@@ -64702,8 +65125,8 @@ var GeminiAuth = class extends Service9 {
 
 // vendor/channel-pack/src/gemini-sigstore.ts
 import { createHash as createHash8 } from "node:crypto";
-import { existsSync as existsSync12, mkdirSync as mkdirSync10, readFileSync as readFileSync12, renameSync as renameSync10, writeFileSync as writeFileSync11 } from "node:fs";
-import { dirname as dirname2, join as join13 } from "node:path";
+import { existsSync as existsSync13, mkdirSync as mkdirSync11, readFileSync as readFileSync13, renameSync as renameSync11, writeFileSync as writeFileSync12 } from "node:fs";
+import { dirname as dirname2, join as join14 } from "node:path";
 var GEMINI_SIG_FILE = "gemini-sigs.json";
 var GEMINI_SIG_MAX_ENTRIES = 2e3;
 var SIG_KEY_BODY_LIMIT = 512;
@@ -64812,10 +65235,10 @@ var GeminiSigStore = class {
       2
     );
     try {
-      mkdirSync10(dirname2(this.path), { recursive: true });
+      mkdirSync11(dirname2(this.path), { recursive: true });
       const tmp = `${this.path}.tmp`;
-      writeFileSync11(tmp, payload, "utf-8");
-      renameSync10(tmp, this.path);
+      writeFileSync12(tmp, payload, "utf-8");
+      renameSync11(tmp, this.path);
     } catch (error) {
       this.logger?.warn(`[gemini] \u7B7E\u540D\u7F13\u5B58\u5199\u5165\u5931\u8D25\uFF08\u4E0D\u5F71\u54CD\u63A8\u7406\uFF09: ${String(error)}`);
     }
@@ -64825,8 +65248,8 @@ var GeminiSigStore = class {
     const out = /* @__PURE__ */ new Map();
     if (this.path === void 0) return out;
     try {
-      if (!existsSync12(this.path)) return out;
-      const parsed = JSON.parse(readFileSync12(this.path, "utf-8"));
+      if (!existsSync13(this.path)) return out;
+      const parsed = JSON.parse(readFileSync13(this.path, "utf-8"));
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return out;
       for (const [key, value] of Object.entries(parsed)) {
         if (typeof value !== "object" || value === null) continue;
@@ -64850,7 +65273,7 @@ function createGeminiSigStore(ctx) {
     ctx.logger?.warn?.("[gemini] \u65E0\u6CD5\u5B9A\u4F4D DSH home\uFF0C\u7B7E\u540D\u7F13\u5B58\u4EC5\u5B58\u5728\u4E8E\u5185\u5B58\u4E2D\uFF08\u547D\u4E2D\u7387\u4F1A\u5728\u91CD\u542F\u540E\u5F52\u96F6\uFF09");
     return new GeminiSigStore(void 0, ctx.logger);
   }
-  return new GeminiSigStore(join13(home, "channel-pack", GEMINI_SIG_FILE), ctx.logger);
+  return new GeminiSigStore(join14(home, "channel-pack", GEMINI_SIG_FILE), ctx.logger);
 }
 
 // vendor/channel-pack/src/opencode-adapter.ts
@@ -65078,9 +65501,9 @@ function buildOpencodePayloadWithToolMap(input) {
 
 // vendor/channel-pack/src/opencode-capability.ts
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { readFileSync as readFileSync13 } from "node:fs";
+import { readFileSync as readFileSync14 } from "node:fs";
 import { homedir as homedir5 } from "node:os";
-import { join as join14 } from "node:path";
+import { join as join15 } from "node:path";
 var MEASURED_IMAGE_OVERRIDES = {
   // 实测 2026-10-02：models.dev 标 `modalities.input: ["text"]`，
   // 但 1×1 PNG 的多模态请求真实返回 200（big-pickle 是最常用的免费模型）。
@@ -65140,8 +65563,8 @@ function normalizeEntry(id, raw) {
   };
 }
 function cacheFilePath() {
-  const home = process.env.DSH_HOME?.trim() || join14(homedir5(), ".dsh");
-  return join14(home, "cache", "opencode-capabilities.json");
+  const home = process.env.DSH_HOME?.trim() || join15(homedir5(), ".dsh");
+  return join15(home, "cache", "opencode-capabilities.json");
 }
 var memory = [];
 var cacheFileAt = 0;
@@ -65164,7 +65587,7 @@ function loadDiskCacheSync() {
   if (diskLoaded) return;
   diskLoaded = true;
   try {
-    const raw = readFileSync13(cacheFilePath(), "utf8");
+    const raw = readFileSync14(cacheFilePath(), "utf8");
     const parsed = JSON.parse(raw);
     if (parsed?.version === 3 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
       memory = parsed.entries;
@@ -65176,7 +65599,7 @@ function loadDiskCacheSync() {
 async function writeDiskCache(entries) {
   try {
     const path2 = cacheFilePath();
-    await mkdir(join14(path2, ".."), { recursive: true });
+    await mkdir(join15(path2, ".."), { recursive: true });
     const payload = { version: 3, at: Date.now(), entries };
     await writeFile(path2, JSON.stringify(payload), "utf8");
   } catch {

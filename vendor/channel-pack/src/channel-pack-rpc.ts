@@ -58,6 +58,12 @@ import {
 } from './minimax-credits.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiCredential } from './gemini.js'
+import {
+  WORKBUDDY_ID,
+  claimWorkbuddyDailyCheckin,
+  fetchWorkbuddyCheckinStatus,
+  type WorkbuddyCredential,
+} from './workbuddy-credits.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 import { fetchGeminiCreditBalance } from './gemini-credits.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
@@ -217,7 +223,17 @@ import {
   createBadgePreferenceStore,
 } from './badge-preferences.js'
 import { createUsageBadge, type BadgeRpcResult } from './usage-badge.js'
-import { createAutoCheckin, createAutoCheckinStore, utc8DateString } from './auto-checkin.js'
+import {
+  createAutoSchedule,
+  createAutoCheckinStore,
+  isAutoCheckinExcluded,
+  utc8DateString,
+  describeChannel as describeCheckinChannel,
+  describeRun as describeCheckinRun,
+  type AutoScheduleEntry,
+  type AutoTriggerReply,
+} from './auto-checkin.js'
+import { createAutoWake, createAutoWakeStore, type RpcUsageAutoWakeRequest, type RpcUsageAutoWakeResponse } from './auto-wake.js'
 import {
   OPS_JOURNAL_MAX_ENTRIES,
   claimJournalEntries,
@@ -225,6 +241,37 @@ import {
   wakeJournalEntry,
 } from './ops-journal.js'
 import { createOpsRunner } from './ops-runner.js'
+import type { RpcOpsRunResponse } from './types.js'
+
+/**
+ * 有签到实现的平台。无签到接口的平台（Cline / Raccoon / Gemini）不参与签到；
+ * WorkBuddy 有独立签到接口（2026-11-13 实测），参与签到与一键签到。
+ *
+ * **模块级导出**：「自动唤醒也覆盖 WorkBuddy」这类覆盖面断言要能被测试静态检查
+ * （`scripts/channel-ops-rpc-test.mjs`），挂在端点装配函数内部就拿不到。
+ */
+export const OPS_CHECKIN_PROVIDERS: ReadonlySet<string> = new Set([
+  LOBSTERAI.id,
+  QODER.id,
+  QODER_CN.id,
+  TRAE.id,
+  LOOMY.id,
+  MINIMAX.id,
+  ZCODE.id,
+  WORKBUDDY_ID,
+])
+
+/**
+ * **不参与唤醒**的平台。当前只有 OpenCode：它在宿主的账号集成被禁用，
+ * `account.refresh` 也没有它的分支。
+ *
+ * ⚠️ **不要**把 WorkBuddy 加进来：它走「重读凭据 + 探活」的唤醒分支
+ * （`account.refresh` 的 `WORKBUDDY_ID` case），必须被一键唤醒 / 自动唤醒覆盖。
+ * `scripts/channel-ops-rpc-test.mjs` 有反向守护断言。
+ */
+export const OPS_WAKE_EXCLUDED_PROVIDERS: ReadonlySet<string> = new Set([
+  OPENCODE.id,
+])
 
 /** Channel Pack RPC API 路径 */
 export const CHANNEL_PACK_API_PATH = '/api/channel-pack'
@@ -959,37 +1006,6 @@ function registerChannelPackEndpoints(
   const badgePreferences = createBadgePreferenceStore(ctx)
 
   /**
-   * 「每日首次启动自动签到」（独立文档 `auto-checkin.json`）。
-   *
-   * ⚠️ **不维护第二份「哪些渠道能签到」的名单**：判据交给下面的 `claim` ——
-   * `credits.claimAll` 对不支持的渠道会**不发上游请求**就返回明确错误，本执行体
-   * 把它计为「跳过」。客户端的能力表（`credits-capabilities.js`）仍是唯一权威。
-   *
-   * ⚠️ 「有账号的渠道」由账号池派生（`pool.listAllAccounts()` 只是同步内存副本
-   * 的异步外壳），不遍历 12 个渠道里没账号的那些 —— 那些调下去只会拿到空结果。
-   */
-  const autoCheckin = createAutoCheckin({
-    store: createAutoCheckinStore(ctx),
-    listProviderIds: async () => {
-      const accounts = await pool.listAllAccounts()
-      return [...new Set(accounts.filter((entry) => isSupportedProvider(entry.provider)).map((entry) => entry.provider))].sort()
-    },
-    claim: (provider) =>
-      // `origin: 'auto'` 只影响流水来源标记；自动签到仍然串行遍历平台。
-      handleMethod('credits.claimAll', { provider, origin: 'auto' }) as Promise<BadgeRpcResult<RpcCreditsClaimAllResponse>>,
-    warn: (message) => ctx.logger?.warn?.(message),
-  })
-  // 启动时排定一轮（延迟 30s；内部自己判开关与「今天是否已跑」）。
-  autoCheckin.start()
-  /**
-   * ⚠️ `ctx.effect` 必须**可选调用**：本文件此前没用过它，而大量单测的 ctx 桩是
-   * 最小化的（没有 `effect`）—— 直接调用会让 138 条无关用例报
-   * `ctx.effect is not a function`（2026-10-02 实测到）。真实宿主里它一定存在，
-   * 故这里的降级只影响桩环境，不影响生产环境的清理语义。
-   */
-  ctx.effect?.(() => () => autoCheckin.stop(), 'channel-pack: auto checkin')
-
-  /**
    * 签到 / 唤醒流水（独立文档 `ops-journal.json`）。
    *
    * ⚠️ 它**只写观测**：调用方不需要 try/catch，`append()` 自己吞掉写盘异常。
@@ -997,17 +1013,6 @@ function registerChannelPackEndpoints(
    * 都会落账，因此历史面板与一键任务的「今天是否已成功」天然同源。
    */
   const opsJournal = createOpsJournalStore(ctx)
-
-  /** 有签到实现的平台。无签到接口的平台（Cline / Raccoon / Gemini）不参与签到。 */
-  const OPS_CHECKIN_PROVIDERS = new Set<string>([
-    LOBSTERAI.id,
-    QODER.id,
-    QODER_CN.id,
-    TRAE.id,
-    LOOMY.id,
-    MINIMAX.id,
-    ZCODE.id,
-  ])
 
   /** 把一条领取结果归一成执行体要的结局。 */
   function checkinOutcomeOf(row: RpcCreditsClaimAccountResult): { outcome: 'ok' | 'already' | 'inactive' | 'failed'; message: string } {
@@ -1064,9 +1069,87 @@ function registerChannelPackEndpoints(
     journal: () => opsJournal.read(),
     isCheckinProvider: (provider) => OPS_CHECKIN_PROVIDERS.has(provider),
     // OpenCode 在本宿主的账号集成被禁用；`account.refresh` 也没有它的分支。
-    isWakeProvider: (provider) => isSupportedProvider(provider) && provider !== OPENCODE.id,
+    isWakeProvider: (provider) => isSupportedProvider(provider) && !OPS_WAKE_EXCLUDED_PROVIDERS.has(provider),
     warn: (message) => ctx.logger?.warn?.(message),
   })
+
+  /** 流水条目 → 自动任务骨架要的形状（升序读出来，直接映射即可）。 */
+  const scheduleEntries = (): readonly AutoScheduleEntry[] =>
+    opsJournal.read().map((entry) => ({
+      at: entry.at,
+      kind: entry.kind,
+      provider: entry.provider,
+      outcome: entry.outcome,
+      message: entry.message,
+      ...entry.credit === undefined ? {} : { credit: entry.credit },
+      ...entry.unit === undefined ? {} : { unit: entry.unit },
+      ...entry.coversToday === undefined ? {} : { coversToday: entry.coversToday },
+    }))
+
+  /** `opsRunner.run()` 回执 → 自动任务骨架要的形状。 */
+  const toTriggerReply = (reply: RpcOpsRunResponse): AutoTriggerReply => ({
+    started: reply.started,
+    reason: reply.reason,
+    startedAt: reply.status.startedAt,
+  })
+
+  /**
+   * 「每日自动签到」（独立文档 `auto-checkin.json`）。
+   *
+   * ⚠️ **执行路径与手动一键签到完全同一条**（2026-11 需求）：本执行体只在「今天
+   * 到点该不该跑」上做判断，真正干活的是上面的 `opsRunner`（逐账号、5 秒间隔、
+   * 按流水幂等、`origin: 'auto'` 落同一份流水）。自动回执统计也直接读流水 ——
+   * 不存在第二套执行语义。
+   * ⚠️ 排除表 `isAutoCheckinExcluded`（zcode 的高代价 captcha）在两处生效：
+   * `opsRunner.run` 的 `excludeProviders` 把它摘出**执行计划**（先于任何上游
+   * 请求），`isExcluded` 再给逐渠道状态出一行「需手动签到」的提示。手动一键
+   * **不传**排除：那是用户的显式操作。
+   */
+  const autoCheckin = createAutoSchedule({
+    store: createAutoCheckinStore(ctx),
+    kind: 'checkin',
+    trigger: async () => toTriggerReply(await opsRunner.run('checkin', { excludeProviders: [ZCODE.id] })),
+    whenIdle: () => opsRunner.whenIdle(),
+    entries: scheduleEntries,
+    describeTotals: describeCheckinRun,
+    describeChannel: describeCheckinChannel,
+    emptyResultText: '今天所有账号都已签到成功',
+    runLabel: '自动签到',
+    listProviderIds: async () => {
+      const accounts = await pool.listAllAccounts()
+      return [...new Set(accounts.filter((entry) => isSupportedProvider(entry.provider)).map((entry) => entry.provider))].sort()
+    },
+    isExcluded: (provider) => isAutoCheckinExcluded(provider),
+    excludedText: '需手动签到',
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+
+  /**
+   * 「每日自动唤醒」（独立文档 `auto-wake.json`，结构照 auto-checkin 但**默认
+   * 关闭**：唤醒是逐账号刷新/探活凭据的写操作，用户须在「签到与唤醒」页显式
+   * 打开；理由详见 `auto-wake.ts` 的文件头）。
+   *
+   * 与自动签到同一骨架、同一执行路径（`opsRunner.run('wake')`），覆盖面由
+   * `opsRunner` 的 `isWakeProvider` 决定 —— 除 OpenCode 外的全部已接入平台
+   * （含 WorkBuddy），无第二份名单。
+   */
+  const autoWake = createAutoWake({
+    store: createAutoWakeStore(ctx),
+    trigger: async () => toTriggerReply(await opsRunner.run('wake')),
+    whenIdle: () => opsRunner.whenIdle(),
+    entries: scheduleEntries,
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // 启动时各排定一轮（延迟 30s；内部自己判开关与「今天是否已跑」）。
+  autoCheckin.start()
+  autoWake.start()
+  /**
+   * ⚠️ `ctx.effect` 必须**可选调用**：本文件此前没用过它，而大量单测的 ctx 桩是
+   * 最小化的（没有 `effect`）—— 直接调用会让 138 条无关用例报
+   * `ctx.effect is not a function`（2026-10-02 实测到）。真实宿主里它一定存在，
+   * 故这里的降级只影响桩环境，不影响生产环境的清理语义。
+   */
+  ctx.effect?.(() => () => { autoCheckin.stop(); autoWake.stop() }, 'channel-pack: auto checkin/wake')
 
   /**
    * 用量徽标读数服务（宿主侧 TTL 缓存 + 只保留启用账号 + 附加订阅读数）。
@@ -1968,6 +2051,34 @@ if (provider === LOBSTERAI.id) {
               // ⚠️ Google 会**轮换 refresh_token**，`GeminiAuth` 内部已回写新值。
               await gemini.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
+            case WORKBUDDY_ID: {
+              /**
+               * WorkBuddy **没有 OAuth 续期端点**（账号池凭据是直接导入的
+               * access/refresh token；上游 refresh 端点未公开）。
+               *
+               * 与 ZCode 同策略：唤醒 = **重读自己的 ref 并回写账号条目**，
+               * 用户更新凭据后无需重启 DSH。同时用状态端点做一次**真探活**：
+               * HTTP 200 + code 0 ⇒ 凭据有效；401 ⇒ 抛「请重新登录」。
+               * 探活失败不臆造成功 —— 唤醒的语义是「验证它现在活着」。
+               */
+              const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+              if (!resolved) throw new Error('凭据未配置')
+              let credential: WorkbuddyCredential
+              try {
+                credential = JSON.parse(resolved.value) as WorkbuddyCredential
+              } catch {
+                throw new Error('凭据解析失败')
+              }
+              if (typeof credential.accessToken !== 'string' || credential.accessToken.length === 0
+                || typeof credential.uid !== 'string' || credential.uid.length === 0) {
+                throw new Error('WorkBuddy 凭据缺少 accessToken/uid，请重新导入该账号')
+              }
+              const probe = await fetchWorkbuddyCheckinStatus(credential)
+              if (probe === null) {
+                throw new Error('WorkBuddy 探活失败（凭据失效或网络异常），请检查该账号')
+              }
+              break
+            }
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
           }
@@ -2470,6 +2581,20 @@ if (provider === LOBSTERAI.id) {
           )
           return { ok: true, value: { accounts: value } satisfies RpcCreditsStatusResponse }
         }
+        if (req.provider === WORKBUDDY_ID) {
+          // ⚠️ WorkBuddy **有**独立的签到状态端点（`checkin-activity-status`，
+          // 2026-11-13 实测），与 MiniMax 同类：走共享 helper 真查。
+          // ⚠️ 文件头口径：`total_credits` 是活动累计奖励，**不是**消费余额。
+          const wbStatusAccounts = await pool.listAccounts(req.provider)
+          const value = await collectCreditsStatus<WorkbuddyCredential, undefined>(
+            wbStatusAccounts, undefined, {
+              resolve: (ref) => ctx.credentials.resolve(ref),
+              fetchStatus: (credential) => fetchWorkbuddyCheckinStatus(credential),
+              warn: (msg) => ctx.logger?.warn?.(msg),
+            },
+          )
+          return { ok: true, value: { accounts: value } satisfies RpcCreditsStatusResponse }
+        }
         return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
       }
 
@@ -2686,6 +2811,20 @@ if (provider === LOBSTERAI.id) {
             }
           }
           const value: RpcCreditsClaimAllResponse = { results, summary: computeClaimSummary(outcomes) }
+          return record(value)
+        }
+        if (req.provider === WORKBUDDY_ID) {
+          // WorkBuddy 每日签到：逐账号 POST `/billing/meter/daily-checkin`。
+          //
+          // ⚠️ **开启状态预检**（`precheckStatus` 默认 true）：WB 有独立状态端点，
+          // 与 TRAE/MiniMax 同理，预检把「今天已签」在发领取请求前挡住。
+          // ⚠️ credit 单位是「活动积分」（不是 token），缺省口径即可。
+          const value = await collectClaimResults<WorkbuddyCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential) => fetchWorkbuddyCheckinStatus(credential),
+            claim: (credential) => claimWorkbuddyDailyCheckin(credential),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
           return record(value)
         }
         return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
@@ -3078,6 +3217,21 @@ if (provider === LOBSTERAI.id) {
               balance: buildZcodeBalance(result),
             })
           }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === WORKBUDDY_ID) {
+          // ⚠️ WorkBuddy **没有余额端点**：`/billing/meter/balance` 实测恒 404
+          //（2026-11-13，3 个存活账号）。签到返回的 `total_credits` 是**活动
+          // 累计奖励计数**，不是消费余额，映射成余额会误导用户。
+          // 这里逐账号如实报「无余额接口」，不编造数字 —— 与 Cline/Raccoon
+          // 显式返回可读错误（而非落到 unsupported provider 泛化文案）的理由同源。
+          const accounts = await pool.listAccounts(req.provider)
+          const values: RpcCreditsBalancesResponse['accounts'] = accounts.map((account) => ({
+            accountId: account.id,
+            nickname: account.nickname,
+            balance: null,
+            error: 'WorkBuddy 无余额查询接口（balance 端点 404）；签到积分可在签到面板查看',
+          }))
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
@@ -3992,6 +4146,48 @@ if (provider === LOBSTERAI.id) {
           }
         }
         const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.setEnabled(req.enabled) }
+        return { ok: true, value }
+      }
+
+      /**
+       * 「每日自动唤醒」开关（读 / 写，**全局一个**）。校验口径与
+       * `usage.autoCheckin` 完全一致（省略 = 只读；非法值拒绝不回落）。
+       *
+       * ⚠️ 开关**默认关闭**（`auto-wake.ts` 的 `DEFAULT_AUTO_WAKE`）：唤醒是
+       * 逐账号刷新/探活凭据的写操作，用户必须在「签到与唤醒」页显式打开。
+       * 打开时宿主同样**立刻尝试一轮**（今天已跑过则内部拦住）。
+       */
+      case 'usage.autoWake': {
+        const req = payload as RpcUsageAutoWakeRequest
+        if (req.dismiss !== undefined) {
+          if (typeof req.dismiss !== 'boolean') {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: `dismiss 必须是布尔值（收到：${JSON.stringify(req.dismiss)}）`,
+              },
+            }
+          }
+          if (req.dismiss) {
+            const value: RpcUsageAutoWakeResponse = { autoWake: await autoWake.dismiss() }
+            return { ok: true, value }
+          }
+        }
+        if (req.enabled === undefined) {
+          const value: RpcUsageAutoWakeResponse = { autoWake: autoWake.state() }
+          return { ok: true, value }
+        }
+        if (typeof req.enabled !== 'boolean') {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: `enabled 必须是布尔值（收到：${JSON.stringify(req.enabled)}）`,
+            },
+          }
+        }
+        const value: RpcUsageAutoWakeResponse = { autoWake: await autoWake.setEnabled(req.enabled) }
         return { ok: true, value }
       }
 

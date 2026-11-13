@@ -660,6 +660,15 @@ window.__ModuleLoader__.load({
         'activity.count': '共 {total} 条 · 本页 {shown} 条',
         'activity.noMatch': '没有符合筛选条件的流水。',
         'activity.empty': '还没有签到或唤醒流水。',
+        'activity.autoCheckin.title': '每日自动签到',
+        'activity.autoWake.title': '每日自动唤醒',
+        'activity.auto.running': '执行中…',
+        'activity.autoCheckin.ran': '今日已自动签到',
+        'activity.autoCheckin.off': '今日尚未自动签到',
+        'activity.autoWake.ran': '今日已自动唤醒',
+        'activity.autoWake.off': '今日尚未自动唤醒',
+        'activity.auto.last': '上次结果：{result}',
+        'activity.auto.disabled': '未启用',
         'gw.title': '网关设置',
         'gw.sub': '把渠道模型以 OpenAI 兼容接口发给本机与局域网工具：端点、密钥与转发端口都在这里。',
         'gw.gatewayTitle': '渠道模型网关（OpenAI 兼容）',
@@ -700,11 +709,6 @@ window.__ModuleLoader__.load({
         'chan.credits.partial': '{count} 个账号未能查询余额，请展开账号查看原因并重试。',
         'chan.credits.unavailable': '未返回余额数据',
         'chan.claim.failed': '领取失败：{reason}',
-        'chan.auto.title': '每日自动签到',
-        'chan.auto.running': '签到进行中…',
-        'chan.auto.ran': '今日已自动签到',
-        'chan.auto.off': '今日尚未签到',
-        'chan.auto.last': '上次结果：{result}',
         'nav.tab.aggregate': '聚合渠道',
         'nav.tab.workspace': '模型工作台',
         'engine.start': '打开工作台',
@@ -1572,6 +1576,15 @@ window.__ModuleLoader__.load({
         'activity.count': '{total} entries · {shown} on this page',
         'activity.noMatch': 'No entries match these filters.',
         'activity.empty': 'No check-in or wake entries yet.',
+        'activity.autoCheckin.title': 'Daily auto check-in',
+        'activity.autoWake.title': 'Daily auto wake',
+        'activity.auto.running': 'Running…',
+        'activity.autoCheckin.ran': 'Auto checked in today',
+        'activity.autoCheckin.off': 'Not auto checked in today',
+        'activity.autoWake.ran': 'Auto woken today',
+        'activity.autoWake.off': 'Not auto woken today',
+        'activity.auto.last': 'Last result: {result}',
+        'activity.auto.disabled': 'Disabled',
         'gw.title': 'Gateway settings',
         'gw.sub': 'Serve the channel models over an OpenAI-compatible API to this machine and the LAN: endpoint, key and relay port live here.',
         'gw.gatewayTitle': 'Channel gateway (OpenAI compatible)',
@@ -1612,11 +1625,6 @@ window.__ModuleLoader__.load({
         'chan.credits.partial': 'Could not query {count} accounts. Expand accounts to see the reasons and retry.',
         'chan.credits.unavailable': 'No balance data returned',
         'chan.claim.failed': 'Claim failed: {reason}',
-        'chan.auto.title': 'Daily auto check-in',
-        'chan.auto.running': 'Check-in running…',
-        'chan.auto.ran': 'Checked in today',
-        'chan.auto.off': 'Not checked in today',
-        'chan.auto.last': 'Last result: {result}',
         'nav.tab.aggregate': 'Aggregate',
         'nav.tab.workspace': 'Model workspace',
         'engine.start': 'Open workspace',
@@ -5367,17 +5375,9 @@ window.__ModuleLoader__.load({
       const { available, rpc } = useChannelRpc(ctx)
       const [query, setQuery] = useState('')
       const [filter, setFilter] = useState('')
-      // The pack runs a daily auto check-in engine across the credit channels;
-      // this page is where it is switched and watched (usage.autoCheckin).
-      const [auto, setAuto] = useState(undefined)
-      const loadAuto = useCallback(async () => {
-        if (!available) return
-        try { const value = await rpc('usage.autoCheckin', {}, 30_000); setAuto(value?.autoCheckin ?? null) } catch { setAuto(null) }
-      }, [available, rpc])
-      useEffect(() => { void loadAuto() }, [loadAuto])
-      const toggleAuto = async () => {
-        try { const value = await rpc('usage.autoCheckin', { enabled: auto?.enabled !== true }, 60_000); setAuto(value?.autoCheckin ?? null) } catch { /* the status refresh tells */ }
-      }
+      // 「每日自动签到 / 自动唤醒」的开关已搬到「签到与唤醒」页（2026-11 需求：
+      // 自动与手动是同一件事的两个入口，该放在同一页）。本页不再读
+      // usage.autoCheckin —— RPC 语义没变，别的地方照常可用。
       const [statuses, setStatuses] = useState(undefined)
       const [error, setError] = useState('')
       const pack = summary?.channels ?? { state: 'pending', error: '' }
@@ -5461,12 +5461,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'ofm_pills' },
               h(Pill, { strong: true, tone: ready ? 'ok' : failed ? 'err' : 'warn' },
                 ready ? `${connected}/${CHANNEL_PROVIDERS.length} ${t('chan.state.on')}` : t('chan.state.off')),
-              h(Pill, null, `${t('chan.meta.accounts')} ${statuses === undefined ? '—' : CHANNEL_PROVIDERS.reduce((sum, row) => sum + (statuses[row.id]?.accounts?.enabled ?? 0), 0)}`))),
-          auto == null ? null : h('div', { className: 'ofm_row' },
-            h(Switch, { checked: auto.enabled === true, label: t('chan.auto.title'), onChange: () => void toggleAuto() }),
-            h(Pill, { tone: auto.running === true ? 'warn' : auto.ranToday === true ? 'ok' : '' },
-              auto.running === true ? t('chan.auto.running') : auto.ranToday === true ? t('chan.auto.ran') : t('chan.auto.off')),
-            typeof auto.lastResult === 'string' && auto.lastResult !== '' ? h('span', { className: 'ofm_note', title: auto.lastResult }, t('chan.auto.last').replace('{result}', auto.lastResult.length > 60 ? `${auto.lastResult.slice(0, 60)}…` : auto.lastResult)) : null)),
+              h(Pill, null, `${t('chan.meta.accounts')} ${statuses === undefined ? '—' : CHANNEL_PROVIDERS.reduce((sum, row) => sum + (statuses[row.id]?.accounts?.enabled ?? 0), 0)}`)))),
         failed ? h('div', { className: 'ofm_callout ofm_error' },
           h('div', null, t('chan.pack.failed').replace('{reason}', pack.error ?? ''), h('div', { className: 'ofm_note' }, t('chan.pack.hint')))) : null,
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
@@ -5840,6 +5835,10 @@ window.__ModuleLoader__.load({
      * 面板上的「一键领取」、账号卡的「刷新」以及本页的「一键签到/唤醒」写的是
      * 同一份 `ops-journal.json`，所以「今天是否已成功」在这里与执行体同源。
      *
+     * 「每日自动签到 / 自动唤醒」的开关也搬到了本页（2026-11 需求：自动与手动
+     * 是同一件事的两个入口，必须在同一页）：自动任务在宿主里就是「每天到点替
+     * 用户点一次一键签到/唤醒」，执行路径与下面的按钮完全相同。
+     *
      * 一键任务在宿主后台跑（同平台 5 秒间隔，账号多时要几分钟），本页只轮询
      * 状态；`ops.run` 会立刻返回。
      */
@@ -5854,6 +5853,29 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('')
       const [notice, setNotice] = useState('')
       const [page, setPage] = useState(1)
+      const [auto, setAuto] = useState(undefined)
+      const [wake, setWake] = useState(undefined)
+      const loadAuto = useCallback(async () => {
+        if (!available) { setAuto(null); return }
+        try { const value = await rpc('usage.autoCheckin', {}, 30_000); setAuto(value?.autoCheckin ?? null) } catch { setAuto(null) }
+      }, [available, rpc])
+      const loadWake = useCallback(async () => {
+        if (!available) { setWake(null); return }
+        try { const value = await rpc('usage.autoWake', {}, 30_000); setWake(value?.autoWake ?? null) } catch { setWake(null) }
+      }, [available, rpc])
+      const toggleAuto = async () => {
+        try { const value = await rpc('usage.autoCheckin', { enabled: auto?.enabled !== true }, 60_000); setAuto(value?.autoCheckin ?? null) } catch { /* the status refresh tells */ }
+      }
+      const toggleWake = async () => {
+        try { const value = await rpc('usage.autoWake', { enabled: wake?.enabled === true ? false : true }, 60_000); setWake(value?.autoWake ?? null) } catch { /* the status refresh tells */ }
+      }
+      useEffect(() => { void loadAuto(); void loadWake() }, [loadAuto, loadWake])
+      // 自动任务跑到一半时，状态行要跟上（进行中 → 今日已完成）。
+      useEffect(() => {
+        if (auto?.running !== true && wake?.running !== true) return undefined
+        const timer = setInterval(() => { void loadAuto(); void loadWake() }, 5_000)
+        return () => clearInterval(timer)
+      }, [auto?.running, wake?.running, loadAuto, loadWake])
 
       const load = useCallback(async () => {
         if (!available) {
@@ -5920,6 +5942,24 @@ window.__ModuleLoader__.load({
         ? (status?.providers ?? []).map(row => `${nameOf(row.provider)} ${row.done}/${row.total}`).join(' · ')
         : ''
 
+      // 「每日自动签到 / 自动唤醒」：开关 + 状态灯 + 上次结果 + 逐渠道明细。
+      // ⚠️ 唤醒开关默认关闭（写操作，用户须显式启用），未启用时如实显示，
+      // 不要渲染成「今日尚未唤醒」暗示它本来就该跑。
+      // ⚠️ 文案在调用点用 `t('字面量')` 求值后传入：copy-lint 只认字面量键，
+      // 动态键会让词典覆盖检查漏报（与下方 kindText 同款取舍）。
+      const autoRow = (state, label, ranText, offText, toggle) => state == null ? null : h('div', { className: 'ofm_row', key: label },
+        h(Switch, { checked: state.enabled === true, label, onChange: () => void toggle() }),
+        h(Pill, { tone: state.running === true ? 'warn' : state.enabled !== true ? '' : state.ranToday === true ? 'ok' : '' },
+          state.running === true ? t('activity.auto.running')
+            : state.enabled !== true ? t('activity.auto.disabled')
+              : state.ranToday === true ? ranText : offText),
+        typeof state.lastResult === 'string' && state.lastResult !== ''
+          ? h('span', { className: 'ofm_note', title: state.lastResult },
+            t('activity.auto.last').replace('{result}', state.lastResult.length > 60 ? `${state.lastResult.slice(0, 60)}…` : state.lastResult)) : null,
+        Array.isArray(state.channels) && state.channels.length > 0
+          ? h('span', { className: 'ofm_note' },
+            state.channels.map(row => `${nameOf(row.provider)}：${row.text}`).join('；')) : null)
+
       return h('div', { className: 'ofm_page' },
         h(PageHero, { title: t('activity.title'), sub: t('activity.sub') },
           h(Button, {
@@ -5931,6 +5971,8 @@ window.__ModuleLoader__.load({
             busy: busy === 'wake', onClick: () => void start('wake'),
           }, busy === 'wake' ? '…' : t('activity.wake')),
           h(Button, { kind: 'ghost', disabled: !available, onClick: () => void load() }, t('dash.refresh'))),
+        autoRow(auto, t('activity.autoCheckin.title'), t('activity.autoCheckin.ran'), t('activity.autoCheckin.off'), toggleAuto),
+        autoRow(wake, t('activity.autoWake.title'), t('activity.autoWake.ran'), t('activity.autoWake.off'), toggleWake),
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
         error !== '' ? h('div', { className: 'ofm_callout ofm_error' }, h('div', null, t('activity.loadFailed').replace('{reason}', error))) : null,
         running ? h('div', { className: 'ofm_callout' },
