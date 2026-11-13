@@ -565,6 +565,7 @@ window.__ModuleLoader__.load({
         'chan.rpc.unavailable': '宿主未提供 connection 服务，渠道操作暂不可用。',
         'nav.tab.ledger': '数据看板',
         'nav.tab.logs': '运行日志',
+        'nav.tab.activity': '签到与唤醒',
         'nav.tab.gateway': '网关设置',
         'nav.tab.upgrade': '插件升级',
         'chan.titleSingle': '渠道',
@@ -623,6 +624,42 @@ window.__ModuleLoader__.load({
         'logs.empty': '还没有请求记录。',
         'logs.page': '第 {page} 页 / 共 {pages} 页',
         'logs.windowNote': '逐条日志保留最近窗口；历史只保留按日聚合（约 90 天），数据看板的「全部历史」即来源于此。',
+        'activity.title': '签到与唤醒流水',
+        'activity.sub': '逐账号记录签到与唤醒：可按日期、网关平台和类型筛选。一键操作只重试今天未成功的账号；不同平台并发，同一平台账号之间强制间隔 5 秒。',
+        'activity.checkin': '一键签到',
+        'activity.wake': '一键唤醒',
+        'activity.running': '进行中 {done}/{total}',
+        'activity.phase': '正在准备账号…',
+        'activity.startedCheckin': '已开始一键签到，进度见下方流水。',
+        'activity.startedWake': '已开始一键唤醒，进度见下方流水。',
+        'activity.alreadyRunning': '已有任务在进行中，请等它结束。',
+        'activity.nothingCheckin': '今天所有账号都已签到成功，无需重复。',
+        'activity.nothingWake': '今天所有账号都已唤醒成功，无需重复。',
+        'activity.runFailed': '操作失败：{reason}',
+        'activity.loadFailed': '读取流水失败：{reason}',
+        'activity.filterDate': '日期',
+        'activity.filterProvider': '网关平台',
+        'activity.filterKind': '类型',
+        'activity.all': '全部',
+        'activity.kind.checkin': '签到',
+        'activity.kind.wake': '唤醒',
+        'activity.origin.auto': '自动',
+        'activity.origin.manual': '手动',
+        'activity.outcome.ok': '成功',
+        'activity.outcome.already': '今日已完成',
+        'activity.outcome.stale': '非今日轮次',
+        'activity.outcome.inactive': '不可领取',
+        'activity.outcome.failed': '失败',
+        'activity.credit': '额度',
+        'activity.source': '来源',
+        'activity.type': '类型',
+        'activity.detail': '详情',
+        'activity.provider': '平台',
+        'activity.account': '账号',
+        'activity.time': '时间',
+        'activity.count': '共 {total} 条 · 本页 {shown} 条',
+        'activity.noMatch': '没有符合筛选条件的流水。',
+        'activity.empty': '还没有签到或唤醒流水。',
         'gw.title': '网关设置',
         'gw.sub': '把渠道模型以 OpenAI 兼容接口发给本机与局域网工具：端点、密钥与转发端口都在这里。',
         'gw.gatewayTitle': '渠道模型网关（OpenAI 兼容）',
@@ -1440,6 +1477,7 @@ window.__ModuleLoader__.load({
         'chan.rpc.unavailable': 'This host exposes no connection service, so channel actions are unavailable.',
         'nav.tab.ledger': 'Dashboard',
         'nav.tab.logs': 'Request log',
+        'nav.tab.activity': 'Check-in & wake',
         'nav.tab.gateway': 'Gateway',
         'nav.tab.upgrade': 'Plugin upgrade',
         'chan.titleSingle': 'Channel',
@@ -1498,6 +1536,42 @@ window.__ModuleLoader__.load({
         'logs.empty': 'No requests recorded yet.',
         'logs.page': 'Page {page} of {pages}',
         'logs.windowNote': 'Per-request rows cover a recent window only; history is kept as daily aggregates (~90 days) — the dashboard\'s "All time" reads those.',
+        'activity.title': 'Check-in & wake log',
+        'activity.sub': 'Per-account check-in and wake history, filterable by date, channel platform and kind. One-click actions retry only accounts that have not succeeded today; platforms run concurrently while accounts on the same platform are spaced 5 seconds apart.',
+        'activity.checkin': 'Check in all',
+        'activity.wake': 'Wake all',
+        'activity.running': 'Running {done}/{total}',
+        'activity.phase': 'Preparing accounts…',
+        'activity.startedCheckin': 'Check-in started; progress appears below.',
+        'activity.startedWake': 'Wake started; progress appears below.',
+        'activity.alreadyRunning': 'A task is already running; wait for it to finish.',
+        'activity.nothingCheckin': 'Every account has already checked in today; nothing to retry.',
+        'activity.nothingWake': 'Every account has already been woken today; nothing to retry.',
+        'activity.runFailed': 'Action failed: {reason}',
+        'activity.loadFailed': 'Could not read the log: {reason}',
+        'activity.filterDate': 'Date',
+        'activity.filterProvider': 'Channel platform',
+        'activity.filterKind': 'Kind',
+        'activity.all': 'All',
+        'activity.kind.checkin': 'Check-in',
+        'activity.kind.wake': 'Wake',
+        'activity.origin.auto': 'Auto',
+        'activity.origin.manual': 'Manual',
+        'activity.outcome.ok': 'OK',
+        'activity.outcome.already': 'Already done',
+        'activity.outcome.stale': 'Stale round',
+        'activity.outcome.inactive': 'Unavailable',
+        'activity.outcome.failed': 'Failed',
+        'activity.credit': 'Credit',
+        'activity.source': 'Source',
+        'activity.type': 'Kind',
+        'activity.detail': 'Detail',
+        'activity.provider': 'Platform',
+        'activity.account': 'Account',
+        'activity.time': 'Time',
+        'activity.count': '{total} entries · {shown} on this page',
+        'activity.noMatch': 'No entries match these filters.',
+        'activity.empty': 'No check-in or wake entries yet.',
         'gw.title': 'Gateway settings',
         'gw.sub': 'Serve the channel models over an OpenAI-compatible API to this machine and the LAN: endpoint, key and relay port live here.',
         'gw.gatewayTitle': 'Channel gateway (OpenAI compatible)',
@@ -5759,6 +5833,168 @@ window.__ModuleLoader__.load({
           h('p', { className: 'ofm_note' }, t('logs.windowNote'))) : null)
     }
 
+    /**
+     * 签到与唤醒流水。
+     *
+     * 数据与动作都走渠道包自己的 RPC（`ops.journal` / `ops.run`）：自动签到、
+     * 面板上的「一键领取」、账号卡的「刷新」以及本页的「一键签到/唤醒」写的是
+     * 同一份 `ops-journal.json`，所以「今天是否已成功」在这里与执行体同源。
+     *
+     * 一键任务在宿主后台跑（同平台 5 秒间隔，账号多时要几分钟），本页只轮询
+     * 状态；`ops.run` 会立刻返回。
+     */
+    function ActivityPage(props) {
+      const { t, ctx } = props
+      const { available, rpc } = useChannelRpc(ctx)
+      const [date, setDate] = useState('')
+      const [provider, setProvider] = useState('')
+      const [kind, setKind] = useState('')
+      const [data, setData] = useState(undefined)
+      const [error, setError] = useState('')
+      const [busy, setBusy] = useState('')
+      const [notice, setNotice] = useState('')
+      const [page, setPage] = useState(1)
+
+      const load = useCallback(async () => {
+        if (!available) {
+          setData({ entries: [], days: [], providers: [], total: 0, status: null })
+          return
+        }
+        try {
+          const value = await rpc('ops.journal', {
+            ...date === '' ? {} : { date },
+            ...provider === '' ? {} : { provider },
+            ...kind === '' ? {} : { kind },
+            limit: 500,
+          }, 30_000)
+          setData(value ?? null)
+          setError('')
+        } catch (err) { setError(String(err?.message ?? err)) }
+      }, [available, rpc, date, provider, kind])
+      useEffect(() => { void load() }, [load])
+      useEffect(() => { setPage(1) }, [date, provider, kind])
+
+      const status = data?.status ?? null
+      const running = status?.running === true
+      // 任务在宿主后台执行：进行中每 2 秒读一次进度与新增流水。
+      useEffect(() => {
+        if (!running) return undefined
+        const timer = setInterval(() => { void load() }, 2_000)
+        return () => clearInterval(timer)
+      }, [running, load])
+
+      const start = async runKind => {
+        if (busy !== '' || !available) return
+        setBusy(runKind); setNotice('')
+        try {
+          const value = await rpc('ops.run', { kind: runKind }, 30_000)
+          if (value?.started === true) setNotice(runKind === 'checkin' ? t('activity.startedCheckin') : t('activity.startedWake'))
+          else if (value?.reason === 'running') setNotice(t('activity.alreadyRunning'))
+          else if (value?.reason === 'nothing') setNotice(runKind === 'checkin' ? t('activity.nothingCheckin') : t('activity.nothingWake'))
+          await load()
+        } catch (err) {
+          setNotice(t('activity.runFailed').replace('{reason}', String(err?.message ?? err)))
+        } finally { setBusy('') }
+      }
+
+      // 动态键会让 copy-lint 看不到字面量，故逐项写死（与 logs 页同款取舍）。
+      const kindText = value => value === 'checkin' ? t('activity.kind.checkin') : t('activity.kind.wake')
+      const originText = value => value === 'auto' ? t('activity.origin.auto') : t('activity.origin.manual')
+      const outcomeText = entry => entry?.outcome === 'ok' ? t('activity.outcome.ok')
+        : entry?.outcome === 'already' ? (entry.coversToday === false ? t('activity.outcome.stale') : t('activity.outcome.already'))
+          : entry?.outcome === 'inactive' ? t('activity.outcome.inactive') : t('activity.outcome.failed')
+      const outcomeTone = value => value === 'failed' ? 'unavailable'
+        : value === 'ok' || value === 'already' ? 'available' : 'unknown'
+      const nameOf = id => CHANNEL_PROVIDERS.find(row => row.id === id)?.name ?? id
+      const creditText = entry => {
+        if (!Number.isFinite(entry?.credit)) return '—'
+        return entry.unit === 'token' ? `${kilo(entry.credit)} Token` : kilo(entry.credit)
+      }
+
+      const entries = data?.entries ?? []
+      const pageSize = 50
+      const pages = Math.max(1, Math.ceil(entries.length / pageSize))
+      const safePage = Math.min(page, pages)
+      const rows = entries.slice((safePage - 1) * pageSize, safePage * pageSize)
+      const progress = running
+        ? (status?.providers ?? []).map(row => `${nameOf(row.provider)} ${row.done}/${row.total}`).join(' · ')
+        : ''
+
+      return h('div', { className: 'ofm_page' },
+        h(PageHero, { title: t('activity.title'), sub: t('activity.sub') },
+          h(Button, {
+            kind: 'primary', disabled: !available || busy !== '' || running,
+            busy: busy === 'checkin', onClick: () => void start('checkin'),
+          }, busy === 'checkin' ? '…' : t('activity.checkin')),
+          h(Button, {
+            kind: 'ghost', disabled: !available || busy !== '' || running,
+            busy: busy === 'wake', onClick: () => void start('wake'),
+          }, busy === 'wake' ? '…' : t('activity.wake')),
+          h(Button, { kind: 'ghost', disabled: !available, onClick: () => void load() }, t('dash.refresh'))),
+        !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
+        error !== '' ? h('div', { className: 'ofm_callout ofm_error' }, h('div', null, t('activity.loadFailed').replace('{reason}', error))) : null,
+        running ? h('div', { className: 'ofm_callout' },
+          h('div', null, status?.total > 0
+            ? t('activity.running').replace('{done}', String(status.done ?? 0)).replace('{total}', String(status.total))
+            : t('activity.phase')),
+          progress === '' ? null : h('div', { className: 'ofm_note' }, progress)) : null,
+        notice !== '' ? h('p', { className: 'ofm_note', role: 'status' }, notice) : null,
+        h('div', { className: 'ofm_directorytools' },
+          h('label', null, t('activity.filterDate'),
+            h('input', {
+              className: 'ofm_input', type: 'date', value: date, 'aria-label': t('activity.filterDate'),
+              onChange: event => setDate(event.target.value),
+            })),
+          h('label', null, t('activity.filterProvider'),
+            h('select', {
+              className: 'ofm_input', 'aria-label': t('activity.filterProvider'), value: provider,
+              onChange: event => setProvider(event.target.value),
+            },
+              h('option', { value: '' }, t('activity.all')),
+              CHANNEL_PROVIDERS.map(row => h('option', { key: row.id, value: row.id }, row.name)))),
+          h('label', null, t('activity.filterKind'),
+            h('select', {
+              className: 'ofm_input', 'aria-label': t('activity.filterKind'), value: kind,
+              onChange: event => setKind(event.target.value),
+            },
+              h('option', { value: '' }, t('activity.all')),
+              h('option', { value: 'checkin' }, t('activity.kind.checkin')),
+              h('option', { value: 'wake' }, t('activity.kind.wake'))))),
+        h(Section, {
+          title: t('activity.title'),
+          hint: t('activity.count').replace('{total}', String(data?.total ?? entries.length)).replace('{shown}', String(rows.length)),
+        },
+          data === undefined ? h('div', { className: 'ofm_skel', style: { minHeight: 180 } })
+            : rows.length === 0 ? h('p', { className: 'ofm_note' },
+              date === '' && provider === '' && kind === '' ? t('activity.empty') : t('activity.noMatch'))
+              : h('div', { className: 'ofm_tablewrap' }, h('table', { className: 'ofm_table' },
+                h('thead', null, h('tr', null,
+                  h('th', { key: 'time' }, t('activity.time')),
+                  h('th', { key: 'kind' }, t('activity.type')),
+                  h('th', { key: 'provider' }, t('activity.provider')),
+                  h('th', { key: 'account' }, t('activity.account')),
+                  h('th', { key: 'outcome' }, t('log.result')),
+                  h('th', { key: 'credit' }, t('activity.credit')),
+                  h('th', { key: 'source' }, t('activity.source')),
+                  h('th', { key: 'detail' }, t('activity.detail')))),
+                h('tbody', null, rows.map((entry, index) => h('tr', {
+                  key: entry.id ?? index,
+                  className: entry.outcome === 'failed' ? 'ofm_logfailed' : '',
+                },
+                  h('td', null, new Date(entry.at).toLocaleString()),
+                  h('td', null, kindText(entry.kind)),
+                  h('td', null, nameOf(entry.provider)),
+                  h('td', null, h('b', null, entry.nickname || entry.accountId || '—')),
+                  h('td', null, h('span', { className: `ofm_badge ${entry.coversToday === false && entry.outcome === 'already' ? 'unknown' : outcomeTone(entry.outcome)}`, title: entry.message }, outcomeText(entry))),
+                  h('td', { className: 'ofm_num' }, creditText(entry)),
+                  h('td', null, originText(entry.origin)),
+                  h('td', { title: entry.message }, entry.message || '—')))))),
+          pages > 1 ? h('div', { className: 'ofm_row' },
+            h(Button, { kind: 'ghost', disabled: safePage <= 1, onClick: () => setPage(value => Math.max(1, value - 1)) }, '‹'),
+            h('span', { className: 'ofm_note' }, t('logs.page').replace('{page}', String(safePage)).replace('{pages}', String(pages))),
+            h(Button, { kind: 'ghost', disabled: safePage >= pages, onClick: () => setPage(value => Math.min(pages, value + 1)) }, '›')) : null))
+    }
+
     /** The gateway page: the pack's OpenAI endpoint plus this plugin's relay. */
     function GatewayPage(props) {
       const { t, ctx } = props
@@ -7175,7 +7411,7 @@ window.__ModuleLoader__.load({
     // upgrader triggers — comes back to the page the user was reading.
     const EFFECTS_KEY = 'ofm.visualEffects'
     const TAB_KEY = 'ofm.tab'
-    const TABS = ['free', 'eac', 'channels', 'aggregate', 'workspace', 'extensions', 'saver', 'routing', 'ledger', 'logs', 'gateway', 'upgrade', 'picks']
+    const TABS = ['free', 'eac', 'channels', 'aggregate', 'workspace', 'extensions', 'saver', 'routing', 'ledger', 'logs', 'activity', 'gateway', 'upgrade', 'picks']
     const WORKSPACE_CSS = `
       .who{min-width:0}
       .who .name,.nm .n,.lib-path{white-space:normal!important;overflow-wrap:anywhere;overflow:visible!important;text-overflow:clip!important}
@@ -7477,6 +7713,7 @@ window.__ModuleLoader__.load({
         ['routing', t('nav.tab.routing'), data.catalog.filter(m => m.channel === 'combo').length],
         ['ledger', t('nav.tab.ledger'), null],
         ['logs', t('nav.tab.logs'), null],
+        ['activity', t('nav.tab.activity'), null],
         ['gateway', t('nav.tab.gateway'), null],
         ['upgrade', t('nav.tab.upgrade'), null],
         ['picks', t('nav.tab.picks'), null],
@@ -7523,7 +7760,9 @@ window.__ModuleLoader__.load({
                 ? h(LedgerPage, { t, ctx })
                 : tab === 'logs'
                   ? h(LogsPage, { t, ctx })
-                  : tab === 'gateway'
+                  : tab === 'activity'
+                    ? h(ActivityPage, { t, ctx })
+                    : tab === 'gateway'
                     ? h(GatewayPage, { t, ctx })
                     : tab === 'upgrade'
                       ? h(UpgradePage, { t, settings: data.settings, onApply: apply, busy })
@@ -8563,7 +8802,7 @@ window.__ModuleLoader__.load({
     exports.inject = inject
     exports.name = 'our-free-model'
     // Headless test seams use the same stub React as scripts/client-lint.mjs.
-    exports.__test = { parseSafeHtml, safeUrl, sanitizeStyle, htmlToDom, buildHeatCells, Heatmap, ChannelsPage, UpgradePanel, useEacLogin, EacAuth, PicksPage, RecoCard, DICT, useChannelRpc, Shell, SubscriptionsPage, Disclaimer, CSS }
+    exports.__test = { parseSafeHtml, safeUrl, sanitizeStyle, htmlToDom, buildHeatCells, Heatmap, ChannelsPage, ActivityPage, UpgradePanel, useEacLogin, EacAuth, PicksPage, RecoCard, DICT, useChannelRpc, Shell, SubscriptionsPage, Disclaimer, CSS }
     return module.exports
   },
 })

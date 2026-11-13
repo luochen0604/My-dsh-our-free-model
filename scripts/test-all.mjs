@@ -81,6 +81,8 @@ const suites = [
   ['channel-network', 'channel-network-test.mjs', []],
   ['channel-credits-rpc', 'channel-credits-rpc-test.mjs', []],
   ['channel-credits-ui', 'channel-credits-ui-test.mjs', []],
+  ['ops-runner', 'ops-runner-test.mjs', []],
+  ['channel-activity-ui', 'channel-activity-ui-test.mjs', []],
   ['channel-model-actions', 'channel-model-actions-test.mjs', []],
   ['channel-login', 'channel-login-test.mjs', []],
   // LobsterAI 登录请求参数的「指纹」离线自检（keyfrom 语义、安装 UUID、

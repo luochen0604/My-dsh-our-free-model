@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { verifyChannelModelActions } from './channel-model-actions-test.mjs'
 import { verifyChannelCreditsUi } from './channel-credits-ui-test.mjs'
 import { verifyChannelCreditsRpc } from './channel-credits-rpc-test.mjs'
+import { verifyChannelOps } from './channel-ops-rpc-test.mjs'
 import { verifyChannelImagePricing } from './channel-image-pricing-test.mjs'
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-channel-pack-'))
@@ -192,6 +193,7 @@ try {
   if (sourceMode) await verifySourceRegressions({ ctx, adapters, call, creds })
   await verifyChannelCreditsRpc({ ctx, call, creds, adapters })
   console.log('ok  实际渠道 RPC：七渠道仅账号池凭据即可查余额，ZCode 账号池回退及缺凭据反馈')
+  await verifyChannelOps({ ctx, call, creds })
 
   // A failed browser callback must become a terminal, readable poll result.
   // Before this regression check, the Gemini placeholder was removed and
