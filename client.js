@@ -5965,7 +5965,8 @@ window.__ModuleLoader__.load({
           hint: t('activity.count').replace('{total}', String(data?.total ?? entries.length)).replace('{shown}', String(rows.length)),
         },
           data === undefined ? h('div', { className: 'ofm_skel', style: { minHeight: 180 } })
-            : rows.length === 0 ? h('p', { className: 'ofm_note' }, entries.length === 0 ? t('activity.empty') : t('activity.noMatch'))
+            : rows.length === 0 ? h('p', { className: 'ofm_note' },
+              date === '' && provider === '' && kind === '' ? t('activity.empty') : t('activity.noMatch'))
               : h('div', { className: 'ofm_tablewrap' }, h('table', { className: 'ofm_table' },
                 h('thead', null, h('tr', null,
                   h('th', { key: 'time' }, t('activity.time')),
