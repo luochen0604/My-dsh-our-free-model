@@ -218,6 +218,11 @@ export interface RpcReorderAccountsRequest {
 
 export interface RpcRefreshAccountRequest {
   accountId: string
+  /**
+   * 触发来源：一键唤醒系统传 `manual`（缺省）。保留 `auto` 供将来的定时唤醒
+   * 使用 —— 流水页据此区分「自动」与「手动」，不影响刷新行为。
+   */
+  origin?: 'auto' | 'manual'
 }
 export interface RpcRefreshAccountResponse {
   /**
@@ -372,6 +377,15 @@ export interface RpcCreditsStatusResponse {
 /** RPC: 一键领取积分请求 */
 export interface RpcCreditsClaimAllRequest {
   provider: string
+  /**
+   * 只处理这些账号（缺省 = 该平台全部账号）。
+   *
+   * 「一键签到」按单账号调用本端点，才能在同一平台账号之间插入 5 秒间隔；
+   * 面板上的「一键领取」不带本字段，行为与既有版本一致。
+   */
+  accountIds?: string[]
+  /** 触发来源（写入流水）；缺省 `manual`。 */
+  origin?: 'auto' | 'manual'
 }
 /** 单个账号的领取结果 */
 export interface RpcCreditsClaimAccountResult {
@@ -1445,4 +1459,123 @@ export interface RpcUsageAutoCheckinRequest {
 /** RPC: 自动签到开关响应（回显写入后的生效状态）。 */
 export interface RpcUsageAutoCheckinResponse {
   autoCheckin: RpcUsageAutoCheckinState
+}
+
+/**
+ * ========================================
+ * 签到与唤醒流水（ops journal）
+ * ========================================
+ *
+ * 用户 2026-11 的需求：现有自动签到只留一句逐渠道摘要，无法回答「昨天哪个账号
+ * 失败了」「这个平台的唤醒有没有跑」。故把**每一次**签到/唤醒都落成一条流水，
+ * 由设置页的「签到与唤醒流水」页展示、按日期与平台筛选，并由同一页触发
+ * 「一键签到 / 一键唤醒」。
+ *
+ * ⚠️ 日志只是**观测**，不参与控制流：写盘失败不得让签到/唤醒本身失败。
+ */
+
+/** 流水类型：签到（credits.claimAll）或唤醒（account.refresh）。 */
+export type RpcOpsKind = 'checkin' | 'wake'
+
+/** 单条流水的结局。`already` = 今天已完成（幂等），`inactive` = 渠道判定不可领。 */
+export type RpcOpsOutcome = 'ok' | 'already' | 'inactive' | 'failed'
+
+/** 触发来源：自动签到为 `auto`，面板/一键按钮为 `manual`。 */
+export type RpcOpsOrigin = 'auto' | 'manual'
+
+/** 一条签到 / 唤醒流水。 */
+export interface RpcOpsJournalEntry {
+  /** 唯一 id（仅用于前端列表 key，不参与业务判重）。 */
+  id: string
+  /** 发生时刻（毫秒时间戳）。 */
+  at: number
+  /** 发生日（UTC+8，`YYYY-MM-DD`）—— 筛选与「今天是否已完成」都用它。 */
+  day: string
+  kind: RpcOpsKind
+  provider: string
+  accountId: string
+  nickname: string
+  outcome: RpcOpsOutcome
+  /** 可读详情（失败原因 / 领取额度 / 已签到）。 */
+  message: string
+  /** 领取到的额度（仅 `outcome === 'ok'` 且渠道给得出时）。 */
+  credit?: number
+  /** 额度单位；缺省按积分。 */
+  unit?: 'token' | 'credit'
+  /**
+   * 这条结果是否**覆盖今天这一轮**（缺省 true）。
+   *
+   * 与 `ClaimOutcomeCommon.coversToday` 同义：Qoder 在每天 10:00（UTC+8）刷新前
+   * 看到的「已领」属于昨天，不能算作今天已签到。一键签到据此决定要不要重试。
+   */
+  coversToday?: boolean
+  origin: RpcOpsOrigin
+}
+
+/** 一次批量任务里单个平台的进度。 */
+export interface RpcOpsProviderProgress {
+  provider: string
+  total: number
+  done: number
+  ok: number
+  skipped: number
+  failed: number
+  running: boolean
+  error?: string
+}
+
+/** 「一键签到 / 一键唤醒」任务的实时状态（供页面轮询）。 */
+export interface RpcOpsStatus {
+  running: boolean
+  kind: RpcOpsKind | null
+  startedAt: number
+  finishedAt: number
+  total: number
+  done: number
+  ok: number
+  skipped: number
+  failed: number
+  providers: RpcOpsProviderProgress[]
+  /** 任务摘要（准备中 / 已完成句）。页面主要读计数，这里只用于状态行。 */
+  message: string
+}
+
+/** RPC: 读取流水（可选按日期、平台、类型筛选）。 */
+export interface RpcOpsJournalRequest {
+  /** `YYYY-MM-DD`（UTC+8）；省略 = 全部日期。 */
+  date?: string
+  provider?: string
+  kind?: RpcOpsKind
+  /** 返回条数上限（默认 500，服务端钳到 2000）。 */
+  limit?: number
+}
+
+/** RPC: 读取流水响应。 */
+export interface RpcOpsJournalResponse {
+  /** 最新在前。 */
+  entries: RpcOpsJournalEntry[]
+  /** 流水里出现过的日期（最新在前，最多 90 条）—— 给日期筛选选项。 */
+  days: string[]
+  /** 流水里出现过的平台（给平台筛选选项）。 */
+  providers: string[]
+  /** 当前筛选条件下的总条数（`entries` 受 limit 限制）。 */
+  total: number
+  /** 今天的 UTC+8 日期。 */
+  today: string
+  /** 同一次请求顺带回传任务状态，页面轮询不用再发一次。 */
+  status: RpcOpsStatus
+}
+
+/** RPC: 启动一键签到 / 一键唤醒。 */
+export interface RpcOpsRunRequest {
+  kind: RpcOpsKind
+}
+
+/** RPC: 启动结果（任务在后台执行，页面轮询 `ops.journal` 看进度）。 */
+export interface RpcOpsRunResponse {
+  /** 这次请求是否真的启动了任务。 */
+  started: boolean
+  /** `started` = 已启动；`running` = 已有任务在跑；`nothing` = 今天没有需要处理的账号。 */
+  reason: 'started' | 'running' | 'nothing'
+  status: RpcOpsStatus
 }

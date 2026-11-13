@@ -204,6 +204,10 @@ import type {
   RpcUsageTokenLedgerHistoryResponse,
   RpcUsageAutoCheckinRequest,
   RpcUsageAutoCheckinResponse,
+  RpcOpsJournalRequest,
+  RpcOpsJournalResponse,
+  RpcOpsRunRequest,
+  RpcOpsRunResponse,
   ProviderStatus,
 
   ProviderAccountStatus,
@@ -213,7 +217,14 @@ import {
   createBadgePreferenceStore,
 } from './badge-preferences.js'
 import { createUsageBadge, type BadgeRpcResult } from './usage-badge.js'
-import { createAutoCheckin, createAutoCheckinStore } from './auto-checkin.js'
+import { createAutoCheckin, createAutoCheckinStore, utc8DateString } from './auto-checkin.js'
+import {
+  OPS_JOURNAL_MAX_ENTRIES,
+  claimJournalEntries,
+  createOpsJournalStore,
+  wakeJournalEntry,
+} from './ops-journal.js'
+import { createOpsRunner } from './ops-runner.js'
 
 /** Channel Pack RPC API 路径 */
 export const CHANNEL_PACK_API_PATH = '/api/channel-pack'
@@ -964,7 +975,8 @@ function registerChannelPackEndpoints(
       return [...new Set(accounts.filter((entry) => isSupportedProvider(entry.provider)).map((entry) => entry.provider))].sort()
     },
     claim: (provider) =>
-      handleMethod('credits.claimAll', { provider }) as Promise<BadgeRpcResult<RpcCreditsClaimAllResponse>>,
+      // `origin: 'auto'` 只影响流水来源标记；自动签到仍然串行遍历平台。
+      handleMethod('credits.claimAll', { provider, origin: 'auto' }) as Promise<BadgeRpcResult<RpcCreditsClaimAllResponse>>,
     warn: (message) => ctx.logger?.warn?.(message),
   })
   // 启动时排定一轮（延迟 30s；内部自己判开关与「今天是否已跑」）。
@@ -976,6 +988,85 @@ function registerChannelPackEndpoints(
    * 故这里的降级只影响桩环境，不影响生产环境的清理语义。
    */
   ctx.effect?.(() => () => autoCheckin.stop(), 'channel-pack: auto checkin')
+
+  /**
+   * 签到 / 唤醒流水（独立文档 `ops-journal.json`）。
+   *
+   * ⚠️ 它**只写观测**：调用方不需要 try/catch，`append()` 自己吞掉写盘异常。
+   * `credits.claimAll` 与 `account.refresh` 的所有调用（自动、面板、一键任务）
+   * 都会落账，因此历史面板与一键任务的「今天是否已成功」天然同源。
+   */
+  const opsJournal = createOpsJournalStore(ctx)
+
+  /** 有签到实现的平台。无签到接口的平台（Cline / Raccoon / Gemini）不参与签到。 */
+  const OPS_CHECKIN_PROVIDERS = new Set<string>([
+    LOBSTERAI.id,
+    QODER.id,
+    QODER_CN.id,
+    TRAE.id,
+    LOOMY.id,
+    MINIMAX.id,
+    ZCODE.id,
+  ])
+
+  /** 把一条领取结果归一成执行体要的结局。 */
+  function checkinOutcomeOf(row: RpcCreditsClaimAccountResult): { outcome: 'ok' | 'already' | 'inactive' | 'failed'; message: string } {
+    switch (row.outcome.kind) {
+      case 'claimed':
+        return { outcome: 'ok', message: row.outcome.credit > 0 ? `+${row.outcome.credit}` : '领取成功（+0）' }
+      case 'already-claimed':
+        return { outcome: 'already', message: row.outcome.message === '' ? '今天已签到' : row.outcome.message }
+      case 'inactive':
+        return { outcome: 'inactive', message: row.outcome.message === '' ? '活动未开启' : row.outcome.message }
+      case 'failed':
+        return { outcome: 'failed', message: row.outcome.message === '' ? '领取失败' : row.outcome.message }
+      default:
+        return { outcome: 'failed', message: '未知领取结果' }
+    }
+  }
+
+  /**
+   * 一键签到 / 一键唤醒的执行体。
+   *
+   * ⚠️ `checkin` 复用 `credits.claimAll` 的 `accountIds` 过滤：按单账号调用，
+   * 间隔与进度由执行体控制，流水由 `credits.claimAll` 自己写 —— 两处不会漂移。
+   * ⚠️ `handleMethod` 是函数声明，这里只是闭包引用，调用发生在 RPC 到达之后。
+   */
+  const opsRunner = createOpsRunner({
+    accounts: async () => (await pool.listAllAccounts()).map((entry) => ({
+      id: entry.id,
+      nickname: entry.nickname,
+      provider: entry.provider,
+      enabled: entry.enabled !== false,
+    })),
+    checkin: async (provider, accountId) => {
+      const result = await handleMethod('credits.claimAll', {
+        provider,
+        accountIds: [accountId],
+        origin: 'manual',
+      }) as BadgeRpcResult<RpcCreditsClaimAllResponse>
+      if (!result.ok) {
+        return { outcome: 'failed', message: result.error?.message ?? '签到失败' }
+      }
+      const row = result.value?.results?.find((item) => item.accountId === accountId) ?? result.value?.results?.[0]
+      if (row === undefined) return { outcome: 'failed', message: '没有返回签到结果' }
+      return checkinOutcomeOf(row)
+    },
+    wake: async (accountId) => {
+      const result = await handleMethod('account.refresh', { accountId, origin: 'manual' }) as {
+        ok?: boolean
+        error?: { message?: string }
+      }
+      return result.ok === true
+        ? { outcome: 'ok', message: '凭据已刷新' }
+        : { outcome: 'failed', message: result.error?.message ?? '唤醒失败' }
+    },
+    journal: () => opsJournal.read(),
+    isCheckinProvider: (provider) => OPS_CHECKIN_PROVIDERS.has(provider),
+    // OpenCode 在本宿主的账号集成被禁用；`account.refresh` 也没有它的分支。
+    isWakeProvider: (provider) => isSupportedProvider(provider) && provider !== OPENCODE.id,
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
 
   /**
    * 用量徽标读数服务（宿主侧 TTL 缓存 + 只保留启用账号 + 附加订阅读数）。
@@ -1798,9 +1889,11 @@ if (provider === LOBSTERAI.id) {
 
       case 'account.refresh': {
         const req = payload as RpcRefreshAccountRequest
+        const origin = req.origin === 'auto' ? 'auto' as const : 'manual' as const
+        let entry: ProviderAccountEntry | undefined
         try {
           const accounts = await pool.listAllAccounts()
-          const entry = accounts.find((a) => a.id === req.accountId)
+          entry = accounts.find((a) => a.id === req.accountId)
           if (!entry) throw new Error(`Account ${req.accountId} not found`)
 
           // 按 **entry.provider** 分派到对应服务，并调用**按凭据 ref 的**
@@ -1815,10 +1908,9 @@ if (provider === LOBSTERAI.id) {
           //    「已过期」。早先只有 raccoon 分支传了，其余七个分支漏传，
           //    凭据续好了、界面纹丝不动，用户没有任何自救手段。
           //
-          // ⚠⚠ **本端点没有面板入口**（issue IKJOZA 取证）：账号卡片上并没有
-          // 「刷新」按钮（按钮是 测试/重测/重置/停用/代理/指纹/删除），
-          // 调用方是仓库外的脚本/手工 RPC。下面三处历史注释曾把它写成
-          // 「账号卡片的刷新按钮」——那是失实的，会把排障的人引到不存在的 UI。
+          // 本端点现在有两类入口：账号卡片上的「刷新」（以及「全部刷新」），
+          // 和设置页「签到与唤醒流水」的「一键唤醒」。一键唤醒按单账号调用
+          // 本端点，因此这里的每次成功/失败都会落一条唤醒流水（见下方 append）。
           switch (entry.provider) {
             case LOBSTERAI.id:
               await lobsterai.refreshAccountCredential(entry.credentialRef, pool, entry.id)
@@ -1879,8 +1971,27 @@ if (provider === LOBSTERAI.id) {
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
           }
+          await opsJournal.append([wakeJournalEntry({
+            provider: entry.provider,
+            accountId: entry.id,
+            nickname: entry.nickname,
+            ok: true,
+            message: '凭据已刷新',
+            origin,
+          })])
           return { ok: true, value: { success: true } }
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (entry !== undefined) {
+            await opsJournal.append([wakeJournalEntry({
+              provider: entry.provider,
+              accountId: entry.id,
+              nickname: entry.nickname,
+              ok: false,
+              message,
+              origin,
+            })])
+          }
           /**
            * ⚠⚠ **失败必须回 `ok: false`**，不得包成 `ok:true + value.success:false`
            * （Gitee issue IKJOZA，真实缺陷）。
@@ -1899,23 +2010,6 @@ if (provider === LOBSTERAI.id) {
            * 本分支只有 `success` 一个布尔：**失败是业务终态，不是可自愈的中间态**，
            * 与上述四者不同类。
            *
-           * ## 为什么 `ok:false` 不会打破仓库内任何调用方
-           * `account.refresh` **全仓库零调用方**：面板 `plugin-src/client/channel-pack.js`
-           * 的 42 处 `rpcCall(` 里没有它（账号卡片的按钮是 测试/重测/重置/停用/代理/
-           * 指纹/删除，**没有「刷新」**）；另两处 `rpcCall(变量)` 的实参经追溯只有
-           * `opencode.*` 四个方法。它从来就是给仓库外脚本/手工 RPC 用的端点。
-           * ⇒ 这是**对外部调用方的破坏性契约变更**：原先误判的调用方会从「静默错」
-           * 变成 `unwrapRpcResult` 抛错，属预期的「提前炸」。成功路径仍是
-           * `ok:true + value.success:true`，未变。
-           *
-           * ⚠⚠ **复现这条取证不要用 `git log -S "rpcCall('account.refresh'"`**：
-           * 本注释自身引用了该字面量，`-S` 会**自匹配修复提交本身**（返回 `68fb567`），
-           * 那正是 `AGENTS.md` 明令禁止的「注释与实测脱节」。在 `origin/master`
-           * （修复前）上该命令零命中，这本身是它曾有效的证据。稳定写法是只搜
-           * **不含注释**的客户端源码：
-           * `Select-String -Path plugin-src\client\*.js -Pattern "rpcCall\('account\."`
-           * （应零命中；`account.refreshable` 是另一个字段名，不是端点）。
-           *
            * 回归用例在 `tests/unit/lobsterai-rpc-dispatch.spec.ts` 的
            * 「issue IKJOZA」段（锁死「失败不得是 ok:true」+「失败必须带原因」）。
            */
@@ -1923,7 +2017,7 @@ if (provider === LOBSTERAI.id) {
             ok: false,
             error: {
               code: 'bad-request',
-              message: error instanceof Error ? error.message : String(error),
+              message,
             },
           }
         }
@@ -2382,7 +2476,22 @@ if (provider === LOBSTERAI.id) {
       // 一键领取：逐账号顺序执行（并发易触发风控），单个账号失败不中断整体。
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
-        const accounts = await pool.listAccounts(req.provider)
+        const origin = req.origin === 'auto' ? 'auto' as const : 'manual' as const
+        // 「一键签到」按单账号调用本端点（见 ops-runner 的模块头）：
+        // `accountIds` 缺省时保持既有行为（该平台全部账号）。
+        const wanted = Array.isArray(req.accountIds)
+          ? new Set(req.accountIds.filter((id): id is string => typeof id === 'string'))
+          : null
+        const allAccounts = await pool.listAccounts(req.provider)
+        const accounts = wanted === null ? allAccounts : allAccounts.filter((entry) => wanted.has(entry.id))
+        /**
+         * 落流水后再返回。`append()` 自己吞掉写盘异常，故这里不需要 try/catch，
+         * 也不会把观测失败变成签到失败。
+         */
+        const record = async (value: RpcCreditsClaimAllResponse) => {
+          await opsJournal.append(claimJournalEntries(req.provider, value.results, origin))
+          return { ok: true, value }
+        }
         if (isQoderFamily(req.provider)) {
           const { product } = requireQoderFamily(req.provider)
           // Qoder 的领取流程**自带活动列表查询**（loadCampaigns → 逐个 claim），
@@ -2397,7 +2506,7 @@ if (provider === LOBSTERAI.id) {
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+          return record(value)
         }
         if (req.provider === LOBSTERAI.id) {
           // LobsterAI 的 clientVersion 是签到必填参数，需动态解析
@@ -2411,7 +2520,7 @@ if (provider === LOBSTERAI.id) {
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+          return record(value)
         }
         if (req.provider === TRAE.id) {
           const value = await collectClaimResults<TraeCredential, undefined>(accounts, undefined, {
@@ -2436,7 +2545,7 @@ if (provider === LOBSTERAI.id) {
               ),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+          return record(value)
         }
         if (req.provider === LOOMY.id) {
           // Loomy 的「签到」= `POST /points/first-login`（触发每日赠送额度）。
@@ -2466,13 +2575,11 @@ if (provider === LOBSTERAI.id) {
             const outcome = await loomy.claimDailyQuota(credential)
             values.push({ accountId: account.id, nickname: account.nickname, outcome })
           }
-          return {
-            ok: true,
-            value: {
-              summary: computeClaimSummary(values.map((v) => v.outcome)),
-              results: values,
-            } satisfies RpcCreditsClaimAllResponse,
+          const value: RpcCreditsClaimAllResponse = {
+            summary: computeClaimSummary(values.map((v) => v.outcome)),
+            results: values,
           }
+          return record(value)
         }
         if (req.provider === CLINE.id) {
           // Cline **没有签到端点**（见 src/cline-credits.ts 的模块注释：
@@ -2521,7 +2628,7 @@ if (provider === LOBSTERAI.id) {
             claim: (credential) => claimMinimaxDailyCheckin(credential),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+          return record(value)
         }
         if (req.provider === ZCODE.id) {
           /**
@@ -2578,10 +2685,8 @@ if (provider === LOBSTERAI.id) {
               outcomes.push(outcome)
             }
           }
-          return {
-            ok: true,
-            value: { results, summary: computeClaimSummary(outcomes) } satisfies RpcCreditsClaimAllResponse,
-          }
+          const value: RpcCreditsClaimAllResponse = { results, summary: computeClaimSummary(outcomes) }
+          return record(value)
         }
         return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
       }
@@ -3881,6 +3986,61 @@ if (provider === LOBSTERAI.id) {
           }
         }
         const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.setEnabled(req.enabled) }
+        return { ok: true, value }
+      }
+
+      /**
+       * 签到与唤醒流水（设置页「签到与唤醒流水」页）。
+       *
+       * 纯内存 + 落盘文档读取（`ops-journal.json`），不打上游。`date` / `provider` /
+       * `kind` 三个筛选都由服务端做，页面切换筛选不会把整份流水拉两遍。
+       *
+       * ⚠️ 日期按 **UTC+8** 日界（与各渠道的每日额度、自动签到的「今天」同口径），
+       * 不用本机时区 —— 出差改时区时「今天」不能漂。
+       */
+      case 'ops.journal': {
+        const req = (payload ?? {}) as RpcOpsJournalRequest
+        if (req.date !== undefined && (typeof req.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(req.date))) {
+          return { ok: false, error: { code: 'bad-request', message: 'date 必须是 YYYY-MM-DD' } }
+        }
+        if (req.kind !== undefined && req.kind !== 'checkin' && req.kind !== 'wake') {
+          return { ok: false, error: { code: 'bad-request', message: 'kind 必须是 checkin / wake' } }
+        }
+        if (req.provider !== undefined && !isSupportedProvider(req.provider)) {
+          return { ok: false, error: { code: 'bad-request', message: `不支持的渠道：${String(req.provider)}` } }
+        }
+        const limit = typeof req.limit === 'number' && Number.isFinite(req.limit)
+          ? Math.min(Math.max(Math.trunc(req.limit), 1), OPS_JOURNAL_MAX_ENTRIES)
+          : 500
+        const all = opsJournal.read()
+        const filtered = all.filter((entry) =>
+          (req.date === undefined || entry.day === req.date)
+          && (req.provider === undefined || entry.provider === req.provider)
+          && (req.kind === undefined || entry.kind === req.kind))
+        const value: RpcOpsJournalResponse = {
+          // 最新在前：页面默认就是「刚发生的在顶上」。
+          entries: filtered.slice(Math.max(0, filtered.length - limit)).reverse(),
+          days: [...new Set(all.map((entry) => entry.day))].sort().reverse().slice(0, 90),
+          providers: [...new Set(all.map((entry) => entry.provider))].sort(),
+          total: filtered.length,
+          today: utc8DateString(),
+          status: opsRunner.status(),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 一键签到 / 一键唤醒。
+       *
+       * ⚠️ 任务在**后台**执行并立刻返回：账号多时一轮要几分钟（同平台 5 秒间隔），
+       * 不能把 RPC 挂住。页面随后轮询 `ops.journal` 的 `status` 看进度。
+       */
+      case 'ops.run': {
+        const req = (payload ?? {}) as RpcOpsRunRequest
+        if (req.kind !== 'checkin' && req.kind !== 'wake') {
+          return { ok: false, error: { code: 'bad-request', message: 'kind 必须是 checkin / wake' } }
+        }
+        const value: RpcOpsRunResponse = await opsRunner.run(req.kind)
         return { ok: true, value }
       }
 
