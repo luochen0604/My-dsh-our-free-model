@@ -18,8 +18,12 @@ import {
   isLobsteraiExpired,
   isLobsteraiRefreshable,
   lobsteraiAnonymousHeaders,
+  lobsteraiAuthHeaders,
   lobsteraiCredentialExpiresAtMs,
   lobsteraiDisplayNickname,
+  lobsteraiJsonHeaders,
+  lobsteraiKeyfromBody,
+  lobsteraiKeyfromQuery,
   lobsteraiModelsHeaders,
   lobsteraiRefreshBody,
   parseLobsteraiEnvelope,
@@ -30,7 +34,9 @@ import {
   type LobsteraiCredential,
   type LobsteraiIdentityFields,
 } from './lobsterai.js'
-import { LOBSTERAI_REFRESH_PATH } from './lobsterai.js'
+import { LOBSTERAI_LOGOUT_PATH, LOBSTERAI_REFRESH_PATH } from './lobsterai.js'
+import { lobsteraiFetch } from './lobsterai-fetch.js'
+import { LOBSTERAI_PROFILE_SUMMARY_PATH } from './lobsterai-credits.js'
 import { createLobsteraiIdentityStore, type LobsteraiIdentity, type LobsteraiIdentityStore } from './lobsterai-identity.js'
 import { buildLobsteraiModelsUrl, parseLobsteraiModels, type LobsteraiRemoteModel } from './lobsterai-adapter.js'
 import { LOBSTERAI, type LobsteraiProduct } from './lobsterai-product.js'
@@ -58,6 +64,18 @@ const LOBSTERAI_EXPIRY_ACCESSORS: ExpiryAccessors<LobsteraiCredential> = {
   refreshableOf: isLobsteraiRefreshable,
   identityOf: (credential) => credential.access_token ?? '',
 }
+
+/**
+ * 「登录后请求组」的单次超时（毫秒）。
+ *
+ * 比控制面默认的 30 秒短：这组请求是**补齐行为**，`login()` 会等它们，
+ * 任一端点卡住都不该让用户以为登录没反应。桌面端同样把它们当作可失败的
+ * 附加请求（`main.js:186817-186831` 与 `163255-163305` 全部 catch）。
+ */
+const LOBSTERAI_POST_LOGIN_TIMEOUT_MS = 10_000
+
+/** 启动 warmup 的单次超时（毫秒）；对齐桌面端 `WARMUP_TIMEOUT = 5e3`。 */
+const LOBSTERAI_WARMUP_TIMEOUT_MS = 5_000
 
 /**
  * LobsterAI 的默认凭据 ref。
@@ -173,6 +191,8 @@ export class LobsteraiAuth extends Service {
   private identityState: LobsteraiIdentity | undefined
   /** 已经就「版本号回退」告警过一次（避免每次调用刷屏）。 */
   private fallbackVersionWarned = false
+  /** 启动 warmup 只跑一次（桌面端同样只在应用启动时预热）。 */
+  private warmupStarted = false
 
   constructor(ctx: Context, private readonly options: LobsteraiAuthOptions = {}) {
     const product = options.product ?? LOBSTERAI
@@ -185,9 +205,15 @@ export class LobsteraiAuth extends Service {
     this.identityStore = options.identityStore ?? createLobsteraiIdentityStore(ctx)
   }
 
-  /** 注入的 fetch（测试用）；默认为全局 fetch。 */
+  /**
+   * 控制面请求的 fetch。
+   *
+   * 默认是 {@link lobsteraiFetch}：Electron 宿主里走 Chromium `net.fetch`
+   * （与桌面端同一套 TLS/ALPN/HTTP2/头部指纹），纯 Node 里回退全局 fetch。
+   * 测试可用 `options.fetcher` 注入。
+   */
   private get fetchImpl(): typeof fetch {
-    return this.options.fetcher ?? fetch
+    return this.options.fetcher ?? lobsteraiFetch
   }
 
   /**
@@ -246,7 +272,7 @@ export class LobsteraiAuth extends Service {
     const flow = await runLobsteraiLoginFlow({
       product: this.product,
       clientVersion,
-      ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
+      fetcher: this.fetchImpl,
       ...flowOptions,
       // 安装身份**必须**来自落盘文档：这是「重登不换设备」的唯一保证，
       // 故放在 flowOptions 之后，调用方无法用一次性身份覆盖它。
@@ -268,7 +294,7 @@ export class LobsteraiAuth extends Service {
     const started = await startLobsteraiLoginFlow({
       product: this.product,
       clientVersion,
-      ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
+      fetcher: this.fetchImpl,
       ...flowOptions,
       // 同 `login`：安装身份来自落盘文档，不允许调用方覆盖。
       identity: await this.resolveIdentity(),
@@ -294,6 +320,9 @@ export class LobsteraiAuth extends Service {
     await this.ctx.credentials.set(ref, flow.access)
     this.refreshTokenInvalid = false
     this.lastRefreshError = undefined
+    // 登录路径自己会补齐「登录后请求」（见 runPostLoginRequests），
+    // 故不必再跑启动 warmup —— 否则模型列表会被连拉两次。
+    this.warmupStarted = true
     this.scheduleRefresh()
     const credential = parseCredential(flow.access)
     // 多账号：accountId 提供时自动注册到 pool
@@ -311,6 +340,8 @@ export class LobsteraiAuth extends Service {
         refreshable: credential !== undefined && isLobsteraiRefreshable(credential),
       })
     }
+    // 与桌面端一致的**登录后请求组**（少这一组就是「只换 token、不装客户端」）。
+    if (credential !== undefined) await this.runPostLoginRequests(credential)
     return {
       access: flow.access,
       expires: flow.expires,
@@ -318,6 +349,145 @@ export class LobsteraiAuth extends Service {
       loginUrl: flow.loginUrl,
       refreshable: flow.refreshable,
     }
+  }
+
+  /**
+   * 登录成功后补齐桌面端会立刻发出的请求（2026-11-13 第二轮排查）。
+   *
+   * ## 为什么要补（实证）
+   *
+   * 桌面端在 exchange 成功后会**连续**发这四条（`main.js` + 渲染进程
+   * `useDesktopCompanionState-dtwKvfpU.js:8981-8994`）：
+   *
+   * 1. `POST /api/purchase-offers/low-credit/activate`（`main.js:186903` 内 await，
+   *    无 body，Bearer + Content-Type）；
+   * 2. `GET /api/models/available?…keyfrom…`（`loadServerModels`，带能力头）；
+   * 3. `GET /api/user/quota`（`refreshQuota` → `getQuota`，**不带 keyfrom**）；
+   * 4. `GET /api/user/profile-summary?…keyfrom…`（`fetchProfileSummary`）。
+   *
+   * 只做 exchange 的客户端在服务端看来是「拿到 token 就消失」——真实客户端
+   * 永远会带这组请求。全部失败都只记 warn：补齐请求不该让登录失败。
+   */
+  private async runPostLoginRequests(credential: LobsteraiCredential): Promise<void> {
+    try {
+      const clientVersion = await this.resolveClientVersion()
+      // ① 桌面端在 exchange 返回前就 await 这一步（`main.js:186903`）。
+      await this.activateLowCreditPurchaseOffer(credential)
+      // ② 渲染进程随后立刻做这三件（`:8993-8994`）。
+      await this.warmModels(credential, clientVersion)
+      // `getQuota` 内部还会再激活一次优惠（`main.js:187090`），照做。
+      await this.refreshQuota(credential)
+      await this.fetchProfileSummary(credential, clientVersion)
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        `[lobsterai] 登录后补齐请求失败（不影响凭据）: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  /**
+   * `POST /api/purchase-offers/low-credit/activate`。
+   *
+   * 桌面端 `main.js:186817-186831`：Bearer + `Content-Type`，**无 body**，
+   * 只看 `ok` 与信封 `code`，失败仅 warn —— 这里同样不把失败当登录失败。
+   */
+  private async activateLowCreditPurchaseOffer(credential: LobsteraiCredential): Promise<void> {
+    const response = await this.fetchImpl(`${this.product.apiBase}/api/purchase-offers/low-credit/activate`, {
+      method: 'POST',
+      headers: lobsteraiJsonHeaders(credential, this.product),
+      signal: AbortSignal.timeout(LOBSTERAI_POST_LOGIN_TIMEOUT_MS),
+    })
+    // 消费掉响应体（避免连接悬挂）；内容本身对凭据没有影响。
+    await response.json().catch(() => undefined)
+  }
+
+  /**
+   * `GET /api/models/available` 预热（`loadServerModels` / 启动 warmup 同款）。
+   *
+   * 身份 query 与能力头都必须与桌面端一致：`appendKeyfromQuery` + 四个能力
+   * token（`main.js:184942-184946`、`163290-163293`）。
+   */
+  private async warmModels(
+    credential: LobsteraiCredential,
+    clientVersion: string,
+    timeoutMs: number = LOBSTERAI_POST_LOGIN_TIMEOUT_MS,
+  ): Promise<void> {
+    const url = buildLobsteraiModelsUrl(
+      this.product,
+      withLobsteraiIdentity(credential, await this.resolveIdentity()),
+      clientVersion,
+    )
+    const response = await this.fetchImpl(url, {
+      headers: lobsteraiModelsHeaders(credential, this.product, clientVersion),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    await response.json().catch(() => undefined)
+  }
+
+  /**
+   * `GET /api/user/quota` + 再激活一次低积分优惠（桌面端 `getQuota` 的两步）。
+   *
+   * ⚠️ 桌面端这个端点**不带** keyfrom query（`main.js:163269`、`187011`）：
+   * 它是账号级快照，归因字段只在 `profile-summary` 一类端点出现。
+   */
+  private async refreshQuota(credential: LobsteraiCredential): Promise<void> {
+    const response = await this.fetchImpl(`${this.product.apiBase}/api/user/quota`, {
+      headers: lobsteraiAuthHeaders(credential, this.product),
+      signal: AbortSignal.timeout(LOBSTERAI_POST_LOGIN_TIMEOUT_MS),
+    })
+    await response.json().catch(() => undefined)
+    await this.activateLowCreditPurchaseOffer(credential)
+  }
+
+  /** `GET /api/user/profile-summary?…keyfrom…`（`main.js:187110-187112`）。 */
+  private async fetchProfileSummary(
+    credential: LobsteraiCredential,
+    clientVersion: string,
+  ): Promise<void> {
+    const query = lobsteraiKeyfromQuery(
+      withLobsteraiIdentity(credential, await this.resolveIdentity()),
+      clientVersion,
+    )
+    const base = `${this.product.apiBase}${LOBSTERAI_PROFILE_SUMMARY_PATH}`
+    const response = await this.fetchImpl(query.length === 0 ? base : `${base}?${query}`, {
+      headers: lobsteraiAuthHeaders(credential, this.product),
+      signal: AbortSignal.timeout(LOBSTERAI_POST_LOGIN_TIMEOUT_MS),
+    })
+    await response.json().catch(() => undefined)
+  }
+
+  /**
+   * 启动 warmup：已有凭据时预热 `quota` 与 `models`（桌面端
+   * `runStartupCacheWarmup`，`main.js:163255-163305`）。
+   *
+   * 只跑一次；登录路径会自己跑完整的一组登录后请求，故 `persistLogin` 会先
+   * 把标记置上，避免模型列表被连拉两次。
+   */
+  private scheduleWarmupOnce(): void {
+    if (this.warmupStarted) return
+    this.warmupStarted = true
+    void (async () => {
+      try {
+        const credential = await this.resolveStoredCredential()
+        if (credential === undefined || credential.access_token.length === 0) return
+        // 桌面端 warmup 只做 quota + models（不含 activate-offer）。
+        await this.refreshQuotaWithoutOffer(credential)
+        await this.warmModels(credential, await this.resolveClientVersion(), LOBSTERAI_WARMUP_TIMEOUT_MS)
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[lobsterai] 启动预热失败（不影响使用）: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    })()
+  }
+
+  /** `GET /api/user/quota`（不带 activate-offer，供启动 warmup 用）。 */
+  private async refreshQuotaWithoutOffer(credential: LobsteraiCredential): Promise<void> {
+    const response = await this.fetchImpl(`${this.product.apiBase}/api/user/quota`, {
+      headers: lobsteraiAuthHeaders(credential, this.product),
+      signal: AbortSignal.timeout(LOBSTERAI_WARMUP_TIMEOUT_MS),
+    })
+    await response.json().catch(() => undefined)
   }
 
   /**
@@ -354,6 +524,7 @@ export class LobsteraiAuth extends Service {
     await this.ctx.credentials.set(ref, access)
     this.refreshTokenInvalid = false
     this.lastRefreshError = undefined
+    this.warmupStarted = true
     this.scheduleRefresh()
     if (options.accountId !== undefined && options.pool !== undefined) {
       await options.pool.addAccount({
@@ -368,6 +539,8 @@ export class LobsteraiAuth extends Service {
         refreshable: isLobsteraiRefreshable(credential),
       })
     }
+    // 与 `persistLogin` 同款：登录成功必须补齐桌面端的「登录后请求组」。
+    await this.runPostLoginRequests(credential)
     return {
       access,
       expires: lobsteraiCredentialExpiresAtMs(credential) ?? 0,
@@ -651,12 +824,40 @@ export class LobsteraiAuth extends Service {
     }
   }
 
-  /** 移除已存储的凭据并停止任何待处理的刷新。 */
+  /**
+   * 移除已存储的凭据并停止任何待处理的刷新。
+   *
+   * 还要**通知服务端**（桌面端 `AuthIpcChannel.Logout`，`main.js:187237-187265`）：
+   * 只清本地会让服务端一直认为该会话仍在线 —— 下次登录时「同一账号的两条会话
+   * 时间线」本身就是异常信号。远程登出失败不影响本地结果。
+   */
   async logout(): Promise<void> {
     // 先置 inactive，再清凭据：在途刷新完成后不得回写/重新武装调度。
     this.active = false
     this.scheduler.stop()
-    await this.ctx.credentials.unset(credentialRef(this.credentialRefName))
+    const ref = credentialRef(this.credentialRefName)
+    const resolved = await this.ctx.credentials.resolve(ref)
+    await this.ctx.credentials.unset(ref)
+    if (resolved === null || resolved === undefined) return
+    const credential = parseCredential(resolved.value)
+    if (credential === undefined) return
+    try {
+      const clientVersion = await this.resolveClientVersion()
+      const body = lobsteraiKeyfromBody(
+        withLobsteraiIdentity(credential, await this.resolveIdentity()),
+        clientVersion,
+      )
+      await this.fetchImpl(`${this.product.apiBase}${LOBSTERAI_LOGOUT_PATH}`, {
+        method: 'POST',
+        headers: lobsteraiJsonHeaders(credential, this.product),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(LOBSTERAI_REQUEST_TIMEOUT_MS),
+      })
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        `[lobsterai] 远程登出失败（本地凭据已清除）: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
   }
 
   /** 停止刷新调度（不清理凭据）。 */
@@ -665,7 +866,7 @@ export class LobsteraiAuth extends Service {
     this.scheduler.stop()
   }
 
-  /** 启动时若已有可刷新凭据则安排续期（由 apply 调用）。 */
+  /** 启动时若已有可刷新凭据则安排续期，并做一次桌面端同款启动预热（由 apply 调用）。 */
   scheduleRefresh(): void {
     void this.ctx.credentials.resolve(credentialRef(this.credentialRefName)).then((resolved) => {
       if (!resolved) return
@@ -673,6 +874,7 @@ export class LobsteraiAuth extends Service {
       if (!credential || !isLobsteraiRefreshable(credential)) return
       const expiresAt = lobsteraiCredentialExpiresAtMs(credential)
       if (expiresAt !== undefined) this.scheduler.arm(expiresAt)
+      this.scheduleWarmupOnce()
     })
   }
 

@@ -71,7 +71,11 @@ const result = await esbuild.build({
   platform: 'node',
   target: ['node22'],
   // The kernel's own modules must resolve at run time, to the host's copies.
-  external: ['@deepseek-ai/*', 'node:*'],
+  // `electron` is provided by the hosting Electron process (the pack prefers
+  // `net.fetch` so LobsterAI control-plane traffic shares the desktop's TLS /
+  // ALPN / HTTP2 fingerprint); a plain Node host has no such module and the
+  // pack falls back to global fetch — hence external, with a guarded import.
+  external: ['@deepseek-ai/*', 'node:*', 'electron'],
   sourcemap: false,
   legalComments: 'none',
   logLevel: 'warning',

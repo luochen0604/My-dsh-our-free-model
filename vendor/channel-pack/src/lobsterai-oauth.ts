@@ -53,6 +53,7 @@ import {
   type LobsteraiCredential,
   type LobsteraiIdentityFields,
 } from './lobsterai.js'
+import { lobsteraiFetch } from './lobsterai-fetch.js'
 import type { LobsteraiProduct } from './lobsterai-product.js'
 
 /** 在浏览器中打开登录 URL；永不抛出。 */
@@ -198,7 +199,7 @@ export function loginPageUrlFromOvermind(body: unknown): string | undefined {
  */
 export async function resolveLobsteraiLoginPageUrl(
   product: LobsteraiProduct,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = lobsteraiFetch,
   signal?: AbortSignal,
 ): Promise<string> {
   try {
@@ -235,7 +236,7 @@ export async function exchangeLobsteraiAuthCode(
   identity: LobsteraiIdentityFields,
   clientVersion: string,
   product: LobsteraiProduct,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = lobsteraiFetch,
   signal?: AbortSignal,
 ): Promise<LobsteraiCredential> {
   const body = {
@@ -330,7 +331,7 @@ export interface StartedLobsteraiLoginFlow {
 export async function startLobsteraiLoginFlow(
   options: LobsteraiLoginFlowOptions & { product: LobsteraiProduct; clientVersion: string },
 ): Promise<StartedLobsteraiLoginFlow> {
-  const fetcher = options.fetcher ?? fetch
+  const fetcher = options.fetcher ?? lobsteraiFetch
   const { product, clientVersion } = options
   // 安装级身份由调用方（`LobsteraiAuth`）提供；缺省才退化为一套一次性身份。
   const identity = options.identity ?? fallbackLobsteraiIdentity()

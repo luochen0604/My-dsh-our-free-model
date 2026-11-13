@@ -33,6 +33,7 @@ import {
   type LobsteraiCredential,
 } from './lobsterai.js'
 import { LOBSTERAI, type LobsteraiFallbackModel, type LobsteraiProduct } from './lobsterai-product.js'
+import { lobsteraiFetch } from './lobsterai-fetch.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
   classifyLobsteraiError,
@@ -695,7 +696,9 @@ export class LobsteraiAdapter extends LlmAdapter {
   constructor(private readonly options: LobsteraiAdapterOptions) {
     super()
     this.product = options.product ?? LOBSTERAI
-    this.fetchImpl = options.fetchImpl ?? fetch
+    // 与桌面端同一套网络栈：Electron 宿主里走 Chromium `net.fetch`，
+    // 纯 Node（standalone / 单测）里回退全局 fetch。见 `lobsterai-fetch.ts`。
+    this.fetchImpl = options.fetchImpl ?? lobsteraiFetch
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
     )

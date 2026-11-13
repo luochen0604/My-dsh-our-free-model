@@ -371,6 +371,133 @@ try {
     assert.equal(warnLog.some(line => line.includes('回退')), true, '版本号回退必须留日志')
     console.log('ok  Auth 服务：安装 UUID 落盘复用，版本号回退时有日志')
   }
+
+  // ── 7. GET / POST 请求头分离（桌面端 GET 不发 Content-Type）──────────────
+  {
+    const credential = { access_token: 'access', refresh_token: 'refresh' }
+    const getHeaders = lobsterai.lobsteraiAuthHeaders(credential, product)
+    assert.equal(getHeaders['Content-Type'], undefined, 'GET 不得带 Content-Type')
+    assert.equal(getHeaders.Authorization, 'Bearer access')
+    assert.equal(getHeaders['User-Agent'], product.userAgent)
+    const jsonHeaders = lobsterai.lobsteraiJsonHeaders(credential, product)
+    assert.equal(jsonHeaders['Content-Type'], 'application/json', '带 JSON 体的 POST 必须有 Content-Type')
+    const models = lobsterai.lobsteraiModelsHeaders(credential, product, '2026.11.6')
+    assert.equal(models['Content-Type'], undefined, 'models 是 GET，同样不得带 Content-Type')
+    assert.match(models['X-LobsterAI-Client-Capabilities'], /virtual-models-v1/)
+    const chat = lobsterai.lobsteraiChatHeaders(credential, product, '2026.11.6')
+    assert.equal(chat['Content-Type'], 'application/json', 'chat 是带 JSON 体的 POST')
+    console.log('ok  请求头按方法分流：GET 只 Authorization+Accept+UA，POST 才带 Content-Type')
+  }
+
+  // ── 8. 登录后请求组：exchange → activate-offer → models → quota → activate → profile-summary
+  {
+    const { LobsteraiAuth } = await load('lobsterai-auth')
+    const services = {}
+    const writes = []
+    const ctx = {
+      logger: { info() {}, warn() {}, error() {} },
+      credentials: {
+        set: async (ref, value) => { writes.push(ref); services.creds = { value } },
+        resolve: async () => services.creds,
+        describe: async () => ({ configured: services.creds !== undefined }),
+        unset: async () => { services.creds = undefined },
+      },
+      get: (name) => services[name],
+      provide: (name, value) => { services[name] = value },
+    }
+    const seen = []
+    const respond = (url, init) => {
+      seen.push({ url, method: init?.method ?? 'GET', headers: init?.headers ?? {}, body: init?.body })
+      if (url.includes('/prod/update')) {
+        return jsonResponse({ code: 0, msg: 'OK', data: { value: { version: '2026.11.6' } } })
+      }
+      if (url.endsWith('/api/auth/exchange')) {
+        return jsonResponse({
+          code: 0,
+          data: { accessToken: 'access', refreshToken: 'refresh', expiresIn: 3600, user: { id: 'u1' } },
+        })
+      }
+      return jsonResponse({ code: 0, data: {} })
+    }
+    const fetcher = async (input, init = {}) => respond(String(input), init)
+    const auth = new LobsteraiAuth(ctx, {
+      fetcher,
+      identityStore: identityModule.createLobsteraiIdentityStore({ logger: { warn() {} } }),
+    })
+    const identity = await auth.resolveIdentity()
+    await auth.loginWithCode('code-1')
+
+    const paths = seen.map((call) => new URL(call.url).pathname)
+    // 桌面端顺序：exchange → purchase-offer activate → models → quota →
+    // （getQuota 内再 activate）→ profile-summary（main.js:186903 / 187090 / 187110）。
+    assert.deepEqual(paths, [
+      '/openapi/get/luna/hardware/lobsterai/prod/update',
+      '/api/auth/exchange',
+      '/api/purchase-offers/low-credit/activate',
+      '/api/models/available',
+      '/api/user/quota',
+      '/api/purchase-offers/low-credit/activate',
+      '/api/user/profile-summary',
+    ], '登录后必须补齐桌面端同款请求组')
+
+    const exchange = seen.find((call) => call.url.endsWith('/api/auth/exchange'))
+    assert.equal(exchange.method, 'POST')
+    assert.deepEqual(Object.keys(exchange.headers).sort(), ['Content-Type', 'User-Agent'],
+      'exchange 只发 Content-Type + UA（与桌面端 main.js:186856-186859 同形）')
+    const body = JSON.parse(exchange.body)
+    assert.equal(body.firstKeyfrom, 'official')
+    assert.equal(body.latestKeyfrom, 'official')
+    assert.equal(body.uuid, identity.uuid)
+
+    const offer = seen.filter((call) => call.url.endsWith('/api/purchase-offers/low-credit/activate'))
+    assert.equal(offer.length, 2, '桌面端在 exchange 与 getQuota 各激活一次')
+    assert.equal(offer[0].method, 'POST')
+    assert.equal(offer[0].body, undefined, '激活优惠不带 body')
+    assert.equal(offer[0].headers['Content-Type'], 'application/json')
+    assert.equal(offer[0].headers.Authorization, 'Bearer access')
+
+    const models = seen.find((call) => call.url.includes('/api/models/available'))
+    const modelsUrl = new URL(models.url)
+    assert.equal(modelsUrl.searchParams.get('uuid'), identity.uuid)
+    assert.equal(modelsUrl.searchParams.get('firstKeyfrom'), 'official')
+    assert.equal(modelsUrl.searchParams.get('latestKeyfrom'), 'official')
+    assert.equal(modelsUrl.searchParams.get('version'), '2026.11.6')
+    assert.equal(models.headers['X-LobsterAI-Client-Version'], '2026.11.6')
+    assert.equal(models.headers['Content-Type'], undefined)
+    assert.equal(models.method, 'GET')
+
+    const quota = seen.find((call) => call.url.endsWith('/api/user/quota'))
+    assert.equal(quota.method, 'GET')
+    assert.equal(quota.headers['User-Agent'], product.userAgent)
+
+    const profile = seen.find((call) => call.url.includes('/api/user/profile-summary'))
+    const profileUrl = new URL(profile.url)
+    assert.equal(profileUrl.searchParams.get('firstKeyfrom'), 'official')
+    assert.equal(profileUrl.searchParams.get('uuid'), identity.uuid)
+    assert.equal(profile.headers['Content-Type'], undefined)
+    console.log('ok  登录后请求组与桌面端一致（offer activate → models → quota → offer → profile-summary）')
+  }
+
+  // ── 9. 传输层：纯 Node 回退全局 fetch，Electron 宿主优先 net.fetch ─────────
+  {
+    const { lobsteraiTransport, resetLobsteraiTransport } = await load('lobsterai-fetch')
+    resetLobsteraiTransport()
+    const transport = await lobsteraiTransport()
+    assert.equal(transport.kind, 'node-fetch', '纯 Node 必须回退全局 fetch')
+    assert.equal(typeof transport.fetch, 'function')
+    // 强制 node 模式的开关也必须生效（排查网络栈差异时用）。
+    process.env.DSH_LOBSTERAI_TRANSPORT = 'node'
+    resetLobsteraiTransport()
+    assert.equal((await lobsteraiTransport()).kind, 'node-fetch')
+    delete process.env.DSH_LOBSTERAI_TRANSPORT
+    resetLobsteraiTransport()
+    assert.equal(
+      (await lobsteraiTransport()).fetch,
+      globalThis.fetch,
+      '回退对象必须是全局 fetch',
+    )
+    console.log('ok  传输层：无 Electron 时回退全局 fetch，可用 DSH_LOBSTERAI_TRANSPORT=node 强制')
+  }
 } finally {
   fs.rmSync(scratch, { recursive: true, force: true })
 }

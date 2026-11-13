@@ -17,11 +17,13 @@ import { randomUUID } from 'node:crypto'
 import { LOBSTERAI_REQUEST_TIMEOUT_MS, parseLobsteraiEnvelope } from './lobsterai.js'
 import {
   lobsteraiAuthHeaders,
+  lobsteraiJsonHeaders,
   lobsteraiKeyfromQuery,
   withLobsteraiIdentity,
   type LobsteraiCredential,
   type LobsteraiIdentityFields,
 } from './lobsterai.js'
+import { lobsteraiFetch } from './lobsterai-fetch.js'
 import type { LobsteraiProduct } from './lobsterai-product.js'
 import type { ClaimOutcome, CreditBalance, CreditPackage } from './credits.js'
 
@@ -97,7 +99,10 @@ async function requestJson(
   try {
     const response = await fetcher(url, {
       method: init.method,
-      headers: lobsteraiAuthHeaders(credential, product),
+      // GET 不带 Content-Type；只有带 JSON 体的 POST 才带（与桌面端一致）。
+      headers: init.body === undefined
+        ? lobsteraiAuthHeaders(credential, product)
+        : lobsteraiJsonHeaders(credential, product),
       ...init.body === undefined ? {} : { body: init.body },
       signal: AbortSignal.timeout(LOBSTERAI_REQUEST_TIMEOUT_MS),
     })
@@ -157,7 +162,7 @@ export async function fetchLobsteraiActivitySlot(
   credential: LobsteraiCredential,
   product: LobsteraiProduct,
   clientVersion: string,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = lobsteraiFetch,
 ): Promise<LobsteraiActivitySlot | null> {
   const query = new URLSearchParams({
     placement: LOBSTERAI_SLOT_PLACEMENT,
@@ -192,7 +197,7 @@ export async function fetchLobsteraiActivityContext(
   credential: LobsteraiCredential,
   product: LobsteraiProduct,
   slot: LobsteraiActivitySlot,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = lobsteraiFetch,
 ): Promise<LobsteraiActivityContext | null> {
   const query = new URLSearchParams({ configRevision: String(slot.configRevision) })
   const url = `${product.apiBase}${LOBSTERAI_ACTIVITY_CONTEXT_PATH}/${encodeURIComponent(slot.activityCode)}/context?${query.toString()}`
@@ -228,7 +233,7 @@ export async function claimLobsteraiDailyCheckin(
   credential: LobsteraiCredential,
   product: LobsteraiProduct,
   clientVersion: string,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = lobsteraiFetch,
 ): Promise<ClaimOutcome> {
   const slot = await fetchLobsteraiActivitySlot(credential, product, clientVersion, fetcher)
   if (slot === null) {
@@ -310,7 +315,7 @@ export async function claimLobsteraiDailyCheckin(
 export async function fetchLobsteraiCreditBalance(
   credential: LobsteraiCredential,
   product: LobsteraiProduct,
-  fetcher: typeof fetch = fetch,
+  fetcher: typeof fetch = lobsteraiFetch,
   /** 身份来源（安装级）；缺省时退回凭据里的快照（已过 sanitizer）。 */
   options: { identity?: LobsteraiIdentityFields; clientVersion?: string } = {},
 ): Promise<CreditBalance | null> {

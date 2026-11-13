@@ -32,6 +32,7 @@
 
 import { createHash } from 'node:crypto'
 import { jwtExpiresAtMs } from './credential-expiry.js'
+import { lobsteraiFetch } from './lobsterai-fetch.js'
 import type { LobsteraiProduct } from './lobsterai-product.js'
 
 // ── 端点路径 ──
@@ -40,6 +41,8 @@ import type { LobsteraiProduct } from './lobsterai-product.js'
 export const LOBSTERAI_EXCHANGE_PATH = '/api/auth/exchange'
 /** 静默续期。 */
 export const LOBSTERAI_REFRESH_PATH = '/api/auth/refresh'
+/** 退出登录（桌面端 Web 端登出时也会通知服务端，`main.js:187240-187259`）。 */
+export const LOBSTERAI_LOGOUT_PATH = '/api/auth/logout'
 /** 可用模型列表。 */
 export const LOBSTERAI_MODELS_PATH = '/api/models/available'
 /**
@@ -628,7 +631,12 @@ export function applyLobsteraiRefresh(
 // ── 请求头 ──
 
 /**
- * 构造带 Bearer 的通用请求头。
+ * 构造 **GET** 请求头（Bearer + Accept + 桌面形态 UA）。
+ *
+ * ⚠️ **不带 `Content-Type`**：桌面端对服务端 GET（models / quota /
+ * profile-summary / banner）只设 `Authorization`（`main.js:184945`、`187112`、
+ * `163291`），`Content-Type` 只出现在 POST 上。给 GET 加 `Content-Type` 是
+ * 典型的「手写 HTTP 客户端」痕迹，也是本轮要消除的差异之一。
  *
  * `User-Agent` 用桌面形态串（见 `LOBSTERAI_USER_AGENT`）——桌面端自己不设置
  * UA、由 Electron 网络栈生成含 `Chrome/…`/`Electron/…` 的真实串；Node 侧
@@ -642,18 +650,34 @@ export function lobsteraiAuthHeaders(
   return {
     Authorization: `Bearer ${credential.access_token}`,
     Accept: accept,
-    'Content-Type': 'application/json',
     'User-Agent': product.userAgent,
   }
 }
 
 /**
- * 构造对话请求头。
+ * 构造 **POST JSON** 请求头 = GET 头 + `Content-Type: application/json`。
  *
- * 比 {@link lobsteraiAuthHeaders} 多两个 `X-LobsterAI-Client-*` 头，
- * `Accept` 为 SSE。这两个头来自 `client.go:94-101` 的实测实现：
- * `Capabilities` 声明客户端支持的 agentic 协议版本（影响工具调用行为），
- * `Version` 是客户端版本号（**用动态真值**，见下方说明）。
+ * 桌面端只在确实带 JSON 体的请求上加该头（chat `send`、logout
+ * `main.js:187253-187257`、purchase-offer activate `186821`）。
+ */
+export function lobsteraiJsonHeaders(
+  credential: LobsteraiCredential,
+  product: LobsteraiProduct,
+  accept = 'application/json',
+): Record<string, string> {
+  return {
+    ...lobsteraiAuthHeaders(credential, product, accept),
+    'Content-Type': 'application/json',
+  }
+}
+
+/**
+ * 构造对话请求头（POST JSON）。
+ *
+ * 比 {@link lobsteraiAuthHeaders} 多 `Content-Type` 与两个
+ * `X-LobsterAI-Client-*` 头，`Accept` 为 SSE。这两个头来自 `client.go:94-101`
+ * 的实测实现：`Capabilities` 声明客户端支持的 agentic 协议版本（影响工具调用
+ * 行为），`Version` 是客户端版本号（**用动态真值**，见下方说明）。
  *
  * 注意 `X-LobsterAI-Client-Version` 用传入的 `clientVersion` 而非
  * `product.fallbackClientVersion`：Go 侧一直发假值 `0.1.0` 未被拒绝，
@@ -665,7 +689,7 @@ export function lobsteraiChatHeaders(
   clientVersion: string,
 ): Record<string, string> {
   return {
-    ...lobsteraiAuthHeaders(credential, product, 'text/event-stream, application/json'),
+    ...lobsteraiJsonHeaders(credential, product, 'text/event-stream, application/json'),
     'X-LobsterAI-Client-Capabilities': product.clientCapabilities,
     'X-LobsterAI-Client-Version': clientVersion,
   }
@@ -808,7 +832,7 @@ export class LobsteraiClientVersionResolver {
     if (this.cached !== undefined && now - this.cachedAt < ttl) {
       return { version: this.cached, source: 'cache' }
     }
-    const fetched = this.options.fetcher ?? fetch
+    const fetched = this.options.fetcher ?? lobsteraiFetch
     const query = identity === undefined
       ? ''
       : lobsteraiKeyfromQueryString(lobsteraiKeyfromPayload(identity, product.fallbackClientVersion))
