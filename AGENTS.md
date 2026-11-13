@@ -6,7 +6,9 @@
 ## 硬性规则：所有改动必须经 GitHub 提交到我的分支
 
 1. 任何代码改动都必须在分支上提交，并 `git push` 到 `origin`。不允许只改工作区、不提交、不推送就结束。
-2. 从 `my/feature` 开功能分支（`my/<功能>`），**绝不在 `main` 上提交**；`main` 只跟随上游。
+2. **默认在当前分支上直接继续提交，不要新开分支。** 当前工作分支是 `my/integrate-checkin`（已合并签到流水 + lobsterai 修复），它是唯一主线。**绝不在 `main` 上提交**；`main` 只跟随上游。
+   只有在用户**明确要求**时才新开分支，且必须从**当前最新分支**分出，不要从 `my/feature` 分。
+   （踩过的坑：2026-11-13 两条功能分支都从旧的 `my/feature` 14:41 那个点分出去，结果 `my/checkin-wake-log` 和 `my/lobsterai-login-fingerprint` 互相看不见对方的功能，用户以为"提交没叠加"。）
 3. 绝不推 `upstream`；绝不改 `upstream` 的 push URL。
 4. 收尾时工作区必须干净（`git status --short` 无输出），并报告：分支名、commit sha、push 结果。
 5. 一个 commit 只做一件事；提交信息写清楚"改了什么、为什么"。
@@ -49,4 +51,15 @@
 
 **规则三：结果为 `stale` 时，agent 必须主动、明确提醒用户「需要重启 DSH 才能生效」**（必要时在插件管理器里重装），不能默默结束。
 
-**本机推送凭证现状（push 会失败，如实处理）**：已生成 ed25519 key（`C:\Users\ASUS\.ssh\id_ed25519`，指纹 `SHA256:HbNRBaLgQ1UPy3hVv8/xMDE6pPvSL8YxtRkGvL4H68c`），等待用户把公钥加到 GitHub；`origin` 的 fetch 走 HTTPS + 代理 `http://127.0.0.1:7897`，push 计划改走 SSH。在公钥生效前 **push 会失败**，属正常状态，如实报告即可，不要反复重试。
+**本机推送凭证（已可用）**：ed25519 key 在 `C:\Users\ASUS\.ssh\id_ed25519`（指纹 `SHA256:HbNRBaLgQ1UPy3hVv8/xMDE6pPvSL8YxtRkGvL4H68c`），公钥已加入 GitHub，`ssh -T git@github.com` 返回 `Hi luochen0604!`。
+`origin` 的 **fetch 走 HTTPS + 代理 `http://127.0.0.1:7897`**，**push 走 SSH**（`git@github.com:luochen0604/My-dsh-our-free-model.git`）。直接 `git push origin <branch>` 即可。
+
+**规则四：代码更新后，宿主不会自动刷新 `file:` 依赖，必须手动重装。**
+pnpm 对 `file:` 依赖走缓存，光跑 `dsh plugin --profile desktop install` **不会**把新代码装进去（踩过：合并后 install 退出码 0，但 profile 副本还是旧 `pack.js`）。可靠做法：
+
+```powershell
+Remove-Item "C:\Users\ASUS\.dsh\profiles\desktop\node_modules\dsh-our-free-model" -Recurse -Force
+& "D:\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop install --force
+```
+
+装完**必须**逐字节验证 profile 副本与仓库一致（不能只看退出码 0），然后跑规则二的新鲜度检测。只改 `AGENTS.md` / `scripts/` 这类不进 `files` 的文件时，无需重装，重启 DSH 即可。
