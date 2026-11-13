@@ -39,6 +39,7 @@ import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
 import type { RaccoonAuth } from './raccoon-auth.js'
+import { claimRaccoonDailyPoints, fetchRaccoonDailyCheckinStatus } from './raccoon-credits.js'
 import type { ZcodeAuth } from './zcode-auth.js'
 import { ZCODE } from './zcode-product.js'
 import type { ZcodeCredential } from './zcode.js'
@@ -252,8 +253,12 @@ import { createOpsRunner } from './ops-runner.js'
 import type { RpcOpsRunResponse } from './types.js'
 
 /**
- * 有签到实现的平台。无签到接口的平台（Cline / Raccoon / Gemini）不参与签到；
- * WorkBuddy 有独立签到接口（2026-11-13 实测），参与签到与一键签到。
+ * 有签到实现的平台。
+ *
+ * **无**签到接口的只有 Cline / Gemini；Raccoon **有**（2026-11-14 实测：
+ * 官方桌面端每次启动都会 `POST /api/web/desktop/v1/login/points/grant`，
+ * 服务端对当天首次发放 300 每日积分，账单 `biz_type=daily_grant`）；
+ * WorkBuddy 有独立签到接口（2026-11-13 实测）。四个平台都参与签到与一键签到。
  *
  * **模块级导出**：「自动唤醒也覆盖 WorkBuddy」这类覆盖面断言要能被测试静态检查
  * （`scripts/channel-ops-rpc-test.mjs`），挂在端点装配函数内部就拿不到。
@@ -264,6 +269,7 @@ export const OPS_CHECKIN_PROVIDERS: ReadonlySet<string> = new Set([
   QODER_CN.id,
   TRAE.id,
   LOOMY.id,
+  RACCOON.id,
   MINIMAX.id,
   ZCODE.id,
   WORKBUDDY_ID,
@@ -2621,6 +2627,20 @@ if (provider === LOBSTERAI.id) {
             } satisfies RpcCreditsStatusResponse,
           }
         }
+        if (req.provider === RACCOON.id) {
+          // Raccoon **有**可查的签到状态（不是独立端点，而是账单）：
+          // `GET /points/v2/bills?type=income` 里当天的 `daily_grant`
+          // ⇒ 今天已领。见 `fetchRaccoonDailyCheckinStatus`。
+          const raccoonStatusAccounts = await pool.listAccounts(req.provider)
+          const value = await collectCreditsStatus<RaccoonCredential, typeof RACCOON>(
+            raccoonStatusAccounts, RACCOON, {
+              resolve: (ref) => ctx.credentials.resolve(ref),
+              fetchStatus: (credential, product) => fetchRaccoonDailyCheckinStatus(product, credential),
+              warn: (msg) => ctx.logger?.warn?.(msg),
+            },
+          )
+          return { ok: true, value: { accounts: value } satisfies RpcCreditsStatusResponse }
+        }
         if (req.provider === MINIMAX.id) {
           // ⚠️ MiniMax **有**独立的签到状态端点（`/minimax-cloud/api/v1/signin/status`），
           // 与 LobsterAI/TRAE/Cline 那几个「如实返回 null」的 provider 不同 ——
@@ -2781,20 +2801,24 @@ if (provider === LOBSTERAI.id) {
           }
         }
         if (req.provider === RACCOON.id) {
-          // raccoon **没有签到端点**：每日 300 积分由服务端按日自动发放
-          //（账单里的 `daily_grant`，实测注册后 1 分钟即到账），
-          // 客户端按能力矩阵（`raccoon: { balance: true, onboardingTasks: true }`，
-          // **无** `dailyCheckin`）根本不会渲染「一键领取积分」按钮、也不会发起本调用。
-          // 这里显式返回可读错误，而不是落到下面 `productById` 的
-          // `unsupported provider` 泛化文案 —— 后者会让排查者以为是
-          //「provider 没注册」，而真相是「该产品无此能力」。
-          return {
-            ok: false,
-            error: {
-              code: 'bad-request',
-              message: 'Raccoon Work 不支持每日签到（每日积分由服务端自动发放；登录奖励请在「新手任务」中领取）',
-            },
-          }
+          // Raccoon 的「每日积分」= 官方桌面端启动时打的
+          // `POST /api/web/desktop/v1/login/points/grant`（2026-11-14 实测：
+          // 桌面端每次启动都打它；服务端对当天首次回 `granted:true` 并加一条
+          // `daily_grant` 账单 +300，当天再次调用回 `granted:false`）。
+          // 早期把该端点当成「一次性登录奖励」并把 raccoon 登记为「无签到」，
+          // 是漏掉了它同时承担每日发放这一事实。
+          //
+          // ⚠️ **开启状态预检**（默认值，不要传 false）：状态来自账单
+          // （`fetchRaccoonDailyCheckinStatus`）。今天已有 `daily_grant` ⇒ 直接
+          // already-claimed、不再打写端点；查不到状态（网络/凭据问题）时才照旧
+          // 尝试领取 —— 无法确认不等于不能领。
+          const value = await collectClaimResults<RaccoonCredential, typeof RACCOON>(accounts, RACCOON, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential, product) => fetchRaccoonDailyCheckinStatus(product, credential),
+            claim: (credential, product) => claimRaccoonDailyPoints(product, credential),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return record(value)
         }
         if (req.provider === MINIMAX.id) {
           // ⚠️ **必须开启状态预检**（`precheckStatus` 默认为 true，不要传 false）。

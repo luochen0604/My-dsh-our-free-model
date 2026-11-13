@@ -1,21 +1,32 @@
 /**
- * Raccoon Work 积分（余额 + 一次性登录奖励）。
+ * Raccoon Work 积分（余额 + 每日积分领取）。
  *
  * ## ⚠️ 三个来源的语义（关键）
  *
  * | 来源 | 金额 | 触发方式 | 本模块 |
  * |---|---|---|---|
  * | 新人注册礼包 | 3000 | 注册时服务端自动发放 | 不涉及（用户注册即有） |
- * | 桌面端登录奖励 | 3000 | `POST …/login/points/grant` | ✅ `claimRaccoonLoginReward` |
- * | 每日积分发放 | 300 | **服务端按日自动发放，无端点** | ❌ 不实现 |
+ * | 桌面端登录奖励 | 3000 | `POST …/login/points/grant` 首次 | ✅ `claimRaccoonLoginReward` |
+ * | 每日积分发放 | 300 | **同一个端点**，服务端按「当天首次」发放 | ✅ `claimRaccoonDailyPoints` |
  *
- * ⚠️ **每日 300 没有签到端点** —— 实测该账号 13:30 注册、13:31 就收到
- * `daily_grant` 账单（`biz_type: 'daily_grant'`）。故**不能**把它实现成
- * 签到按钮：不存在可调用的端点，按钮必然失败。
+ * ⚠️ **每日 300 的领取动作就是桌面端的 `login/points/grant`**（2026-11-14 实测，
+ * 推翻了本文件早期「每日积分无端点、只能等服务端自动发」的结论）：
+ * 官方桌面端**每次启动**都会 POST 该端点；服务端对「当天首次」返回
+ * `granted:true` 并新增一条 `daily_grant` 账单（`grant_at` 归到当天 00:00），
+ * 当天再次调用则 `granted:false`。本机实测证据：
+ * - 11-12 22:26:22、11-13 23:34:39、11-14 00:04 各有一次 `daily_grant`（+300），
+ *   前两次与桌面端启动时刻对齐，第三次是本次抓包启动桌面端时到账；
+ * - 同一账号在同一分钟里手动 POST 该端点返回 `{"granted":false,"popup":null}`；
+ * - 账单与余额 `daily_points` 在领取后 +300。
  *
- * ⚠️ **登录奖励是幂等一次性的**（已领过返回 `granted:false`），
- * 语义与 Loomy 的新手任务同构，故登记为 `onboardingTasks` 而**不是**
- * `dailyCheckin` —— 后者会让用户以为每天都真的加了额度。
+ * ⚠️ **登录奖励仍是幂等一次性的**：已领过时同一个端点回 `granted:false`。
+ * 故两个函数打同一处端点，语义差异只在「这次 granted 代表哪一种」——
+ * `onboarding` 侧按一次性奖励解读，`dailyCheckin` 侧按每日积分解读。
+ *
+ * ⚠️ **不是每个账号都能领每日积分**：实测只有「在官方桌面端登录过」的账号
+ * （账号存在桌面端会话）会拿到 `granted:true`；纯网页/扫码登录的账号该端点
+ * 只发一次性登录奖励。此时本模块返回 `already-claimed` 并给出可读原因，
+ * 而不是谎报领取成功。
  *
  * ## 只读优先
  *
@@ -26,16 +37,22 @@
 
 import {
   RACCOON_POINTS_PREFIX,
+  RACCOON_POINTS_V2_PREFIX,
   RACCOON_DESKTOP_PREFIX,
   RACCOON_REQUEST_TIMEOUT_MS,
+  raccoonDesktopUserAgent,
   raccoonHeaders,
   type RaccoonCredential,
 } from './raccoon.js'
 import { RACCOON, type RaccoonProduct } from './raccoon-product.js'
-import type { ClaimOutcome, CreditBalance, CreditPackage } from './credits.js'
+import { utc8DateString } from './auto-checkin.js'
+import type { CheckinStatus, ClaimOutcome, CreditBalance, CreditPackage } from './credits.js'
 
 /** 登录奖励的默认额度（服务端未在 popup 里给出时兜底）。 */
 export const RACCOON_LOGIN_REWARD_POINTS = 3000
+
+/** 每日积分的默认额度（`granted` 为真但 popup 未给数值时兜底）。 */
+export const RACCOON_DAILY_GRANT_POINTS = 300
 
 /** 登录奖励在账单里的 `event_name`（用于判定是否已领）。 */
 export const RACCOON_LOGIN_REWARD_EVENT_NAME = '桌面端登录奖励'
@@ -73,21 +90,26 @@ function readNumber(value: unknown): number | undefined {
  *
  * ⚠️ 不抛错 —— 调用方按 `ok` 分支处理。积分查询/领取属「尽力而为」，
  * 批量操作时单个账号失败不应中断其余账号。
+ *
+ * `init.headers` 在标准头之后合并（用于给 `login/points/grant` 补桌面端标识）。
  */
 async function requestJson(
   url: string,
   credential: RaccoonCredential,
   product: RaccoonProduct,
-  init: { method: string; body?: string },
+  init: { method: string; body?: string; headers?: Record<string, string> },
   fetcher: typeof fetch,
 ): Promise<Envelope> {
   try {
     const response = await fetcher(url, {
       method: init.method,
-      headers: raccoonHeaders(credential, {
-        platform: product.clientPlatform,
-        version: product.clientVersion,
-      }),
+      headers: {
+        ...raccoonHeaders(credential, {
+          platform: product.clientPlatform,
+          version: product.clientVersion,
+        }),
+        ...init.headers,
+      },
       ...init.body === undefined ? {} : { body: init.body },
       signal: AbortSignal.timeout(RACCOON_REQUEST_TIMEOUT_MS),
     })
@@ -103,6 +125,33 @@ async function requestJson(
   }
 }
 
+/**
+ * 「桌面端登录积分」端点的请求头：在标准业务头上补 `X-Client-Name` /
+ * `X-Client-Page` 与官方桌面端 UA。
+ *
+ * ⚠️ UA 是 latin1 字节串（见 `raccoonDesktopUserAgent`），某些 fetch 实现
+ * （含 Node 的 undici 在收到**非 latin1** 字符时）会直接拒绝带该头的请求；
+ * 调用方因此保留「去掉 UA 重试一次」的退化路径。
+ */
+function desktopGrantHeaders(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  withUserAgent: boolean,
+): Record<string, string> {
+  return raccoonHeaders(credential, {
+    platform: product.clientPlatform,
+    version: product.clientVersion,
+    desktopClient: true,
+    ...withUserAgent ? { userAgent: raccoonDesktopUserAgent(product.clientVersion) } : {},
+  })
+}
+
+/** UA 被 fetch 实现拒绝时的错误签名（undici 的 ByteString 校验）。 */
+function isHeaderRejection(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /ByteString|invalid header|header.*invalid|Invalid character/i.test(message)
+}
+
 /** 构造一个资源包条目。 */
 function makePackage(name: string, remaining: number): CreditPackage {
   return {
@@ -115,6 +164,66 @@ function makePackage(name: string, remaining: number): CreditPackage {
     cycleStartTime: '',
     cycleEndTime: '',
     expiredTime: '',
+  }
+}
+
+/**
+ * 查询「今天是否已领到每日积分」（供 `credits.status` / 一键签到的状态预检）。
+ *
+ * ## 判据只能看账单，不能看余额
+ *
+ * 每日积分进的是**同一个积分池**（`available_points` 是奖励/每日/充值的合计），
+ * 余额无法回答「今天这一笔到没到」；只有账单能：`GET /points/v2/bills?type=income`
+ * 只返回发放类条目，其中 `biz_type === 'daily_grant'` 且 `grant_at` 的日期
+ * （服务端已带 `+08:00`，取前 10 位即是 UTC+8 的日界）等于今天 ⇒ 今天已领。
+ *
+ * ⚠️ 用 `type=income` 而不是 `all`：`all` 按时间倒序混着消费流水，重度使用
+ * 的账号当天可能翻十几页都翻不到那条发放记录。
+ *
+ * ⚠️ 查询失败返回 `null`（= 未知），调用方据此**仍然尝试领取** ——
+ * 无法确认不等于不能领。
+ */
+export async function fetchRaccoonDailyCheckinStatus(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  fetcher: typeof fetch = fetch,
+  nowMs: number = Date.now(),
+): Promise<CheckinStatus | null> {
+  const envelope = await requestJson(
+    `${product.apiBase}${RACCOON_POINTS_V2_PREFIX}/bills?paging.limit=20&type=income`,
+    credential,
+    product,
+    { method: 'GET' },
+    fetcher,
+  )
+  if (!envelope.ok || envelope.data === undefined) return null
+  const items = Array.isArray(envelope.data.items) ? envelope.data.items : []
+  const today = utc8DateString(nowMs)
+  let grantedToday = false
+  let todayCredit = 0
+  for (const raw of items) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) continue
+    const item = raw as Record<string, unknown>
+    if (item.biz_type !== 'daily_grant') continue
+    const grantAt = typeof item.grant_at === 'string' ? item.grant_at : ''
+    if (grantAt.length < 10) continue
+    if (grantAt.slice(0, 10) !== today) continue
+    grantedToday = true
+    todayCredit = readNumber(item.points) ?? RACCOON_DAILY_GRANT_POINTS
+    break
+  }
+  return {
+    active: true,
+    todayCheckedIn: grantedToday,
+    streakDays: 0,
+    dailyCredit: RACCOON_DAILY_GRANT_POINTS,
+    todayCredit: todayCredit > 0 ? todayCredit : RACCOON_DAILY_GRANT_POINTS,
+    isStreakDay: false,
+    totalCredits: 0,
+    checkinDates: grantedToday ? [today] : [],
+    activityName: '每日积分',
+    themeName: '',
+    endTime: '',
   }
 }
 
@@ -163,10 +272,42 @@ export async function fetchRaccoonCreditBalance(
 }
 
 /**
+ * POST 一次「桌面端登录积分」端点并拆信封（登录奖励与每日积分共用同一个端点）。
+ *
+ * 先带官方桌面端 UA 请求；若 fetch 实现以 header 校验为由拒绝（undici 对
+ * 非 latin1 的 ByteString 校验，见 `raccoonDesktopUserAgent`），退化为
+ * **不带 UA** 的同一请求重试一次 —— UA 只是「像官方客户端」的附加信号，
+ * 不值得为它放弃领取（实测服务端的日常发放判定与 UA 无关）。
+ */
+async function postDesktopLoginGrant(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  fetcher: typeof fetch,
+): Promise<Envelope> {
+  const url = `${product.apiBase}${RACCOON_DESKTOP_PREFIX}/login/points/grant`
+  const attempt = (withUserAgent: boolean) => requestJson(url, credential, product, {
+    method: 'POST',
+    headers: desktopGrantHeaders(product, credential, withUserAgent),
+  }, fetcher)
+  const envelope = await attempt(true)
+  if (envelope.ok || !isHeaderRejection(envelope.message)) return envelope
+  return attempt(false)
+}
+
+/** `granted` 响应里 popup 的积分值（缺失时不编造数字）。 */
+function grantedPopupPoints(data: Record<string, unknown> | undefined): number | undefined {
+  const popup = typeof data?.popup === 'object' && data.popup !== null
+    ? data.popup as Record<string, unknown>
+    : undefined
+  return readNumber(popup?.points)
+}
+
+/**
  * 领取「桌面端登录奖励」（一次性，幂等）。
  *
- * ⚠️ **不是每日签到**：实测该端点是幂等一次性的（已领过返回 `granted:false`
- * 且账单里能看到上一次的记录）。映射到 `onboardingTasks` 能力。
+ * ⚠️ 与 {@link claimRaccoonDailyPoints} **打同一个端点**：该端点对「登录奖励
+ * 未领」优先发 3000，否则尝试发每日 300，两者都已领则 `granted:false`。
+ * 这里按「一次性奖励」解读，登记为 `onboardingTasks` 能力。
  *
  * ⚠️ 需要 `X-Client-Platform` 头（值见 `product.clientPlatform`）——
  * 它标识「来自桌面端」，缺了会被拒。见 `raccoonHeaders`。
@@ -178,13 +319,7 @@ export async function claimRaccoonLoginReward(
   credential: RaccoonCredential,
   fetcher: typeof fetch = fetch,
 ): Promise<ClaimOutcome> {
-  const envelope = await requestJson(
-    `${product.apiBase}${RACCOON_DESKTOP_PREFIX}/login/points/grant`,
-    credential,
-    product,
-    { method: 'POST' },
-    fetcher,
-  )
+  const envelope = await postDesktopLoginGrant(product, credential, fetcher)
 
   if (!envelope.ok) {
     return {
@@ -204,11 +339,54 @@ export async function claimRaccoonLoginReward(
     }
   }
 
-  const popup = typeof envelope.data.popup === 'object' && envelope.data.popup !== null
-    ? envelope.data.popup as Record<string, unknown>
-    : undefined
-  const points = readNumber(popup?.points) ?? RACCOON_LOGIN_REWARD_POINTS
+  const points = grantedPopupPoints(envelope.data) ?? RACCOON_LOGIN_REWARD_POINTS
   return { kind: 'claimed', credit: points, streakDays: 0, isStreakDay: false }
+}
+
+/**
+ * 领取「每日积分」（每次调用都幂等：当天首次 `granted:true`，之后 `false`）。
+ *
+ * ## 这就是官方桌面端的签到动作
+ *
+ * 桌面端**每次启动**都会 POST 这个端点（渲染层的 `useEffect` 在登录态就绪后
+ * 触发一次，见 `raccoon.ts` 模块头第 3 条），服务端对「当天首次」返回
+ * `granted:true` + 一条 `daily_grant` 账单（+300）。本插件把同一动作做成
+ * `dailyCheckin` 能力：自动签到每天替用户「点一次桌面端」。
+ *
+ * ## 判据与文案
+ *
+ * - `granted:true` ⇒ `claimed`，额度取 popup（缺失按 300）；
+ * - `granted:false` ⇒ `already-claimed`。**注意**：服务端对「从没在桌面端
+ *   登录过」的账号永久回 false（实测纯扫码登录的账号不发每日积分），
+ *   文案必须把这两种可能都说出来，不能让用户以为只是「今天已领」。
+ * - 网络/信封失败 ⇒ `failed`（自动签到据此不记今日，下一轮会重试）。
+ *
+ * 本函数**不抛错**，保证批量领取不会因单个账号中断。
+ */
+export async function claimRaccoonDailyPoints(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  fetcher: typeof fetch = fetch,
+): Promise<ClaimOutcome> {
+  const envelope = await postDesktopLoginGrant(product, credential, fetcher)
+
+  if (!envelope.ok) {
+    return {
+      kind: 'failed',
+      code: envelope.code,
+      message: envelope.message.length > 0 ? `领取每日积分失败：${envelope.message}` : '领取每日积分失败',
+    }
+  }
+
+  if (envelope.data?.granted !== true) {
+    return {
+      kind: 'already-claimed',
+      message: '今天已领过（该端点对没在商汤桌面端登录过的账号不发每日积分）',
+    }
+  }
+
+  const points = grantedPopupPoints(envelope.data) ?? RACCOON_DAILY_GRANT_POINTS
+  return { kind: 'claimed', credit: points, unit: 'credit', streakDays: 0, isStreakDay: false }
 }
 
 /**

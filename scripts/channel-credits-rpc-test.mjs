@@ -96,6 +96,7 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds, adapters }) {
       }
     }
     await verifyWorkbuddyWake({ ctx, call, creds })
+    await verifyRaccoonDailyClaim({ ctx, call, creds })
   } finally {
     ctx.credentials.resolve = originalResolve
     globalThis.fetch = originalFetch
@@ -103,6 +104,93 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds, adapters }) {
       await ctx.accountPool.removeAccount(`fixture-credits-${provider}`)
       creds.delete(`FIXTURE_CREDITS_${provider.toUpperCase()}`)
     }
+  }
+}
+
+/**
+ * raccoon 的「每日积分」：一键签到必须真的打桌面端那个端点
+ * （`POST /api/web/desktop/v1/login/points/grant`），带桌面端客户端标识，
+ * 并把 `granted` 映射成 claimed / already-claimed。
+ *
+ * 用途：锁死 2026-11-14 的协议结论 —— 每日 300 不是「服务端自动发放、
+ * 无法调用」，而是桌面端启动时调用的同一端点。
+ */
+async function verifyRaccoonDailyClaim({ ctx, call, creds }) {
+  const provider = 'raccoon'
+  const accountId = 'fixture-daily-raccoon'
+  const ref = 'FIXTURE_DAILY_RACCOON'
+  const savedFetch = globalThis.fetch
+  const requests = []
+  let granted = true
+  let bills = []
+  const todayUtc8 = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10)
+  try {
+    creds.set(ref, { value: JSON.stringify({ access_token: 'fixture-raccoon-token', refresh_token: 'fixture-refresh' }) })
+    await ctx.accountPool.addAccount({
+      id: accountId, provider, nickname: 'RaccoonDaily', credentialRef: ref,
+      enabled: true, refreshable: true, createdAt: 1,
+    })
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input))
+      requests.push({ url: url.toString(), method: init?.method, headers: { ...(init?.headers ?? {}) } })
+      if (url.pathname.endsWith('/points/v2/bills')) {
+        return Response.json({ code: 0, message: 'success', data: { items: bills } })
+      }
+      if (!url.pathname.endsWith('/desktop/v1/login/points/grant')) {
+        throw new Error(`未预期的 raccoon 端点：${url.pathname}`)
+      }
+      return Response.json({ code: 0, message: 'success', data: granted
+        ? { granted: true, popup: { points: 300 } }
+        : { granted: false, popup: null } })
+    }
+
+    // ① 账单里还没有今天的 daily_grant ⇒ 真的调桌面端那个端点领取。
+    const first = await call('credits.claimAll', { provider })
+    assert.equal(first.ok, true)
+    const statusRequests = requests.filter((row) => row.url.includes('/points/v2/bills'))
+    const grantRequests = requests.filter((row) => row.url.includes('/login/points/grant'))
+    assert.equal(statusRequests.length, 1, '领取前先查一次账单状态')
+    assert.equal(statusRequests[0].method, 'GET')
+    assert.match(statusRequests[0].url, /type=income/, '状态查询必须只看发放类流水')
+    assert.equal(grantRequests.length, 1, '状态未知/未领时只打一次写端点')
+    assert.equal(grantRequests[0].method, 'POST')
+    assert.equal(grantRequests[0].url, 'https://xiaohuanxiong.com/api/web/desktop/v1/login/points/grant')
+    const headers = grantRequests[0].headers
+    assert.equal(headers.Authorization, 'Bearer fixture-raccoon-token')
+    assert.equal(headers['X-Client-Platform'], 'desktop-windows', '桌面端平台头是端点要求')
+    assert.equal(headers['X-Client-Name'], 'raccoon-work', '桌面端客户端标识')
+    assert.equal(headers['X-Client-Page'], 'local-agent', '桌面端页面标识')
+    const outcome = first.value.results[0].outcome
+    assert.equal(outcome.kind, 'claimed')
+    assert.equal(outcome.credit, 300, '每日积分额度来自 popup.points')
+    assert.equal(outcome.unit, 'credit')
+    assert.equal(first.value.summary.claimed, 1)
+
+    // ② 账单里已有今天的 daily_grant ⇒ 状态预检直接判「今天已领」，不再写上游。
+    bills = [{ biz_type: 'daily_grant', grant_at: `${todayUtc8}T00:00:00+08:00`, points: 300 }]
+    requests.length = 0
+    const second = await call('credits.claimAll', { provider })
+    assert.equal(second.ok, true)
+    assert.equal(requests.filter((row) => row.url.includes('/login/points/grant')).length, 0, '已领时不得再打写端点')
+    assert.equal(second.value.results[0].outcome.kind, 'already-claimed')
+
+    // ③ 状态查询也走同一判据（面板逐账号的「今日已领」）。
+    const status = await call('credits.status', { provider })
+    assert.equal(status.ok, true)
+    assert.equal(status.value.accounts[0].status.todayCheckedIn, true)
+    assert.equal(status.value.accounts[0].status.dailyCredit, 300)
+
+    granted = false
+    bills = []
+    const third = await call('credits.claimAll', { provider })
+    assert.equal(third.ok, true, '已领不是错误')
+    assert.equal(third.value.results[0].outcome.kind, 'already-claimed', 'granted:false 必须映射成已领')
+    assert.match(third.value.results[0].outcome.message, /桌面端/)
+    console.log('ok  raccoon daily claim: 账单状态预检、桌面端 login/points/grant、granted 幂等映射')
+  } finally {
+    globalThis.fetch = savedFetch
+    await ctx.accountPool.removeAccount(accountId)
+    creds.delete(ref)
   }
 }
 

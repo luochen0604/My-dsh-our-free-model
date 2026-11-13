@@ -41522,7 +41522,14 @@ import { LlmAdapter as LlmAdapter6, LlmError as LlmError11, ReasoningEffortId as
 import { createCipheriv, randomBytes as randomBytes4 } from "node:crypto";
 var RACCOON_API_BASE = "https://xiaohuanxiong.com";
 var RACCOON_POINTS_PREFIX = "/api/web/points/v1";
+var RACCOON_POINTS_V2_PREFIX = "/api/web/points/v2";
 var RACCOON_DESKTOP_PREFIX = "/api/web/desktop/v1";
+var RACCOON_DESKTOP_CLIENT_NAME = "raccoon-work";
+var RACCOON_DESKTOP_CLIENT_PAGE = "local-agent";
+function raccoonDesktopUserAgent(version) {
+  const text = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \u5546\u6C64\u5C0F\u6D63\u718A/${version} Chrome/146.0.7680.72 Electron/41.0.1 Safari/537.36`;
+  return Buffer.from(text, "utf8").toString("latin1");
+}
 var RACCOON_PHONE_CIPHER_SECRET = "senseraccoon2023";
 var RACCOON_REQUEST_TIMEOUT_MS = 6e4;
 var RACCOON_LOGIN_TIMEOUT_MS = 5 * 60 * 1e3;
@@ -41598,6 +41605,13 @@ function raccoonHeaders(credential, opts = {}) {
   }
   if (opts.version !== void 0 && opts.version.length > 0) {
     headers["X-Client-Version"] = opts.version;
+  }
+  if (opts.desktopClient === true) {
+    headers["X-Client-Name"] = RACCOON_DESKTOP_CLIENT_NAME;
+    headers["X-Client-Page"] = RACCOON_DESKTOP_CLIENT_PAGE;
+  }
+  if (opts.userAgent !== void 0 && opts.userAgent.length > 0) {
+    headers["User-Agent"] = opts.userAgent;
   }
   if (credential.device_id !== void 0 && credential.device_id.length > 0) {
     headers["X-Client-Device-ID"] = credential.device_id;
@@ -41686,7 +41700,15 @@ var RACCOON = {
   desktopApiPrefix: "/api/web/desktop/v1",
   userAgent: "Raccoon Work/1.0.35 (Windows)",
   clientPlatform: "desktop-windows",
-  clientVersion: "v1.0.35",
+  /**
+   * 客户端版本（带 `v` 前缀）。
+   *
+   * ⚠️ 2026-11-14 从 `v1.0.35` 升到 `v1.2.1`（本机安装的官方桌面端版本，
+   * 见 `D:\Program Files\Raccon\@raccoonoffice-desktop` 与卸载项 DisplayVersion）。
+   * 只有每日积分领取（`claimRaccoonDailyPoints`）会把它发出去；报真实安装版本
+   * 才不会让服务端把请求当成过期客户端。
+   */
+  clientVersion: "v1.2.1",
   defaultCredentialRef: "RACCOON_ACCESS_TOKEN",
   // 实测该网关按**请求体字节**卡（`HTTP_413: request body exceeds 10MB`），
   // 所以字节目标是主约束；像素预算保证图不至于大到压不进那个字节目标。
@@ -46554,8 +46576,524 @@ var LoomyAuth = class extends Service5 {
 import { Service as Service6 } from "@deepseek-ai/cordis";
 import { credentialRef as credentialRef7 } from "@deepseek-ai/dsh-credentials";
 
+// vendor/channel-pack/src/auto-checkin.ts
+import { existsSync as existsSync5, mkdirSync as mkdirSync5, readFileSync as readFileSync6, renameSync as renameSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { join as join5 } from "node:path";
+
+// vendor/channel-pack/src/credits.ts
+function roundCredits2(value) {
+  return Math.round(value * 100) / 100;
+}
+function normalizeCreditUnit(unit) {
+  return unit === "token" ? "token" : "credit";
+}
+function claimUnitOf(unit) {
+  return normalizeCreditUnit(typeof unit === "string" ? unit : "");
+}
+function formatCreditAmount(value) {
+  if (!Number.isFinite(value)) return "?";
+  return Number.isInteger(value) ? String(value) : value.toFixed(2);
+}
+function formatTokenAmount(value) {
+  if (!Number.isFinite(value)) return "?";
+  const abs = Math.abs(value);
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
+  return String(Math.round(value));
+}
+function claimUnitLabel(unit) {
+  return unit === "token" ? "Token" : "\u79EF\u5206";
+}
+function formatUnitAmount(value, unit) {
+  const text = unit === "token" ? formatTokenAmount(value) : formatCreditAmount(value);
+  return `${text}${claimUnitLabel(unit)}`;
+}
+function formatClaimGains(totals) {
+  if (totals === void 0 || totals === null || typeof totals !== "object") return null;
+  const parts = [];
+  for (const unit of ["token", "credit"]) {
+    const value = Number(totals[unit]);
+    if (!Number.isFinite(value) || value <= 0) continue;
+    parts.push(`+${formatUnitAmount(value, unit)}`);
+  }
+  return parts.length === 0 ? null : parts.join(", ");
+}
+
+// vendor/channel-pack/src/zcode.ts
+var PHONE_RE = /^1[3-9]\d{9}$/;
+function phoneFromUserId(userId) {
+  if (typeof userId !== "string" || userId.length < 11) return void 0;
+  const head = userId.slice(0, 11);
+  if (!PHONE_RE.test(head)) return void 0;
+  return `${head.slice(0, 3)}****${head.slice(-4)}`;
+}
+var ZCODE_APP_VERSION_FALLBACK = "3.14.3";
+function isUsableZcodeCredential(value) {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value;
+  return typeof record.zcode_jwt === "string" && record.zcode_jwt.length > 0 && typeof record.device_mid === "string" && record.device_mid.length > 0;
+}
+
+// vendor/channel-pack/src/zcode-product.ts
+var ZCODE_FALLBACK_MODELS = [
+  {
+    id: "GLM-5.3-Flash",
+    name: "GLM-5.3-Flash",
+    // 上游值（client/configs 的 builtinModels）。
+    contextWindow: 1e6,
+    maxTokens: 128e3,
+    // 上游 capabilities.vision === true。
+    supportsImage: true,
+    // 上游 reasoning.levels 的顺序即展示顺序（low → high → max）。
+    reasoningLevels: ["low", "high", "max"],
+    // 上游 reasoning.defaultLevel。
+    defaultReasoningLevel: "max"
+  },
+  {
+    id: "GLM-5.3",
+    name: "GLM-5.3",
+    contextWindow: 1e6,
+    maxTokens: 128e3,
+    /**
+     * ⚠ **上游 `capabilities` 是空对象** ⇒ 这个模型**没有 vision**。
+     * 我此前按「同族应该一样」推断成 `true` —— 那是错的。
+     */
+    supportsImage: false,
+    reasoningLevels: ["low", "high", "max"],
+    defaultReasoningLevel: "max"
+  }
+];
+var ZCODE = {
+  id: "zcode",
+  // ⚠ 用『ZCode (智谱)』而非长名 —— 后者在 Channel Pack 的 provider Tab 里
+  // **触发换行**（与 Raccoon 同样的用户报障）。
+  // 与 `plugin-src/client/channel-pack.js` 的 `PROVIDERS` label 保持一致。
+  displayName: "ZCode (\u667A\u8C31)",
+  /**
+   * 单凭据回退 ref。
+   *
+   * ⚠ ZCode 正常**不需要**用户填任何东西 —— 凭据从官方
+   * `~/.zcode/v2/credentials.json` 自动解密读取（见 `zcode.ts`）。
+   * 这个 ref 只用于「账号池里没有任何 zcode 账号」时的兜底路径，
+   * 内容为 `ZcodeCredential` 的 JSON。
+   */
+  defaultCredentialRef: "ZCODE_CREDENTIAL",
+  /**
+   * **整轮墙钟**上限：15 分钟。
+   *
+   * ⚠⚠️ **不要按「推理该等多久」来定它**（真实缺陷 IKJOVB）。它只兜两件事：
+   * ① 上游**真静默**且空闲超时也失效的极端情况；② **captcha 卡死** ——
+   * `zcode-captcha.ts` 里存在**无上限的等待**（取页自旋、等 CDP WebSocket `open`），
+   * 早期实测把 `pageBusy` 卡死后整个 turn 永挂，只能靠这里兜。
+   *
+   * ⚠ **180_000 是错的**（那是官方 `network.timeout`，属另一个字段，见接口注释）。
+   * 长思考该由 {@link streamIdleTimeoutMs} 管，本值可以给得很宽。
+   *
+   * ⚠ 实测 free 通道单请求 3–30 秒（本机 GLM-5.3-Flash 2.99 秒），mint 稳态
+   * 0.4–0.5 秒（中位 426ms / 均值 546ms）、含 chromium 冷启动首次 4.2 秒 ——
+   * 这些都在 15 分钟里，不构成约束。
+   */
+  requestTimeoutMs: 15 * 6e4,
+  /**
+   * 流式读取空闲超时：**600_000ms（10 分钟）**，逐字对齐官方
+   * `modelStream.idleTimeoutMs = 6e5`（`zcode.cjs` 默认配置还原）。
+   *
+   * ⚠ 每收到一帧即续期，所以「持续大思考」可以跑满 10 分钟以上而不被判超时 ——
+   * 这正是官方 IDE 面对同一场景不报错的原因。
+   */
+  streamIdleTimeoutMs: 6e5,
+  fallbackModels: ZCODE_FALLBACK_MODELS,
+  appVersionFallback: ZCODE_APP_VERSION_FALLBACK,
+  /**
+   * 闸门与重试参数**全部照搬 `dsh-free-glm` 的实测值**。
+   *
+   * ⚠ 这些值是在**同一个上游**（`zcode.z.ai` 的免费额度通道）上实测出来的，
+   * 而并发配额是**服务端按模型 + 账号**计量的 —— 与我们走不走壳无关，
+   * 故可以直接沿用。将来若上游调整配额，改这里即可（不要在适配器里写死）。
+   */
+  serializeUpstream: true,
+  modelGapMs: {
+    // 那边实测：GLM-5.3 需要间隔（起步 350ms，21 次限流降到 1 次）。
+    "glm-5.3": 350,
+    // Flash 从未撞过限流 —— 强加间隔是纯粹的性能损失。
+    "glm-5.3-flash": 0
+  },
+  concurrencyRetryMax: 2,
+  concurrencyRetryBaseMs: 1500,
+  quotaSwitchMax: 2,
+  toolCacheBreakpoint: true
+};
+var ALL_ZCODE_PRODUCTS = [ZCODE];
+function zcodeProductById(id) {
+  return ALL_ZCODE_PRODUCTS.find((product) => product.id === id);
+}
+
+// vendor/channel-pack/src/auto-checkin.ts
+var AUTO_CHECKIN_FILE = "auto-checkin.json";
+var SCHEMA3 = "channel-pack/auto-checkin/v1";
+var DEFAULT_AUTO_CHECKIN = {
+  enabled: true,
+  lastDate: "",
+  lastResult: "",
+  lastAt: 0,
+  channels: [],
+  dismissedRunAt: 0
+};
+var DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+var MAX_CHANNEL_ENTRIES = 24;
+function sanitizeChannels(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const record = item;
+    if (typeof record.provider !== "string" || record.provider.length === 0) continue;
+    if (typeof record.text !== "string") continue;
+    out.push({ provider: record.provider, text: record.text.slice(0, 120) });
+    if (out.length >= MAX_CHANNEL_ENTRIES) break;
+  }
+  return out;
+}
+function sanitizeAutoCheckin(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { ...DEFAULT_AUTO_CHECKIN };
+  const record = raw;
+  const ms = (value) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+  return {
+    // ⚠️ **只有显式 `false` 才算关闭**（默认是打开的，见 `AutoCheckinDoc.enabled`）：
+    // 写成 `=== true` 会让旧文档（没有该字段）与脏数据把开关静默关掉，与
+    // 「默认保持打开状态」相反。`'false'` / `0` 这些非布尔值一律按打开处理 ——
+    // 它们不是用户点出来的值。
+    enabled: record.enabled !== false,
+    lastDate: typeof record.lastDate === "string" && DATE_RE.test(record.lastDate) ? record.lastDate : "",
+    lastResult: typeof record.lastResult === "string" ? record.lastResult : "",
+    lastAt: ms(record.lastAt),
+    channels: sanitizeChannels(record.channels),
+    dismissedRunAt: ms(record.dismissedRunAt)
+  };
+}
+function utc8DateString(nowMs = Date.now()) {
+  return new Date(nowMs + QODER_BILLING_UTC_OFFSET_MS).toISOString().slice(0, 10);
+}
+var DSH_CHANNEL_PACK_AUTO_CHECKIN_DELAY_MS = "DSH_CHANNEL_PACK_AUTO_CHECKIN_DELAY_MS";
+var AUTO_CHECKIN_DELAY_MS = 3e4;
+var AUTO_CHECKIN_TICK_MS = 150 * 60 * 1e3;
+var AUTO_CHECKIN_RETRY_MS = 60 * 60 * 1e3;
+function autoCheckinDelayMs(env = process.env) {
+  const raw = env[DSH_CHANNEL_PACK_AUTO_CHECKIN_DELAY_MS];
+  if (typeof raw !== "string" || raw.trim().length === 0) return AUTO_CHECKIN_DELAY_MS;
+  const parsed = Number(raw.trim());
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : AUTO_CHECKIN_DELAY_MS;
+}
+var MemoryAutoCheckinStore = class {
+  kind = "memory";
+  doc = { ...DEFAULT_AUTO_CHECKIN };
+  load() {
+    return { ...this.doc };
+  }
+  async save(doc) {
+    this.doc = { ...doc };
+  }
+};
+var FileAutoCheckinStore = class {
+  constructor(path2, logger2) {
+    this.path = path2;
+    this.logger = logger2;
+  }
+  kind = "file";
+  load() {
+    try {
+      if (!existsSync5(this.path)) return { ...DEFAULT_AUTO_CHECKIN };
+      return sanitizeAutoCheckin(JSON.parse(readFileSync6(this.path, "utf-8")));
+    } catch (error) {
+      this.logger?.warn(`[channel-pack] \u8BFB\u53D6 ${this.path} \u5931\u8D25\uFF0C\u81EA\u52A8\u7B7E\u5230\u6309\u9ED8\u8BA4\u8BBE\u7F6E\uFF08\u5F00\u542F\uFF09\u5904\u7406: ${String(error)}`);
+      return { ...DEFAULT_AUTO_CHECKIN };
+    }
+  }
+  async save(doc) {
+    mkdirSync5(join5(this.path, ".."), { recursive: true });
+    const tmp = `${this.path}.tmp`;
+    writeFileSync5(tmp, JSON.stringify({
+      schema: SCHEMA3,
+      enabled: doc.enabled,
+      lastDate: doc.lastDate,
+      lastResult: doc.lastResult,
+      lastAt: doc.lastAt,
+      channels: doc.channels,
+      dismissedRunAt: doc.dismissedRunAt
+    }, null, 2), "utf-8");
+    renameSync5(tmp, this.path);
+  }
+};
+function createAutoCheckinStore(ctx) {
+  const home = resolveChannelPackHome(ctx);
+  if (home === void 0) {
+    ctx.logger?.warn?.("[channel-pack] \u65E0\u6CD5\u5B9A\u4F4D DSH home\uFF0C\u81EA\u52A8\u7B7E\u5230\u5F00\u5173\u4EC5\u5B58\u5728\u4E8E\u5185\u5B58\u4E2D");
+    return new MemoryAutoCheckinStore();
+  }
+  return new FileAutoCheckinStore(join5(home, "channel-pack", AUTO_CHECKIN_FILE), ctx.logger);
+}
+function emptyTotals2() {
+  return { providers: 0, claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 }, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 };
+}
+function isAutoCheckinExcluded(provider) {
+  return provider === ZCODE.id;
+}
+function describeRun(totals) {
+  const parts = [];
+  if (totals.claimed > 0) {
+    const amounts = formatClaimGains(totals.totalByUnit ?? { credit: totals.totalCredit });
+    parts.push(`${totals.claimed} \u4E2A\u8D26\u53F7\u9886\u53D6\u6210\u529F${amounts === null ? "" : `\uFF08${amounts}\uFF09`}`);
+  }
+  if (totals.alreadyClaimed > 0) parts.push(`${totals.alreadyClaimed} \u4E2A\u4ECA\u5929\u5DF2\u9886`);
+  if (totals.failed > 0) parts.push(`${totals.failed} \u4E2A\u5931\u8D25`);
+  if (totals.errors > 0) parts.push(`${totals.errors} \u4E2A\u6E20\u9053\u51FA\u9519`);
+  if (totals.skipped > 0) parts.push(`${totals.skipped} \u4E2A\u6E20\u9053\u4E0D\u652F\u6301\u7B7E\u5230`);
+  if (parts.length === 0) return `${totals.providers} \u4E2A\u6E20\u9053\uFF1A\u6CA1\u6709\u9700\u8981\u9886\u53D6\u7684\u8D26\u53F7`;
+  return `${totals.providers} \u4E2A\u6E20\u9053\uFF1A${parts.join("\uFF0C")}`;
+}
+function shouldMarkToday(totals) {
+  return totals.coversToday > 0;
+}
+function describeChannel(summary) {
+  const parts = [];
+  if (summary.claimed > 0) {
+    const amounts = formatClaimGains(summary.totalByUnit ?? { credit: summary.totalCredit });
+    parts.push(amounts === null ? `${summary.claimed} \u4E2A\u9886\u53D6\u6210\u529F` : `${summary.claimed} \u4E2A ${amounts}`);
+  }
+  if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} \u4E2A\u4ECA\u5929\u5DF2\u9886`);
+  if (summary.failed > 0) parts.push(`${summary.failed} \u4E2A\u5931\u8D25`);
+  if (summary.inactive > 0) parts.push(`${summary.inactive} \u4E2A\u672A\u5F00\u542F`);
+  if (parts.length === 0) return "\u65E0\u53EF\u9886";
+  const coversToday = summary.coversToday ?? summary.claimed + summary.alreadyClaimed;
+  if (coversToday === 0 && summary.claimed + summary.alreadyClaimed > 0) {
+    parts.push("\u975E\u4ECA\u65E5\u8F6E\u6B21");
+  }
+  return parts.join("\uFF0C");
+}
+function createAutoSchedule(deps) {
+  const now = deps.now ?? (() => Date.now());
+  let doc = deps.store.load();
+  let running2 = false;
+  let inflight = null;
+  let pending = null;
+  let tick = null;
+  let lastAttemptAt = doc.lastAt;
+  const today = () => utc8DateString(now());
+  function state() {
+    return {
+      enabled: doc.enabled,
+      lastDate: doc.lastDate,
+      ranToday: doc.lastDate !== "" && doc.lastDate === today(),
+      running: running2,
+      lastResult: doc.lastResult,
+      lastAt: doc.lastAt,
+      channels: doc.channels.map((entry) => ({ ...entry })),
+      // 面板据它决定要不要渲染那行常驻状态文字
+      dismissed: doc.lastAt > 0 && doc.dismissedRunAt === doc.lastAt
+    };
+  }
+  function tallyOf(entry) {
+    const credit = entry.outcome === "ok" ? Math.max(0, entry.credit ?? 0) : 0;
+    const unit = entry.unit === "token" ? "token" : "credit";
+    switch (entry.outcome) {
+      case "ok":
+        return { claimed: 1, totalCredit: credit, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: entry.coversToday !== false ? 1 : 0, unit };
+      case "already":
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0, coversToday: entry.coversToday !== false ? 1 : 0, unit };
+      case "inactive":
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 1, failed: 0, coversToday: 0, unit };
+      default:
+        return { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1, coversToday: 0, unit };
+    }
+  }
+  async function excludedRows() {
+    if (deps.isExcluded === void 0 || deps.excludedText === void 0) return [];
+    let providers = [];
+    try {
+      providers = deps.listProviderIds ? await deps.listProviderIds() : [];
+    } catch {
+      return [];
+    }
+    const rows = [];
+    for (const provider of [...new Set(providers)].sort()) {
+      if (deps.isExcluded(provider) !== true) continue;
+      rows.push({ provider, text: deps.excludedText });
+    }
+    return rows;
+  }
+  function collect(startedAt, excluded) {
+    const totals = emptyTotals2();
+    const perProvider = /* @__PURE__ */ new Map();
+    for (const entry of deps.entries()) {
+      if (entry.kind !== deps.kind || entry.at < startedAt) continue;
+      const tally = perProvider.get(entry.provider) ?? {
+        claimed: 0,
+        totalCredit: 0,
+        totalByUnit: { token: 0, credit: 0 },
+        alreadyClaimed: 0,
+        inactive: 0,
+        failed: 0,
+        coversToday: 0
+      };
+      const add = tallyOf(entry);
+      tally.claimed += add.claimed;
+      tally.totalCredit += add.totalCredit;
+      tally.totalByUnit[add.unit] += add.totalCredit;
+      tally.alreadyClaimed += add.alreadyClaimed;
+      tally.inactive += add.inactive;
+      tally.failed += add.failed;
+      tally.coversToday += add.coversToday;
+      perProvider.set(entry.provider, tally);
+    }
+    const channels = [];
+    for (const [provider, tally] of perProvider) {
+      totals.providers += 1;
+      totals.claimed += tally.claimed;
+      totals.totalCredit += tally.totalCredit;
+      totals.totalByUnit.token += tally.totalByUnit.token;
+      totals.totalByUnit.credit += tally.totalByUnit.credit;
+      totals.alreadyClaimed += tally.alreadyClaimed;
+      totals.inactive += tally.inactive;
+      totals.failed += tally.failed;
+      totals.coversToday += tally.coversToday;
+      channels.push({ provider, text: deps.describeChannel(tally) });
+    }
+    for (const row of excluded) {
+      totals.skipped += 1;
+      channels.push(row);
+    }
+    return { totals, channels };
+  }
+  async function performRun() {
+    lastAttemptAt = now();
+    let reply2;
+    try {
+      reply2 = await deps.trigger();
+    } catch (error) {
+      deps.warn?.(`[channel-pack] ${deps.runLabel}\uFF1A\u542F\u52A8\u6267\u884C\u4EFB\u52A1\u5931\u8D25\uFF0C\u672C\u6B21\u8DF3\u8FC7: ${String(error)}`);
+      return;
+    }
+    if (!reply2.started) {
+      if (reply2.reason === "nothing") {
+        doc = {
+          ...doc,
+          lastDate: today(),
+          lastResult: deps.emptyResultText,
+          lastAt: now(),
+          channels: [],
+          dismissedRunAt: 0
+        };
+        try {
+          await deps.store.save(doc);
+        } catch (error) {
+          deps.warn?.(`[channel-pack] ${deps.runLabel}\u7ED3\u679C\u5199\u5165\u5931\u8D25\uFF08\u4ECA\u5929\u53EF\u80FD\u91CD\u590D\u89E6\u53D1\u4E00\u6B21\uFF09: ${String(error)}`);
+        }
+        return;
+      }
+      deps.warn?.(`[channel-pack] ${deps.runLabel}\uFF1A\u5DF2\u6709\u4EFB\u52A1\u8FDB\u884C\u4E2D\uFF0C\u672C\u8F6E\u4E0D\u8BB0\u65E5\u671F`);
+      return;
+    }
+    await deps.whenIdle();
+    const { totals, channels } = collect(reply2.startedAt, await excludedRows());
+    if (!shouldMarkToday(totals)) {
+      deps.warn?.(
+        `[channel-pack] ${deps.runLabel}\u672A\u8BB0\u5165\u4ECA\u65E5\uFF08\u4E0B\u6B21\u542F\u52A8\u4F1A\u91CD\u8BD5\uFF09\uFF1A${deps.describeTotals(totals)}`
+      );
+      return;
+    }
+    doc = {
+      ...doc,
+      lastDate: today(),
+      lastResult: deps.describeTotals(totals),
+      lastAt: now(),
+      channels,
+      // ⚠️ 新一轮跑完要**清掉上一次的「已关闭」标记**：否则用户关过一次后，
+      // 明天的新结果会被旧标记静默藏住（`dismissed` 的判据是 lastAt 相等）。
+      dismissedRunAt: 0
+    };
+    try {
+      await deps.store.save(doc);
+    } catch (error) {
+      deps.warn?.(`[channel-pack] ${deps.runLabel}\u7ED3\u679C\u5199\u5165\u5931\u8D25\uFF08\u4ECA\u5929\u53EF\u80FD\u91CD\u590D\u89E6\u53D1\u4E00\u6B21\uFF09: ${String(error)}`);
+    }
+    deps.warn?.(`[channel-pack] ${deps.runLabel}\u5B8C\u6210\uFF08${today()}\uFF09\uFF1A${doc.lastResult}`);
+  }
+  function runIfDue() {
+    if (inflight !== null) return inflight;
+    if (!doc.enabled) return Promise.resolve();
+    if (doc.lastDate !== "" && doc.lastDate === today()) return Promise.resolve();
+    running2 = true;
+    const task = performRun().catch((error) => {
+      deps.warn?.(`[channel-pack] ${deps.runLabel}\u5F02\u5E38: ${String(error)}`);
+    }).finally(() => {
+      running2 = false;
+      inflight = null;
+    });
+    inflight = task;
+    return task;
+  }
+  return {
+    state,
+    async setEnabled(enabled) {
+      doc = { ...doc, enabled };
+      await deps.store.save(doc);
+      if (enabled) void runIfDue();
+      return state();
+    },
+    start() {
+      if (pending !== null || tick !== null) return;
+      const ms = deps.delayMs ?? autoCheckinDelayMs();
+      const fire = () => {
+        pending = null;
+        void runIfDue();
+      };
+      if (ms <= 0) {
+        fire();
+      } else {
+        pending = (deps.schedule ?? defaultSchedule)(fire, ms);
+      }
+      const tickMs = deps.tickMs ?? AUTO_CHECKIN_TICK_MS;
+      if (tickMs > 0) {
+        tick = (deps.scheduleTick ?? defaultScheduleTick)(() => {
+          if (doc.lastDate !== "" && doc.lastDate === today()) return;
+          const attemptedToday = lastAttemptAt > 0 && utc8DateString(lastAttemptAt) === today();
+          if (attemptedToday && now() - lastAttemptAt < AUTO_CHECKIN_RETRY_MS) return;
+          void runIfDue();
+        }, tickMs);
+      }
+    },
+    runIfDue,
+    async dismiss() {
+      doc = { ...doc, dismissedRunAt: doc.lastAt };
+      try {
+        await deps.store.save(doc);
+      } catch (error) {
+        deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\u72B6\u6001\u6587\u5B57\u5173\u95ED\u6807\u8BB0\u5199\u5165\u5931\u8D25: ${String(error)}`);
+      }
+      return state();
+    },
+    stop() {
+      pending?.cancel();
+      pending = null;
+      tick?.cancel();
+      tick = null;
+    }
+  };
+}
+function defaultSchedule(fn, ms) {
+  const timer = setTimeout(fn, ms);
+  timer.unref?.();
+  return { cancel: () => clearTimeout(timer) };
+}
+function defaultScheduleTick(fn, ms) {
+  const timer = setInterval(fn, ms);
+  timer.unref?.();
+  return { cancel: () => clearInterval(timer) };
+}
+
 // vendor/channel-pack/src/raccoon-credits.ts
 var RACCOON_LOGIN_REWARD_POINTS = 3e3;
+var RACCOON_DAILY_GRANT_POINTS = 300;
 var RACCOON_LOGIN_REWARD_EVENT_NAME = "\u684C\u9762\u7AEF\u767B\u5F55\u5956\u52B1";
 function parseEnvelope(payload, status) {
   const record = typeof payload === "object" && payload !== null && !Array.isArray(payload) ? payload : {};
@@ -46571,10 +47109,13 @@ async function requestJson2(url, credential, product, init, fetcher) {
   try {
     const response = await fetcher(url, {
       method: init.method,
-      headers: raccoonHeaders(credential, {
-        platform: product.clientPlatform,
-        version: product.clientVersion
-      }),
+      headers: {
+        ...raccoonHeaders(credential, {
+          platform: product.clientPlatform,
+          version: product.clientVersion
+        }),
+        ...init.headers
+      },
       ...init.body === void 0 ? {} : { body: init.body },
       signal: AbortSignal.timeout(RACCOON_REQUEST_TIMEOUT_MS)
     });
@@ -46589,6 +47130,18 @@ async function requestJson2(url, credential, product, init, fetcher) {
     };
   }
 }
+function desktopGrantHeaders(product, credential, withUserAgent) {
+  return raccoonHeaders(credential, {
+    platform: product.clientPlatform,
+    version: product.clientVersion,
+    desktopClient: true,
+    ...withUserAgent ? { userAgent: raccoonDesktopUserAgent(product.clientVersion) } : {}
+  });
+}
+function isHeaderRejection(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /ByteString|invalid header|header.*invalid|Invalid character/i.test(message);
+}
 function makePackage2(name2, remaining) {
   return {
     name: name2,
@@ -46600,6 +47153,44 @@ function makePackage2(name2, remaining) {
     cycleStartTime: "",
     cycleEndTime: "",
     expiredTime: ""
+  };
+}
+async function fetchRaccoonDailyCheckinStatus(product, credential, fetcher = fetch, nowMs = Date.now()) {
+  const envelope = await requestJson2(
+    `${product.apiBase}${RACCOON_POINTS_V2_PREFIX}/bills?paging.limit=20&type=income`,
+    credential,
+    product,
+    { method: "GET" },
+    fetcher
+  );
+  if (!envelope.ok || envelope.data === void 0) return null;
+  const items = Array.isArray(envelope.data.items) ? envelope.data.items : [];
+  const today = utc8DateString(nowMs);
+  let grantedToday = false;
+  let todayCredit = 0;
+  for (const raw of items) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+    const item = raw;
+    if (item.biz_type !== "daily_grant") continue;
+    const grantAt = typeof item.grant_at === "string" ? item.grant_at : "";
+    if (grantAt.length < 10) continue;
+    if (grantAt.slice(0, 10) !== today) continue;
+    grantedToday = true;
+    todayCredit = readNumber3(item.points) ?? RACCOON_DAILY_GRANT_POINTS;
+    break;
+  }
+  return {
+    active: true,
+    todayCheckedIn: grantedToday,
+    streakDays: 0,
+    dailyCredit: RACCOON_DAILY_GRANT_POINTS,
+    todayCredit: todayCredit > 0 ? todayCredit : RACCOON_DAILY_GRANT_POINTS,
+    isStreakDay: false,
+    totalCredits: 0,
+    checkinDates: grantedToday ? [today] : [],
+    activityName: "\u6BCF\u65E5\u79EF\u5206",
+    themeName: "",
+    endTime: ""
   };
 }
 async function fetchRaccoonCreditBalance(product, credential, fetcher = fetch) {
@@ -46629,14 +47220,22 @@ async function fetchRaccoonCreditBalance(product, credential, fetcher = fetch) {
     expiredTotal: 0
   };
 }
+async function postDesktopLoginGrant(product, credential, fetcher) {
+  const url = `${product.apiBase}${RACCOON_DESKTOP_PREFIX}/login/points/grant`;
+  const attempt = (withUserAgent) => requestJson2(url, credential, product, {
+    method: "POST",
+    headers: desktopGrantHeaders(product, credential, withUserAgent)
+  }, fetcher);
+  const envelope = await attempt(true);
+  if (envelope.ok || !isHeaderRejection(envelope.message)) return envelope;
+  return attempt(false);
+}
+function grantedPopupPoints(data) {
+  const popup = typeof data?.popup === "object" && data.popup !== null ? data.popup : void 0;
+  return readNumber3(popup?.points);
+}
 async function claimRaccoonLoginReward(product, credential, fetcher = fetch) {
-  const envelope = await requestJson2(
-    `${product.apiBase}${RACCOON_DESKTOP_PREFIX}/login/points/grant`,
-    credential,
-    product,
-    { method: "POST" },
-    fetcher
-  );
+  const envelope = await postDesktopLoginGrant(product, credential, fetcher);
   if (!envelope.ok) {
     return {
       kind: "failed",
@@ -46650,9 +47249,26 @@ async function claimRaccoonLoginReward(product, credential, fetcher = fetch) {
       message: "\u8BE5\u8D26\u53F7\u5DF2\u9886\u53D6\u8FC7\u684C\u9762\u7AEF\u767B\u5F55\u5956\u52B1\uFF08\u6BCF\u53F7\u4E00\u6B21\uFF09"
     };
   }
-  const popup = typeof envelope.data.popup === "object" && envelope.data.popup !== null ? envelope.data.popup : void 0;
-  const points = readNumber3(popup?.points) ?? RACCOON_LOGIN_REWARD_POINTS;
+  const points = grantedPopupPoints(envelope.data) ?? RACCOON_LOGIN_REWARD_POINTS;
   return { kind: "claimed", credit: points, streakDays: 0, isStreakDay: false };
+}
+async function claimRaccoonDailyPoints(product, credential, fetcher = fetch) {
+  const envelope = await postDesktopLoginGrant(product, credential, fetcher);
+  if (!envelope.ok) {
+    return {
+      kind: "failed",
+      code: envelope.code,
+      message: envelope.message.length > 0 ? `\u9886\u53D6\u6BCF\u65E5\u79EF\u5206\u5931\u8D25\uFF1A${envelope.message}` : "\u9886\u53D6\u6BCF\u65E5\u79EF\u5206\u5931\u8D25"
+    };
+  }
+  if (envelope.data?.granted !== true) {
+    return {
+      kind: "already-claimed",
+      message: "\u4ECA\u5929\u5DF2\u9886\u8FC7\uFF08\u8BE5\u7AEF\u70B9\u5BF9\u6CA1\u5728\u5546\u6C64\u684C\u9762\u7AEF\u767B\u5F55\u8FC7\u7684\u8D26\u53F7\u4E0D\u53D1\u6BCF\u65E5\u79EF\u5206\uFF09"
+    };
+  }
+  const points = grantedPopupPoints(envelope.data) ?? RACCOON_DAILY_GRANT_POINTS;
+  return { kind: "claimed", credit: points, unit: "credit", streakDays: 0, isStreakDay: false };
 }
 async function fetchRaccoonOnboardingStatus(product, credential, fetcher = fetch) {
   const envelope = await requestJson2(
@@ -47969,6 +48585,19 @@ var RaccoonAuth = class extends Service6 {
   async claimLoginReward(credential) {
     return claimRaccoonLoginReward(this.product, credential, this.fetchImpl);
   }
+  /**
+   * 领取「每日积分」（`dailyCheckin` 能力）。
+   *
+   * 与官方桌面端启动时打的**同一个**端点（`login/points/grant`），见
+   * `claimRaccoonDailyPoints` 的说明与 `raccoon.ts` 模块头第 3 条。
+   */
+  async claimDailyPoints(credential) {
+    return claimRaccoonDailyPoints(this.product, credential, this.fetchImpl);
+  }
+  /** 查询今天是否已领到每日积分（账单里的当天 `daily_grant`）。 */
+  async fetchDailyCheckinStatus(credential) {
+    return fetchRaccoonDailyCheckinStatus(this.product, credential, this.fetchImpl);
+  }
   /** 查询一次性登录奖励是否已领。 */
   async fetchOnboardingStatus(credential) {
     return fetchRaccoonOnboardingStatus(this.product, credential, this.fetchImpl);
@@ -48210,121 +48839,12 @@ var LoomyBalanceSelector = class {
 // vendor/channel-pack/src/zcode-auth.ts
 import { Service as Service7 } from "@deepseek-ai/cordis";
 
-// vendor/channel-pack/src/zcode.ts
-var PHONE_RE = /^1[3-9]\d{9}$/;
-function phoneFromUserId(userId) {
-  if (typeof userId !== "string" || userId.length < 11) return void 0;
-  const head = userId.slice(0, 11);
-  if (!PHONE_RE.test(head)) return void 0;
-  return `${head.slice(0, 3)}****${head.slice(-4)}`;
-}
-var ZCODE_APP_VERSION_FALLBACK = "3.14.3";
-function isUsableZcodeCredential(value) {
-  if (typeof value !== "object" || value === null) return false;
-  const record = value;
-  return typeof record.zcode_jwt === "string" && record.zcode_jwt.length > 0 && typeof record.device_mid === "string" && record.device_mid.length > 0;
-}
-
-// vendor/channel-pack/src/zcode-product.ts
-var ZCODE_FALLBACK_MODELS = [
-  {
-    id: "GLM-5.3-Flash",
-    name: "GLM-5.3-Flash",
-    // 上游值（client/configs 的 builtinModels）。
-    contextWindow: 1e6,
-    maxTokens: 128e3,
-    // 上游 capabilities.vision === true。
-    supportsImage: true,
-    // 上游 reasoning.levels 的顺序即展示顺序（low → high → max）。
-    reasoningLevels: ["low", "high", "max"],
-    // 上游 reasoning.defaultLevel。
-    defaultReasoningLevel: "max"
-  },
-  {
-    id: "GLM-5.3",
-    name: "GLM-5.3",
-    contextWindow: 1e6,
-    maxTokens: 128e3,
-    /**
-     * ⚠ **上游 `capabilities` 是空对象** ⇒ 这个模型**没有 vision**。
-     * 我此前按「同族应该一样」推断成 `true` —— 那是错的。
-     */
-    supportsImage: false,
-    reasoningLevels: ["low", "high", "max"],
-    defaultReasoningLevel: "max"
-  }
-];
-var ZCODE = {
-  id: "zcode",
-  // ⚠ 用『ZCode (智谱)』而非长名 —— 后者在 Channel Pack 的 provider Tab 里
-  // **触发换行**（与 Raccoon 同样的用户报障）。
-  // 与 `plugin-src/client/channel-pack.js` 的 `PROVIDERS` label 保持一致。
-  displayName: "ZCode (\u667A\u8C31)",
-  /**
-   * 单凭据回退 ref。
-   *
-   * ⚠ ZCode 正常**不需要**用户填任何东西 —— 凭据从官方
-   * `~/.zcode/v2/credentials.json` 自动解密读取（见 `zcode.ts`）。
-   * 这个 ref 只用于「账号池里没有任何 zcode 账号」时的兜底路径，
-   * 内容为 `ZcodeCredential` 的 JSON。
-   */
-  defaultCredentialRef: "ZCODE_CREDENTIAL",
-  /**
-   * **整轮墙钟**上限：15 分钟。
-   *
-   * ⚠⚠️ **不要按「推理该等多久」来定它**（真实缺陷 IKJOVB）。它只兜两件事：
-   * ① 上游**真静默**且空闲超时也失效的极端情况；② **captcha 卡死** ——
-   * `zcode-captcha.ts` 里存在**无上限的等待**（取页自旋、等 CDP WebSocket `open`），
-   * 早期实测把 `pageBusy` 卡死后整个 turn 永挂，只能靠这里兜。
-   *
-   * ⚠ **180_000 是错的**（那是官方 `network.timeout`，属另一个字段，见接口注释）。
-   * 长思考该由 {@link streamIdleTimeoutMs} 管，本值可以给得很宽。
-   *
-   * ⚠ 实测 free 通道单请求 3–30 秒（本机 GLM-5.3-Flash 2.99 秒），mint 稳态
-   * 0.4–0.5 秒（中位 426ms / 均值 546ms）、含 chromium 冷启动首次 4.2 秒 ——
-   * 这些都在 15 分钟里，不构成约束。
-   */
-  requestTimeoutMs: 15 * 6e4,
-  /**
-   * 流式读取空闲超时：**600_000ms（10 分钟）**，逐字对齐官方
-   * `modelStream.idleTimeoutMs = 6e5`（`zcode.cjs` 默认配置还原）。
-   *
-   * ⚠ 每收到一帧即续期，所以「持续大思考」可以跑满 10 分钟以上而不被判超时 ——
-   * 这正是官方 IDE 面对同一场景不报错的原因。
-   */
-  streamIdleTimeoutMs: 6e5,
-  fallbackModels: ZCODE_FALLBACK_MODELS,
-  appVersionFallback: ZCODE_APP_VERSION_FALLBACK,
-  /**
-   * 闸门与重试参数**全部照搬 `dsh-free-glm` 的实测值**。
-   *
-   * ⚠ 这些值是在**同一个上游**（`zcode.z.ai` 的免费额度通道）上实测出来的，
-   * 而并发配额是**服务端按模型 + 账号**计量的 —— 与我们走不走壳无关，
-   * 故可以直接沿用。将来若上游调整配额，改这里即可（不要在适配器里写死）。
-   */
-  serializeUpstream: true,
-  modelGapMs: {
-    // 那边实测：GLM-5.3 需要间隔（起步 350ms，21 次限流降到 1 次）。
-    "glm-5.3": 350,
-    // Flash 从未撞过限流 —— 强加间隔是纯粹的性能损失。
-    "glm-5.3-flash": 0
-  },
-  concurrencyRetryMax: 2,
-  concurrencyRetryBaseMs: 1500,
-  quotaSwitchMax: 2,
-  toolCacheBreakpoint: true
-};
-var ALL_ZCODE_PRODUCTS = [ZCODE];
-function zcodeProductById(id) {
-  return ALL_ZCODE_PRODUCTS.find((product) => product.id === id);
-}
-
 // vendor/channel-pack/src/zcode-captcha.ts
 import { spawn as spawn2, spawnSync } from "node:child_process";
-import { existsSync as existsSync5, mkdtempSync, rmSync, writeFileSync as writeFileSync5 } from "node:fs";
+import { existsSync as existsSync6, mkdtempSync, rmSync, writeFileSync as writeFileSync6 } from "node:fs";
 import { createServer as createServer5 } from "node:net";
 import { homedir as homedir2, tmpdir } from "node:os";
-import { basename, isAbsolute, join as join5, posix } from "node:path";
+import { basename, isAbsolute, join as join6, posix } from "node:path";
 var ZCODE_CAPTCHA_FALLBACK = {
   region: "cn",
   prefix: "no8xfe",
@@ -48391,21 +48911,21 @@ function windowsBrowserCandidates(env, home) {
      * 用户设了它们就说明默认路径不对。若排在 `~/scoop` 之后，会出现
      * 「旧默认路径恰好存在 → 用它，而用户实际在用的那个被忽略」。
      */
-    ...env.SCOOP !== void 0 && env.SCOOP.trim().length > 0 ? [join5(env.SCOOP.trim(), "apps", "chromium", "current", "chrome.exe")] : [],
-    ...env.SCOOP_GLOBAL !== void 0 && env.SCOOP_GLOBAL.trim().length > 0 ? [join5(env.SCOOP_GLOBAL.trim(), "apps", "chromium", "current", "chrome.exe")] : [],
+    ...env.SCOOP !== void 0 && env.SCOOP.trim().length > 0 ? [join6(env.SCOOP.trim(), "apps", "chromium", "current", "chrome.exe")] : [],
+    ...env.SCOOP_GLOBAL !== void 0 && env.SCOOP_GLOBAL.trim().length > 0 ? [join6(env.SCOOP_GLOBAL.trim(), "apps", "chromium", "current", "chrome.exe")] : [],
     // ② scoop 默认根目录（`~/scoop`）。实测可用。
-    join5(home, "scoop", "apps", "chromium", "current", "chrome.exe"),
+    join6(home, "scoop", "apps", "chromium", "current", "chrome.exe"),
     // ③ 系统 Chrome。
-    join5(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
-    join5(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
-    join5(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+    join6(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+    join6(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+    join6(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
     // ④ Chromium。
-    join5(localAppData, "Chromium", "Application", "chrome.exe"),
-    join5(programFiles, "Chromium", "Application", "chrome.exe"),
+    join6(localAppData, "Chromium", "Application", "chrome.exe"),
+    join6(programFiles, "Chromium", "Application", "chrome.exe"),
     // ⑤ Edge（Chromium 内核，系统普遍自带）。
-    join5(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
-    join5(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
-    join5(localAppData, "Microsoft", "Edge", "Application", "msedge.exe")
+    join6(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+    join6(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+    join6(localAppData, "Microsoft", "Edge", "Application", "msedge.exe")
   ];
 }
 function macBrowserCandidates(home) {
@@ -48458,7 +48978,7 @@ function findBrowserExecutable() {
   for (const candidate of browserCandidates()) {
     try {
       if (candidate.length === 0 || !isAbsolute(candidate)) continue;
-      if (existsSync5(candidate)) return candidate;
+      if (existsSync6(candidate)) return candidate;
     } catch {
     }
   }
@@ -48731,10 +49251,10 @@ foreach ($h in $all) {
 }
 Write-Output "hidden=$n"
 `;
-    const dir = mkdtempSync(join5(tmpdir(), "zcode-hide-"));
-    const file = join5(dir, "hide.ps1");
+    const dir = mkdtempSync(join6(tmpdir(), "zcode-hide-"));
+    const file = join6(dir, "hide.ps1");
     dirCreated = dir;
-    writeFileSync5(file, script, "ascii");
+    writeFileSync6(file, script, "ascii");
     const child = spawn2("powershell.exe", [
       "-NoProfile",
       "-NonInteractive",
@@ -48891,7 +49411,7 @@ var ZcodeCaptchaBrowser = class {
       );
     }
     this.spawnFailure = void 0;
-    this.profileDir = mkdtempSync(join5(tmpdir(), "zcode-captcha-"));
+    this.profileDir = mkdtempSync(join6(tmpdir(), "zcode-captcha-"));
     this.port = this.options.debugPort ?? await pickFreePort();
     const hide = this.options.hideWindow !== false;
     this.child = spawn2(executable, [
@@ -54066,45 +54586,6 @@ function minimaxFallbackEntries(product = MINIMAX) {
   return product.fallbackModels.map(fallbackToEntry);
 }
 
-// vendor/channel-pack/src/credits.ts
-function roundCredits2(value) {
-  return Math.round(value * 100) / 100;
-}
-function normalizeCreditUnit(unit) {
-  return unit === "token" ? "token" : "credit";
-}
-function claimUnitOf(unit) {
-  return normalizeCreditUnit(typeof unit === "string" ? unit : "");
-}
-function formatCreditAmount(value) {
-  if (!Number.isFinite(value)) return "?";
-  return Number.isInteger(value) ? String(value) : value.toFixed(2);
-}
-function formatTokenAmount(value) {
-  if (!Number.isFinite(value)) return "?";
-  const abs = Math.abs(value);
-  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
-  return String(Math.round(value));
-}
-function claimUnitLabel(unit) {
-  return unit === "token" ? "Token" : "\u79EF\u5206";
-}
-function formatUnitAmount(value, unit) {
-  const text = unit === "token" ? formatTokenAmount(value) : formatCreditAmount(value);
-  return `${text}${claimUnitLabel(unit)}`;
-}
-function formatClaimGains(totals) {
-  if (totals === void 0 || totals === null || typeof totals !== "object") return null;
-  const parts = [];
-  for (const unit of ["token", "credit"]) {
-    const value = Number(totals[unit]);
-    if (!Number.isFinite(value) || value <= 0) continue;
-    parts.push(`+${formatUnitAmount(value, unit)}`);
-  }
-  return parts.length === 0 ? null : parts.join(", ");
-}
-
 // vendor/channel-pack/src/minimax-credits.ts
 var MINIMAX_SIGNIN_STATUS = Object.freeze({
   Upcoming: 1,
@@ -55064,9 +55545,9 @@ function quotaRejectionHint(text) {
 
 // vendor/channel-pack/src/qoder-machine.ts
 import { execFileSync, spawn as spawn3 } from "node:child_process";
-import { existsSync as existsSync6, readFileSync as readFileSync6, readdirSync } from "node:fs";
+import { existsSync as existsSync7, readFileSync as readFileSync7, readdirSync } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { join as join6 } from "node:path";
+import { join as join7 } from "node:path";
 var RUNTIME_INFO_TIMEOUT_MS = 2e4;
 var cached;
 function candidatePaths() {
@@ -55076,20 +55557,20 @@ function candidatePaths() {
   const appData = process.env.APPDATA;
   if (appData !== void 0 && appData.length > 0) {
     for (const dir of ["Qoder", "Qoder CN"]) {
-      paths.push(join6(appData, dir, "SharedClientCache", "cache", "machine_token.json"));
+      paths.push(join7(appData, dir, "SharedClientCache", "cache", "machine_token.json"));
     }
   }
   const home = homedir3();
   for (const dir of ["Qoder", "Qoder CN"]) {
-    paths.push(join6(home, "Library", "Application Support", dir, "SharedClientCache", "cache", "machine_token.json"));
-    paths.push(join6(home, ".config", dir, "SharedClientCache", "cache", "machine_token.json"));
+    paths.push(join7(home, "Library", "Application Support", dir, "SharedClientCache", "cache", "machine_token.json"));
+    paths.push(join7(home, ".config", dir, "SharedClientCache", "cache", "machine_token.json"));
   }
   return paths;
 }
 function parseFile(path2) {
   let raw;
   try {
-    raw = readFileSync6(path2, "utf8");
+    raw = readFileSync7(path2, "utf8");
   } catch {
     return void 0;
   }
@@ -55128,7 +55609,7 @@ var QODER_DATA_DIR_NAMES = [".qoder", ".qoder-cn"];
 function findRuntimeInfoExecutable(home, dataDirNames = QODER_DATA_DIR_NAMES) {
   const exeName = process.platform === "win32" ? "runtime-info.exe" : "runtime-info";
   for (const dirName of dataDirNames) {
-    const binDir = join6(home, dirName, ".bin");
+    const binDir = join7(home, dirName, ".bin");
     let entries;
     try {
       entries = readdirSync(binDir);
@@ -55137,8 +55618,8 @@ function findRuntimeInfoExecutable(home, dataDirNames = QODER_DATA_DIR_NAMES) {
     }
     const dir = entries.find((name2) => name2.startsWith("umid-"));
     if (dir === void 0) continue;
-    const exe = join6(binDir, dir, exeName);
-    if (existsSync6(exe)) return exe;
+    const exe = join7(binDir, dir, exeName);
+    if (existsSync7(exe)) return exe;
   }
   return void 0;
 }
@@ -55146,7 +55627,7 @@ function locateRuntimeInfo(override) {
   const fromEnv = process.env.QODER_RUNTIME_INFO;
   const candidate = override ?? (fromEnv !== void 0 && fromEnv.length > 0 ? fromEnv : void 0);
   if (candidate !== void 0) {
-    return existsSync6(candidate) ? candidate : void 0;
+    return existsSync7(candidate) ? candidate : void 0;
   }
   return findRuntimeInfoExecutable(homedir3());
 }
@@ -57392,8 +57873,8 @@ async function handleOpencodeRpc(ctx, pool, method, payload) {
 }
 
 // vendor/channel-pack/src/badge-preferences.ts
-import { existsSync as existsSync7, mkdirSync as mkdirSync5, readFileSync as readFileSync7, renameSync as renameSync5, writeFileSync as writeFileSync6 } from "node:fs";
-import { join as join7 } from "node:path";
+import { existsSync as existsSync8, mkdirSync as mkdirSync6, readFileSync as readFileSync8, renameSync as renameSync6, writeFileSync as writeFileSync7 } from "node:fs";
+import { join as join8 } from "node:path";
 var BADGE_PREFERENCES_FILE = "ui-preferences.json";
 var BADGE_PREFERENCES = ["auto", "subscription", "credits"];
 var DEFAULT_BADGE_PREFERENCE = "auto";
@@ -57418,8 +57899,8 @@ var FilePreferenceStore = class {
   kind = "file";
   load() {
     try {
-      if (!existsSync7(this.path)) return DEFAULT_BADGE_PREFERENCE;
-      const parsed = JSON.parse(readFileSync7(this.path, "utf-8"));
+      if (!existsSync8(this.path)) return DEFAULT_BADGE_PREFERENCE;
+      const parsed = JSON.parse(readFileSync8(this.path, "utf-8"));
       return sanitizeBadgePreference(preferenceFieldOf(parsed));
     } catch (error) {
       this.logger?.warn(`[channel-pack] \u8BFB\u53D6 ${this.path} \u5931\u8D25\uFF0C\u7528\u91CF\u5FBD\u6807\u504F\u597D\u6309\u9ED8\u8BA4\u503C\u5904\u7406: ${String(error)}`);
@@ -57427,13 +57908,13 @@ var FilePreferenceStore = class {
     }
   }
   async save(preference) {
-    mkdirSync5(join7(this.path, ".."), { recursive: true });
+    mkdirSync6(join8(this.path, ".."), { recursive: true });
     const tmp = `${this.path}.tmp`;
-    writeFileSync6(tmp, JSON.stringify({ schema: SCHEMA3, badgePreference: preference }, null, 2), "utf-8");
-    renameSync5(tmp, this.path);
+    writeFileSync7(tmp, JSON.stringify({ schema: SCHEMA4, badgePreference: preference }, null, 2), "utf-8");
+    renameSync6(tmp, this.path);
   }
 };
-var SCHEMA3 = "channel-pack/ui-preferences/v1";
+var SCHEMA4 = "channel-pack/ui-preferences/v1";
 function preferenceFieldOf(parsed) {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return parsed;
   const record = parsed;
@@ -57445,7 +57926,7 @@ function createBadgePreferenceStore(ctx) {
     ctx.logger?.warn?.("[channel-pack] \u65E0\u6CD5\u5B9A\u4F4D DSH home\uFF0C\u7528\u91CF\u5FBD\u6807\u504F\u597D\u4EC5\u5B58\u5728\u4E8E\u5185\u5B58\u4E2D");
     return new MemoryPreferenceStore();
   }
-  return new FilePreferenceStore(join7(home, "channel-pack", BADGE_PREFERENCES_FILE), ctx.logger);
+  return new FilePreferenceStore(join8(home, "channel-pack", BADGE_PREFERENCES_FILE), ctx.logger);
 }
 
 // vendor/channel-pack/src/badge-subscription.ts
@@ -57616,371 +58097,6 @@ function createUsageBadge(deps) {
 }
 function isAllFailed(snapshot) {
   return snapshot.accounts.length > 0 && snapshot.accounts.every((row) => row.error !== void 0);
-}
-
-// vendor/channel-pack/src/auto-checkin.ts
-import { existsSync as existsSync8, mkdirSync as mkdirSync6, readFileSync as readFileSync8, renameSync as renameSync6, writeFileSync as writeFileSync7 } from "node:fs";
-import { join as join8 } from "node:path";
-var AUTO_CHECKIN_FILE = "auto-checkin.json";
-var SCHEMA4 = "channel-pack/auto-checkin/v1";
-var DEFAULT_AUTO_CHECKIN = {
-  enabled: true,
-  lastDate: "",
-  lastResult: "",
-  lastAt: 0,
-  channels: [],
-  dismissedRunAt: 0
-};
-var DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-var MAX_CHANNEL_ENTRIES = 24;
-function sanitizeChannels(raw) {
-  if (!Array.isArray(raw)) return [];
-  const out = [];
-  for (const item of raw) {
-    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
-    const record = item;
-    if (typeof record.provider !== "string" || record.provider.length === 0) continue;
-    if (typeof record.text !== "string") continue;
-    out.push({ provider: record.provider, text: record.text.slice(0, 120) });
-    if (out.length >= MAX_CHANNEL_ENTRIES) break;
-  }
-  return out;
-}
-function sanitizeAutoCheckin(raw) {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { ...DEFAULT_AUTO_CHECKIN };
-  const record = raw;
-  const ms = (value) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
-  return {
-    // ⚠️ **只有显式 `false` 才算关闭**（默认是打开的，见 `AutoCheckinDoc.enabled`）：
-    // 写成 `=== true` 会让旧文档（没有该字段）与脏数据把开关静默关掉，与
-    // 「默认保持打开状态」相反。`'false'` / `0` 这些非布尔值一律按打开处理 ——
-    // 它们不是用户点出来的值。
-    enabled: record.enabled !== false,
-    lastDate: typeof record.lastDate === "string" && DATE_RE.test(record.lastDate) ? record.lastDate : "",
-    lastResult: typeof record.lastResult === "string" ? record.lastResult : "",
-    lastAt: ms(record.lastAt),
-    channels: sanitizeChannels(record.channels),
-    dismissedRunAt: ms(record.dismissedRunAt)
-  };
-}
-function utc8DateString(nowMs = Date.now()) {
-  return new Date(nowMs + QODER_BILLING_UTC_OFFSET_MS).toISOString().slice(0, 10);
-}
-var DSH_CHANNEL_PACK_AUTO_CHECKIN_DELAY_MS = "DSH_CHANNEL_PACK_AUTO_CHECKIN_DELAY_MS";
-var AUTO_CHECKIN_DELAY_MS = 3e4;
-var AUTO_CHECKIN_TICK_MS = 150 * 60 * 1e3;
-var AUTO_CHECKIN_RETRY_MS = 60 * 60 * 1e3;
-function autoCheckinDelayMs(env = process.env) {
-  const raw = env[DSH_CHANNEL_PACK_AUTO_CHECKIN_DELAY_MS];
-  if (typeof raw !== "string" || raw.trim().length === 0) return AUTO_CHECKIN_DELAY_MS;
-  const parsed = Number(raw.trim());
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : AUTO_CHECKIN_DELAY_MS;
-}
-var MemoryAutoCheckinStore = class {
-  kind = "memory";
-  doc = { ...DEFAULT_AUTO_CHECKIN };
-  load() {
-    return { ...this.doc };
-  }
-  async save(doc) {
-    this.doc = { ...doc };
-  }
-};
-var FileAutoCheckinStore = class {
-  constructor(path2, logger2) {
-    this.path = path2;
-    this.logger = logger2;
-  }
-  kind = "file";
-  load() {
-    try {
-      if (!existsSync8(this.path)) return { ...DEFAULT_AUTO_CHECKIN };
-      return sanitizeAutoCheckin(JSON.parse(readFileSync8(this.path, "utf-8")));
-    } catch (error) {
-      this.logger?.warn(`[channel-pack] \u8BFB\u53D6 ${this.path} \u5931\u8D25\uFF0C\u81EA\u52A8\u7B7E\u5230\u6309\u9ED8\u8BA4\u8BBE\u7F6E\uFF08\u5F00\u542F\uFF09\u5904\u7406: ${String(error)}`);
-      return { ...DEFAULT_AUTO_CHECKIN };
-    }
-  }
-  async save(doc) {
-    mkdirSync6(join8(this.path, ".."), { recursive: true });
-    const tmp = `${this.path}.tmp`;
-    writeFileSync7(tmp, JSON.stringify({
-      schema: SCHEMA4,
-      enabled: doc.enabled,
-      lastDate: doc.lastDate,
-      lastResult: doc.lastResult,
-      lastAt: doc.lastAt,
-      channels: doc.channels,
-      dismissedRunAt: doc.dismissedRunAt
-    }, null, 2), "utf-8");
-    renameSync6(tmp, this.path);
-  }
-};
-function createAutoCheckinStore(ctx) {
-  const home = resolveChannelPackHome(ctx);
-  if (home === void 0) {
-    ctx.logger?.warn?.("[channel-pack] \u65E0\u6CD5\u5B9A\u4F4D DSH home\uFF0C\u81EA\u52A8\u7B7E\u5230\u5F00\u5173\u4EC5\u5B58\u5728\u4E8E\u5185\u5B58\u4E2D");
-    return new MemoryAutoCheckinStore();
-  }
-  return new FileAutoCheckinStore(join8(home, "channel-pack", AUTO_CHECKIN_FILE), ctx.logger);
-}
-function emptyTotals2() {
-  return { providers: 0, claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 }, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 };
-}
-function isAutoCheckinExcluded(provider) {
-  return provider === ZCODE.id;
-}
-function describeRun(totals) {
-  const parts = [];
-  if (totals.claimed > 0) {
-    const amounts = formatClaimGains(totals.totalByUnit ?? { credit: totals.totalCredit });
-    parts.push(`${totals.claimed} \u4E2A\u8D26\u53F7\u9886\u53D6\u6210\u529F${amounts === null ? "" : `\uFF08${amounts}\uFF09`}`);
-  }
-  if (totals.alreadyClaimed > 0) parts.push(`${totals.alreadyClaimed} \u4E2A\u4ECA\u5929\u5DF2\u9886`);
-  if (totals.failed > 0) parts.push(`${totals.failed} \u4E2A\u5931\u8D25`);
-  if (totals.errors > 0) parts.push(`${totals.errors} \u4E2A\u6E20\u9053\u51FA\u9519`);
-  if (totals.skipped > 0) parts.push(`${totals.skipped} \u4E2A\u6E20\u9053\u4E0D\u652F\u6301\u7B7E\u5230`);
-  if (parts.length === 0) return `${totals.providers} \u4E2A\u6E20\u9053\uFF1A\u6CA1\u6709\u9700\u8981\u9886\u53D6\u7684\u8D26\u53F7`;
-  return `${totals.providers} \u4E2A\u6E20\u9053\uFF1A${parts.join("\uFF0C")}`;
-}
-function shouldMarkToday(totals) {
-  return totals.coversToday > 0;
-}
-function describeChannel(summary) {
-  const parts = [];
-  if (summary.claimed > 0) {
-    const amounts = formatClaimGains(summary.totalByUnit ?? { credit: summary.totalCredit });
-    parts.push(amounts === null ? `${summary.claimed} \u4E2A\u9886\u53D6\u6210\u529F` : `${summary.claimed} \u4E2A ${amounts}`);
-  }
-  if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} \u4E2A\u4ECA\u5929\u5DF2\u9886`);
-  if (summary.failed > 0) parts.push(`${summary.failed} \u4E2A\u5931\u8D25`);
-  if (summary.inactive > 0) parts.push(`${summary.inactive} \u4E2A\u672A\u5F00\u542F`);
-  if (parts.length === 0) return "\u65E0\u53EF\u9886";
-  const coversToday = summary.coversToday ?? summary.claimed + summary.alreadyClaimed;
-  if (coversToday === 0 && summary.claimed + summary.alreadyClaimed > 0) {
-    parts.push("\u975E\u4ECA\u65E5\u8F6E\u6B21");
-  }
-  return parts.join("\uFF0C");
-}
-function createAutoSchedule(deps) {
-  const now = deps.now ?? (() => Date.now());
-  let doc = deps.store.load();
-  let running2 = false;
-  let inflight = null;
-  let pending = null;
-  let tick = null;
-  let lastAttemptAt = doc.lastAt;
-  const today = () => utc8DateString(now());
-  function state() {
-    return {
-      enabled: doc.enabled,
-      lastDate: doc.lastDate,
-      ranToday: doc.lastDate !== "" && doc.lastDate === today(),
-      running: running2,
-      lastResult: doc.lastResult,
-      lastAt: doc.lastAt,
-      channels: doc.channels.map((entry) => ({ ...entry })),
-      // 面板据它决定要不要渲染那行常驻状态文字
-      dismissed: doc.lastAt > 0 && doc.dismissedRunAt === doc.lastAt
-    };
-  }
-  function tallyOf(entry) {
-    const credit = entry.outcome === "ok" ? Math.max(0, entry.credit ?? 0) : 0;
-    const unit = entry.unit === "token" ? "token" : "credit";
-    switch (entry.outcome) {
-      case "ok":
-        return { claimed: 1, totalCredit: credit, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: entry.coversToday !== false ? 1 : 0, unit };
-      case "already":
-        return { claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0, coversToday: entry.coversToday !== false ? 1 : 0, unit };
-      case "inactive":
-        return { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 1, failed: 0, coversToday: 0, unit };
-      default:
-        return { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1, coversToday: 0, unit };
-    }
-  }
-  async function excludedRows() {
-    if (deps.isExcluded === void 0 || deps.excludedText === void 0) return [];
-    let providers = [];
-    try {
-      providers = deps.listProviderIds ? await deps.listProviderIds() : [];
-    } catch {
-      return [];
-    }
-    const rows = [];
-    for (const provider of [...new Set(providers)].sort()) {
-      if (deps.isExcluded(provider) !== true) continue;
-      rows.push({ provider, text: deps.excludedText });
-    }
-    return rows;
-  }
-  function collect(startedAt, excluded) {
-    const totals = emptyTotals2();
-    const perProvider = /* @__PURE__ */ new Map();
-    for (const entry of deps.entries()) {
-      if (entry.kind !== deps.kind || entry.at < startedAt) continue;
-      const tally = perProvider.get(entry.provider) ?? {
-        claimed: 0,
-        totalCredit: 0,
-        totalByUnit: { token: 0, credit: 0 },
-        alreadyClaimed: 0,
-        inactive: 0,
-        failed: 0,
-        coversToday: 0
-      };
-      const add = tallyOf(entry);
-      tally.claimed += add.claimed;
-      tally.totalCredit += add.totalCredit;
-      tally.totalByUnit[add.unit] += add.totalCredit;
-      tally.alreadyClaimed += add.alreadyClaimed;
-      tally.inactive += add.inactive;
-      tally.failed += add.failed;
-      tally.coversToday += add.coversToday;
-      perProvider.set(entry.provider, tally);
-    }
-    const channels = [];
-    for (const [provider, tally] of perProvider) {
-      totals.providers += 1;
-      totals.claimed += tally.claimed;
-      totals.totalCredit += tally.totalCredit;
-      totals.totalByUnit.token += tally.totalByUnit.token;
-      totals.totalByUnit.credit += tally.totalByUnit.credit;
-      totals.alreadyClaimed += tally.alreadyClaimed;
-      totals.inactive += tally.inactive;
-      totals.failed += tally.failed;
-      totals.coversToday += tally.coversToday;
-      channels.push({ provider, text: deps.describeChannel(tally) });
-    }
-    for (const row of excluded) {
-      totals.skipped += 1;
-      channels.push(row);
-    }
-    return { totals, channels };
-  }
-  async function performRun() {
-    lastAttemptAt = now();
-    let reply2;
-    try {
-      reply2 = await deps.trigger();
-    } catch (error) {
-      deps.warn?.(`[channel-pack] ${deps.runLabel}\uFF1A\u542F\u52A8\u6267\u884C\u4EFB\u52A1\u5931\u8D25\uFF0C\u672C\u6B21\u8DF3\u8FC7: ${String(error)}`);
-      return;
-    }
-    if (!reply2.started) {
-      if (reply2.reason === "nothing") {
-        doc = {
-          ...doc,
-          lastDate: today(),
-          lastResult: deps.emptyResultText,
-          lastAt: now(),
-          channels: [],
-          dismissedRunAt: 0
-        };
-        try {
-          await deps.store.save(doc);
-        } catch (error) {
-          deps.warn?.(`[channel-pack] ${deps.runLabel}\u7ED3\u679C\u5199\u5165\u5931\u8D25\uFF08\u4ECA\u5929\u53EF\u80FD\u91CD\u590D\u89E6\u53D1\u4E00\u6B21\uFF09: ${String(error)}`);
-        }
-        return;
-      }
-      deps.warn?.(`[channel-pack] ${deps.runLabel}\uFF1A\u5DF2\u6709\u4EFB\u52A1\u8FDB\u884C\u4E2D\uFF0C\u672C\u8F6E\u4E0D\u8BB0\u65E5\u671F`);
-      return;
-    }
-    await deps.whenIdle();
-    const { totals, channels } = collect(reply2.startedAt, await excludedRows());
-    if (!shouldMarkToday(totals)) {
-      deps.warn?.(
-        `[channel-pack] ${deps.runLabel}\u672A\u8BB0\u5165\u4ECA\u65E5\uFF08\u4E0B\u6B21\u542F\u52A8\u4F1A\u91CD\u8BD5\uFF09\uFF1A${deps.describeTotals(totals)}`
-      );
-      return;
-    }
-    doc = {
-      ...doc,
-      lastDate: today(),
-      lastResult: deps.describeTotals(totals),
-      lastAt: now(),
-      channels,
-      // ⚠️ 新一轮跑完要**清掉上一次的「已关闭」标记**：否则用户关过一次后，
-      // 明天的新结果会被旧标记静默藏住（`dismissed` 的判据是 lastAt 相等）。
-      dismissedRunAt: 0
-    };
-    try {
-      await deps.store.save(doc);
-    } catch (error) {
-      deps.warn?.(`[channel-pack] ${deps.runLabel}\u7ED3\u679C\u5199\u5165\u5931\u8D25\uFF08\u4ECA\u5929\u53EF\u80FD\u91CD\u590D\u89E6\u53D1\u4E00\u6B21\uFF09: ${String(error)}`);
-    }
-    deps.warn?.(`[channel-pack] ${deps.runLabel}\u5B8C\u6210\uFF08${today()}\uFF09\uFF1A${doc.lastResult}`);
-  }
-  function runIfDue() {
-    if (inflight !== null) return inflight;
-    if (!doc.enabled) return Promise.resolve();
-    if (doc.lastDate !== "" && doc.lastDate === today()) return Promise.resolve();
-    running2 = true;
-    const task = performRun().catch((error) => {
-      deps.warn?.(`[channel-pack] ${deps.runLabel}\u5F02\u5E38: ${String(error)}`);
-    }).finally(() => {
-      running2 = false;
-      inflight = null;
-    });
-    inflight = task;
-    return task;
-  }
-  return {
-    state,
-    async setEnabled(enabled) {
-      doc = { ...doc, enabled };
-      await deps.store.save(doc);
-      if (enabled) void runIfDue();
-      return state();
-    },
-    start() {
-      if (pending !== null || tick !== null) return;
-      const ms = deps.delayMs ?? autoCheckinDelayMs();
-      const fire = () => {
-        pending = null;
-        void runIfDue();
-      };
-      if (ms <= 0) {
-        fire();
-      } else {
-        pending = (deps.schedule ?? defaultSchedule)(fire, ms);
-      }
-      const tickMs = deps.tickMs ?? AUTO_CHECKIN_TICK_MS;
-      if (tickMs > 0) {
-        tick = (deps.scheduleTick ?? defaultScheduleTick)(() => {
-          if (doc.lastDate !== "" && doc.lastDate === today()) return;
-          const attemptedToday = lastAttemptAt > 0 && utc8DateString(lastAttemptAt) === today();
-          if (attemptedToday && now() - lastAttemptAt < AUTO_CHECKIN_RETRY_MS) return;
-          void runIfDue();
-        }, tickMs);
-      }
-    },
-    runIfDue,
-    async dismiss() {
-      doc = { ...doc, dismissedRunAt: doc.lastAt };
-      try {
-        await deps.store.save(doc);
-      } catch (error) {
-        deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\u72B6\u6001\u6587\u5B57\u5173\u95ED\u6807\u8BB0\u5199\u5165\u5931\u8D25: ${String(error)}`);
-      }
-      return state();
-    },
-    stop() {
-      pending?.cancel();
-      pending = null;
-      tick?.cancel();
-      tick = null;
-    }
-  };
-}
-function defaultSchedule(fn, ms) {
-  const timer = setTimeout(fn, ms);
-  timer.unref?.();
-  return { cancel: () => clearTimeout(timer) };
-}
-function defaultScheduleTick(fn, ms) {
-  const timer = setInterval(fn, ms);
-  timer.unref?.();
-  return { cancel: () => clearInterval(timer) };
 }
 
 // vendor/channel-pack/src/auto-wake.ts
@@ -58470,6 +58586,7 @@ var OPS_CHECKIN_PROVIDERS = /* @__PURE__ */ new Set([
   QODER_CN.id,
   TRAE.id,
   LOOMY.id,
+  RACCOON.id,
   MINIMAX.id,
   ZCODE.id,
   WORKBUDDY_ID
@@ -59878,6 +59995,19 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
             }
           };
         }
+        if (req.provider === RACCOON.id) {
+          const raccoonStatusAccounts = await pool.listAccounts(req.provider);
+          const value = await collectCreditsStatus(
+            raccoonStatusAccounts,
+            RACCOON,
+            {
+              resolve: (ref) => ctx.credentials.resolve(ref),
+              fetchStatus: (credential, product) => fetchRaccoonDailyCheckinStatus(product, credential),
+              warn: (msg) => ctx.logger?.warn?.(msg)
+            }
+          );
+          return { ok: true, value: { accounts: value } };
+        }
         if (req.provider === MINIMAX.id) {
           const minimaxStatusAccounts = await pool.listAccounts(req.provider);
           const value = await collectCreditsStatus(
@@ -60003,13 +60133,13 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
           };
         }
         if (req.provider === RACCOON.id) {
-          return {
-            ok: false,
-            error: {
-              code: "bad-request",
-              message: "Raccoon Work \u4E0D\u652F\u6301\u6BCF\u65E5\u7B7E\u5230\uFF08\u6BCF\u65E5\u79EF\u5206\u7531\u670D\u52A1\u7AEF\u81EA\u52A8\u53D1\u653E\uFF1B\u767B\u5F55\u5956\u52B1\u8BF7\u5728\u300C\u65B0\u624B\u4EFB\u52A1\u300D\u4E2D\u9886\u53D6\uFF09"
-            }
-          };
+          const value = await collectClaimResults(accounts, RACCOON, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential, product) => fetchRaccoonDailyCheckinStatus(product, credential),
+            claim: (credential, product) => claimRaccoonDailyPoints(product, credential),
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return record(value);
         }
         if (req.provider === MINIMAX.id) {
           const value = await collectClaimResults(accounts, void 0, {

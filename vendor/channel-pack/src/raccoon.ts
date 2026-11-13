@@ -15,8 +15,10 @@
  *    故改为「客户端本地生成 code + 自行轮询」—— 实测任意自造 code 都被接受。
  * 2. **手机号必须 AES-128-CFB 加密**（密钥见 `RACCOON_PHONE_CIPHER_SECRET`），
  *    否则 `send_sms` 回 `100003 params_encryted_error`。
- * 3. **每日 300 积分没有端点**：服务端按日自动发放（`daily_grant`）。
- *    不要把它实现成签到按钮 —— 见 `raccoon-credits.ts`。
+ * 3. **每日 300 积分的领取动作就是桌面端的 `login/points/grant`**（2026-11-14 实测，
+ *    推翻了早期「服务端按日自动发放、无端点」的结论）：官方桌面端**每次启动**
+ *    都会 POST 该端点，服务端对「当天首次」回 `granted:true` 并发放 300 积分
+ *    （账单 `biz_type=daily_grant`，见 `claimRaccoonDailyPoints`）。
  */
 
 import { createCipheriv, randomBytes } from 'node:crypto'
@@ -30,8 +32,43 @@ export const RACCOON_AUTH_PREFIX = '/api/web/auth/v1'
 export const RACCOON_LLM_PREFIX = '/api/web/llm/v2'
 /** 积分端点前缀。 */
 export const RACCOON_POINTS_PREFIX = '/api/web/points/v1'
+/**
+ * 积分账单（v2）前缀。
+ *
+ * 只给「今天是否已领每日积分」的状态查询用：`?type=income` 只返回发放类条目，
+ * 比 v1 的 `paging.offset` 那种混排（含消费流水）更容易命中当天的
+ * `daily_grant`。余额仍走 v1（`RACCOON_POINTS_PREFIX/balance`）。
+ */
+export const RACCOON_POINTS_V2_PREFIX = '/api/web/points/v2'
 /** 桌面端端点前缀（含一次性登录奖励）。 */
 export const RACCOON_DESKTOP_PREFIX = '/api/web/desktop/v1'
+
+/**
+ * 官方桌面端的客户端标识（`X-Client-Name` / `X-Client-Page`）。
+ *
+ * 依据 Electron 主进程与渲染层的 `createHeaders()`：桌面端的**每一条**业务请求
+ * 都带这两个头，服务端据此把请求归到「桌面端」客户端。`login/points/grant`
+ * （每日积分）在网页版是拿不到的，故领取请求必须带上它们。
+ */
+export const RACCOON_DESKTOP_CLIENT_NAME = 'raccoon-work'
+export const RACCOON_DESKTOP_CLIENT_PAGE = 'local-agent'
+
+/**
+ * 桌面端 User-Agent（版本号取产品配置里的 `clientVersion`）。
+ *
+ * ⚠️ **返回的是 latin1 字节串，不是普通 JS 字符串**：UA 里的 `商汤小浣熊`
+ * 是中文，而 Node 的 fetch（undici）要求 header 值是可映射到单字节的
+ * ByteString —— 直接传含中文的字符串会抛
+ * `Cannot convert argument to a ByteString`。把 UTF-8 字节按 latin1 装进字符串
+ * 后，undici 逐字节写出，服务端收到的仍是合法的 UTF-8 UA。
+ *
+ * @param version - 形如 `v1.2.1`（与 `product.clientVersion` 同源）
+ */
+export function raccoonDesktopUserAgent(version: string): string {
+  const text = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+    + `商汤小浣熊/${version} Chrome/146.0.7680.72 Electron/41.0.1 Safari/537.36`
+  return Buffer.from(text, 'utf8').toString('latin1')
+}
 
 /**
  * 手机号传输层加密密钥。
@@ -257,10 +294,14 @@ export function raccoonDisplayName(model: RaccoonModelMeta): string {
  * 依据客户端 `createHeaders()`。`X-Client-Platform` 对
  * `desktop/v1/login/points/grant` **必需**（取值必须是
  * `desktop-windows` / `desktop-macos` / `desktop-linux`）。
+ *
+ * `desktopClient: true` 再补上官方桌面端的 `X-Client-Name` / `X-Client-Page` /
+ * `User-Agent`（见 `claimRaccoonDailyPoints`）—— 每日积分的领取请求要「像」桌面端，
+ * 其余只读请求（目录 / 余额 / 账单）沿旧行为不加这些头。
  */
 export function raccoonHeaders(
   credential: RaccoonCredential,
-  opts: { platform?: string; version?: string } = {},
+  opts: { platform?: string; version?: string; desktopClient?: boolean; userAgent?: string } = {},
 ): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -275,6 +316,13 @@ export function raccoonHeaders(
   }
   if (opts.version !== undefined && opts.version.length > 0) {
     headers['X-Client-Version'] = opts.version
+  }
+  if (opts.desktopClient === true) {
+    headers['X-Client-Name'] = RACCOON_DESKTOP_CLIENT_NAME
+    headers['X-Client-Page'] = RACCOON_DESKTOP_CLIENT_PAGE
+  }
+  if (opts.userAgent !== undefined && opts.userAgent.length > 0) {
+    headers['User-Agent'] = opts.userAgent
   }
   if (credential.device_id !== undefined && credential.device_id.length > 0) {
     headers['X-Client-Device-ID'] = credential.device_id

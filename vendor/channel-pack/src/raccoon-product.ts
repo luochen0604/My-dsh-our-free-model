@@ -168,7 +168,7 @@ export interface RaccoonProduct {
    * **要求**该头，猜错会被拒。
    */
   clientPlatform: string
-  /** 客户端版本（带 `v` 前缀，如 `v1.0.35`）。 */
+  /** 客户端版本（带 `v` 前缀，如 `v1.2.1`）。 */
   clientVersion: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
@@ -339,7 +339,15 @@ export const RACCOON: RaccoonProduct = {
   desktopApiPrefix: '/api/web/desktop/v1',
   userAgent: 'Raccoon Work/1.0.35 (Windows)',
   clientPlatform: 'desktop-windows',
-  clientVersion: 'v1.0.35',
+  /**
+   * 客户端版本（带 `v` 前缀）。
+   *
+   * ⚠️ 2026-11-14 从 `v1.0.35` 升到 `v1.2.1`（本机安装的官方桌面端版本，
+   * 见 `D:\Program Files\Raccon\@raccoonoffice-desktop` 与卸载项 DisplayVersion）。
+   * 只有每日积分领取（`claimRaccoonDailyPoints`）会把它发出去；报真实安装版本
+   * 才不会让服务端把请求当成过期客户端。
+   */
+  clientVersion: 'v1.2.1',
   defaultCredentialRef: 'RACCOON_ACCESS_TOKEN',
   // 实测该网关按**请求体字节**卡（`HTTP_413: request body exceeds 10MB`），
   // 所以字节目标是主约束；像素预算保证图不至于大到压不进那个字节目标。

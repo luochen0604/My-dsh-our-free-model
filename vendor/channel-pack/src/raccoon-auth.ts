@@ -22,7 +22,7 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import type { AccountPool } from './account-pool.js'
-import type { ClaimOutcome, CreditBalance } from './credits.js'
+import type { CheckinStatus, ClaimOutcome, CreditBalance } from './credits.js'
 import {
   isRaccoonExpired,
   isRaccoonRefreshable,
@@ -33,8 +33,10 @@ import {
   type RaccoonModelMeta,
 } from './raccoon.js'
 import {
+  claimRaccoonDailyPoints,
   claimRaccoonLoginReward,
   fetchRaccoonCreditBalance,
+  fetchRaccoonDailyCheckinStatus,
   fetchRaccoonOnboardingStatus,
 } from './raccoon-credits.js'
 import {
@@ -523,6 +525,21 @@ export class RaccoonAuth extends Service {
   /** 领取一次性登录奖励。 */
   async claimLoginReward(credential: RaccoonCredential): Promise<ClaimOutcome> {
     return claimRaccoonLoginReward(this.product, credential, this.fetchImpl)
+  }
+
+  /**
+   * 领取「每日积分」（`dailyCheckin` 能力）。
+   *
+   * 与官方桌面端启动时打的**同一个**端点（`login/points/grant`），见
+   * `claimRaccoonDailyPoints` 的说明与 `raccoon.ts` 模块头第 3 条。
+   */
+  async claimDailyPoints(credential: RaccoonCredential): Promise<ClaimOutcome> {
+    return claimRaccoonDailyPoints(this.product, credential, this.fetchImpl)
+  }
+
+  /** 查询今天是否已领到每日积分（账单里的当天 `daily_grant`）。 */
+  async fetchDailyCheckinStatus(credential: RaccoonCredential): Promise<CheckinStatus | null> {
+    return fetchRaccoonDailyCheckinStatus(this.product, credential, this.fetchImpl)
   }
 
   /** 查询一次性登录奖励是否已领。 */

@@ -62,7 +62,8 @@ export async function verifyChannelCreditsUi() {
     subscribe()
     return { calls, errors, cells, button, text, cleanup, events }
   }
-  const claimable = new Set(['lobsterai', 'qoder', 'qodercn', 'trae', 'loomy', 'minimax', 'zcode'])
+  // raccoon 自 2026-11-14 起有每日积分领取（桌面端 login/points/grant），故在可领集合里。
+  const claimable = new Set(['lobsterai', 'qoder', 'qodercn', 'trae', 'loomy', 'raccoon', 'minimax', 'zcode'])
   for (const provider of [...claimable, 'cline', 'raccoon', 'gemini']) {
     const app = mount(provider, async () => ({ accounts: [] }))
     await settle()
