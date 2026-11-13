@@ -46,3 +46,6 @@ _audit/
 
 # OFM 进程新鲜度检测的本机状态（含指纹记录），机器相关不进库
 .ofm-freshness-state.json
+
+# MemSearch 在本机工作区生成的记忆目录，机器相关不进库
+.memsearch/
