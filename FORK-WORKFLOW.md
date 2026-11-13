@@ -7,16 +7,16 @@
 - 基准提交：`v2.8.3`（与切换前安装的版本逐字节一致，已核对）
 - 功能分支：`my/feature`（从这里开新分支，别在 `main` 上改）
 
-## 0. 一次性：建自己的 fork 并接上 origin
+## 0. 远端（已配好）
 
-在 GitHub 网页把上游 Fork 到自己的账号，然后：
+- `origin` → `git@github.com:luochen0604/My-dsh-our-free-model.git`
+  （fork 时改过名，仓库名是 `My-dsh-our-free-model`；分支 `my/feature` 已推送并设好追踪）
+- `upstream` → `https://github.com/Ebony-Vinyl/dsh-our-free-model.git`（只读；push URL 已设为
+  `DISABLED`，防止误推上游）
 
-```powershell
-git remote add origin https://github.com/<你的账号>/dsh-our-free-model.git
-git push -u origin my/feature
-```
-
-之后 `upstream` 只读（上游），`origin` 只写（你的 fork）。
+本机 `~/.ssh/id_rsa` 已注册到 GitHub 账号，`ssh -T git@github.com` 应回
+`Hi luochen0604! You've successfully authenticated`。这个仓库局部固定了
+`http.proxy=127.0.0.1:7897`（全局那个 `4780` 已失效），代理变了要同步改。
 
 ## 1. 日常改功能
 
