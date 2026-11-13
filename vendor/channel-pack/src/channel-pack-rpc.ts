@@ -2595,9 +2595,15 @@ if (provider === LOBSTERAI.id) {
         const req = payload as RpcCreditsBalancesRequest
         const accounts = await pool.listAccounts(req.provider)
         if (req.provider === LOBSTERAI.id) {
+          // 身份 query / UA 都要与桌面端同形：身份取**安装级文档**（不是凭据里的
+          // 旧快照），版本号取动态真值（带缓存）。桌面端连 `profile-summary` 这类
+          // GET 都走 `appendKeyfromQuery`（`main.js:187110`）。
+          const identity = await lobsterai.resolveIdentity()
+          const clientVersion = await lobsterai.resolveClientVersion()
           const values = await collectCreditBalances<LobsteraiCredential, typeof LOBSTERAI>(accounts, LOBSTERAI, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
+            fetchBalance: (credential, product) =>
+              fetchLobsteraiCreditBalance(credential, product, fetch, { identity, clientVersion }),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           // ⚠️ LobsterAI 也回传窗口天数（用户报障「账号的积分没按长期、临时方式

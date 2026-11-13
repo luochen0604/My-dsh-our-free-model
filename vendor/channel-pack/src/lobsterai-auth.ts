@@ -23,10 +23,15 @@ import {
   lobsteraiModelsHeaders,
   lobsteraiRefreshBody,
   parseLobsteraiEnvelope,
+  parseLobsteraiInstallationUuid,
   parseLobsteraiTokenPayload,
+  sanitizeLobsteraiKeyfrom,
+  withLobsteraiIdentity,
   type LobsteraiCredential,
+  type LobsteraiIdentityFields,
 } from './lobsterai.js'
 import { LOBSTERAI_REFRESH_PATH } from './lobsterai.js'
+import { createLobsteraiIdentityStore, type LobsteraiIdentity, type LobsteraiIdentityStore } from './lobsterai-identity.js'
 import { buildLobsteraiModelsUrl, parseLobsteraiModels, type LobsteraiRemoteModel } from './lobsterai-adapter.js'
 import { LOBSTERAI, type LobsteraiProduct } from './lobsterai-product.js'
 import { classifyLobsteraiError, isLobsteraiTerminalError } from './lobsterai-errors.js'
@@ -128,6 +133,8 @@ export interface LobsteraiAuthOptions {
   serviceName?: string
   /** 客户端版本号解析器；默认为内部新建的实例。 */
   versionResolver?: LobsteraiClientVersionResolver
+  /** 安装身份后端（测试用）；默认为 `$DSH_HOME/channel-pack/lobsterai-installation.json`。 */
+  identityStore?: LobsteraiIdentityStore
 }
 
 /**
@@ -160,6 +167,12 @@ export class LobsteraiAuth extends Service {
   private active = true
   /** 客户端版本号解析器（带缓存与兜底）。 */
   private readonly versionResolver: LobsteraiClientVersionResolver
+  /** 安装身份后端（uuid + keyfrom 的权威来源）。 */
+  private readonly identityStore: LobsteraiIdentityStore
+  /** 进程内缓存的安装身份（一次运行内恒定，避免每次请求都读盘）。 */
+  private identityState: LobsteraiIdentity | undefined
+  /** 已经就「版本号回退」告警过一次（避免每次调用刷屏）。 */
+  private fallbackVersionWarned = false
 
   constructor(ctx: Context, private readonly options: LobsteraiAuthOptions = {}) {
     const product = options.product ?? LOBSTERAI
@@ -169,6 +182,7 @@ export class LobsteraiAuth extends Service {
     this.versionResolver = options.versionResolver ?? new LobsteraiClientVersionResolver({
       ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
     })
+    this.identityStore = options.identityStore ?? createLobsteraiIdentityStore(ctx)
   }
 
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
@@ -177,13 +191,38 @@ export class LobsteraiAuth extends Service {
   }
 
   /**
+   * 解析本机的**安装身份**（安装 UUID + keyfrom 渠道归属）。
+   *
+   * 这是登录 / 续期 / 模型列表 / 余额查询的**唯一**身份来源：桌面端每次请求
+   * 都现读落盘的 `installation_uuid` 与 `keyfrom.attribution.v1`，而不是从
+   * token 里反推。缓存到进程内后不再读盘（同一运行内不会变）。
+   */
+  async resolveIdentity(): Promise<LobsteraiIdentity> {
+    if (this.identityState === undefined) this.identityState = this.identityStore.resolve()
+    return this.identityState
+  }
+
+  /**
    * 解析客户端版本号（带缓存与兜底）。
    *
    * 三个消费点都需要它：登录 exchange 的 `version` 字段、续期请求体的
    * `version`、以及签到接口的必填 query 参数。集中在此避免三处各自拉取。
+   *
+   * 同时把安装身份拼进更新接口的 query（对齐桌面端 `appendKeyfromQuery`：
+   * 连配置类 GET 也带 `uuid`/`version`/`firstKeyfrom`/`latestKeyfrom`）。
+   * 回退到兜底版本时**必须留日志** —— 「发了个过期的版本号」正是需要能自查的
+   * 特征（见 `LOBSTERAI_FALLBACK_CLIENT_VERSION`）。
    */
   async resolveClientVersion(): Promise<string> {
-    return (await this.versionResolver.resolve(this.product)).version
+    const resolved = await this.versionResolver.resolve(this.product, await this.resolveIdentity())
+    if (resolved.source === 'fallback' && !this.fallbackVersionWarned) {
+      this.fallbackVersionWarned = true
+      this.ctx.logger?.warn?.(
+        `[lobsterai] 无法从远端取到客户端版本号，回退 ${resolved.version}`
+        + '（与官方安装包版本不一致会增加「非官方客户端」特征）',
+      )
+    }
+    return resolved.version
   }
 
   /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false 与重新登录提示。 */
@@ -209,6 +248,9 @@ export class LobsteraiAuth extends Service {
       clientVersion,
       ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
       ...flowOptions,
+      // 安装身份**必须**来自落盘文档：这是「重登不换设备」的唯一保证，
+      // 故放在 flowOptions 之后，调用方无法用一次性身份覆盖它。
+      identity: await this.resolveIdentity(),
     })
     return this.persistLogin(flow, flowOptions)
   }
@@ -228,6 +270,8 @@ export class LobsteraiAuth extends Service {
       clientVersion,
       ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
       ...flowOptions,
+      // 同 `login`：安装身份来自落盘文档，不允许调用方覆盖。
+      identity: await this.resolveIdentity(),
     })
     const result = started.result.then((flow) => this.persistLogin(flow, flowOptions))
     // 与 startLobsteraiLoginFlow 同理：结果可能早于调用方 await 而落定，
@@ -281,17 +325,30 @@ export class LobsteraiAuth extends Service {
    *
    * 与 {@link login} 的区别：不走本地服务器，直接拿 code 换凭据。
    * 保留这个入口是为了让 e2e 探针能在不打开浏览器的情况下验证 exchange。
+   *
+   * `session` 可省略（省略即用安装身份）；即便显式传入，`uuid` / keyfrom
+   * 也会先过 sanitizer 再合并进安装身份 —— 传进来的毫秒 keyfrom 不会上线。
    */
   async loginWithCode(
     code: string,
-    session: { uuid: string; firstKeyfrom: string },
+    session?: Partial<LobsteraiIdentityFields>,
     options: { refName?: string; accountId?: string; pool?: AccountPool } = {},
   ): Promise<LobsteraiLoginResult> {
     this.active = true
     const ref = options.refName ? credentialRef(options.refName) : credentialRef(this.credentialRefName)
     const clientVersion = await this.resolveClientVersion()
+    const identity = await this.resolveIdentity()
+    const fields: LobsteraiIdentityFields = {
+      uuid: parseLobsteraiInstallationUuid(session?.uuid) ?? identity.uuid,
+      firstKeyfrom: session?.firstKeyfrom === undefined
+        ? identity.firstKeyfrom
+        : sanitizeLobsteraiKeyfrom(session.firstKeyfrom),
+      latestKeyfrom: session?.latestKeyfrom === undefined
+        ? identity.latestKeyfrom
+        : sanitizeLobsteraiKeyfrom(session.latestKeyfrom),
+    }
     const credential = await exchangeLobsteraiAuthCode(
-      code, session, clientVersion, this.product, this.fetchImpl,
+      code, fields, clientVersion, this.product, this.fetchImpl,
     )
     const access = JSON.stringify(credential)
     await this.ctx.credentials.set(ref, access)
@@ -483,7 +540,11 @@ export class LobsteraiAuth extends Service {
    */
   private async refreshCredential(credential: LobsteraiCredential): Promise<LobsteraiCredential> {
     const clientVersion = await this.resolveClientVersion()
-    const body = lobsteraiRefreshBody(credential, clientVersion)
+    // 身份字段取**安装身份**而不是凭据里的旧快照：升级前登录的老凭据会从
+    // 下一次续期起自愈（不再发毫秒 keyfrom / 每次登录新造的 uuid）。
+    // 这也是桌面端的行为 —— 它每次都现读 installation_uuid 与 keyfrom。
+    const hydrated = withLobsteraiIdentity(credential, await this.resolveIdentity())
+    const body = lobsteraiRefreshBody(hydrated, clientVersion)
     let response: Response
     try {
       response = await this.fetchImpl(`${this.product.apiBase}${LOBSTERAI_REFRESH_PATH}`, {
@@ -523,7 +584,7 @@ export class LobsteraiAuth extends Service {
       // 视为无法续期（需重新登录），而不是当成可重试的瞬时故障。
       throw new RefreshTokenExpiredError('续期响应缺少 accessToken，请重新登录')
     }
-    return applyLobsteraiRefresh(credential, payload)
+    return applyLobsteraiRefresh(hydrated, payload)
   }
 
   /**
@@ -652,7 +713,13 @@ export class LobsteraiAuth extends Service {
     if (credential === undefined || credential.access_token.length === 0) return []
 
     const clientVersion = await this.resolveClientVersion()
-    const url = buildLobsteraiModelsUrl(this.product, credential, clientVersion)
+    // query 是**身份载荷**（桌面端 `appendKeyfromQuery`）：必须用安装身份覆盖
+    // 凭据里的旧快照，否则老账号会继续把毫秒 keyfrom / 旧 uuid 发给服务端。
+    const url = buildLobsteraiModelsUrl(
+      this.product,
+      withLobsteraiIdentity(credential, await this.resolveIdentity()),
+      clientVersion,
+    )
     try {
       const response = await this.fetchImpl(url, {
         method: 'GET',

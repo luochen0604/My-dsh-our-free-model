@@ -13,6 +13,21 @@
  *
  * **统一信封** `{code, msg, data}`：`code !== 0` 即失败。
  * 唯一例外是 chat 端点 —— 它返回**裸 SSE，不套信封**。
+ *
+ * ## 身份字段的真实语义（桌面端实证，2026-11-13）
+ *
+ * `firstKeyfrom` / `latestKeyfrom` / `uuid` / `version` 这组「身份载荷」的语义
+ * 曾被 Go 参考实现（`lobsterai2api/auth.go:37-50`）误导，现已按桌面端
+ * `dist-electron/main.js:87017-87141`（keyfrom 子系统）、`150789-150798`
+ * （安装 UUID）钉正：
+ *
+ * - `firstKeyfrom` / `latestKeyfrom` 是**分发渠道标签**（本机安装包为
+ *   `"official"`），不是时间戳；时间戳只落在本地的 `updatedAt`；
+ * - `uuid` 是**安装级** ID：首次 `randomUUID()` 后落盘，登录 / 续期 / 登出 /
+ *   所有 GET 复用同一个值（见 `lobsterai-identity.ts`）。
+ *
+ * 把时间戳当 keyfrom、每次登录新造 uuid，是服务端把请求判成「第三方反代」
+ * 权重最高的两条特征（exchange 先发证后打标，所以一次对话都没有也会被标记）。
  */
 
 import { createHash } from 'node:crypto'
@@ -89,14 +104,25 @@ export interface LobsteraiCredential {
   /**
    * 安装 UUID（exchange/refresh 必带）。
    *
-   * 登录时由客户端生成（对齐 `main.go:166` `newUuid()`），
-   * 之后每次续期原样回传。**不能每次刷新都重新生成** ——
-   * 它是服务端识别「同一安装」的依据。
+   * **安装级**，不是登录级：首次由客户端生成后落盘（对齐桌面端
+   * `getOrCreateInstallationId()`，`main.js:150789-150798` 写入散列表
+   * `installation_uuid`），登录 / 续期 / 登出 / 所有 GET 全部复用同一个值。
+   * 每次登录重新 `randomUUID()` 会被服务端看成「同一账号下反复出现全新安装」，
+   * 是「第三方反代」画像的关键一条。
+   *
+   * 权威来源是 {@link LobsteraiIdentityFields}（由 `lobsterai-identity.ts`
+   * 落盘）；凭据里的这个字段只是**快照**，请求前由 `withLobsteraiIdentity`
+   * 用安装身份覆盖 —— 老凭据因此能自愈。
    */
   uuid?: string
-  /** 首次登录时间戳（毫秒字符串，exchange/refresh 必带）。 */
+  /**
+   * 渠道归属的**首次值**（exchange/refresh 必带）。
+   *
+   * 不是时间戳：桌面端 `DefaultKeyfrom.Official = "official"`，
+   * 且首次写入后粘住不变（`initializeKeyfromAttribution`，`main.js:87017-87141`）。
+   */
   first_keyfrom?: string
-  /** 最近活动时间戳（毫秒字符串，**每次刷新后更新**）。 */
+  /** 当前渠道归属（exchange/refresh 必带）。同样是渠道标签，不是时间戳。 */
   latest_keyfrom?: string
 }
 
@@ -271,56 +297,171 @@ export function isLobsteraiRefreshable(credential: LobsteraiCredential): boolean
   return typeof credential.refresh_token === 'string' && credential.refresh_token.length > 0
 }
 
-// ── 身份载荷（exchange / refresh / models 共用） ──
+// ── 身份载荷（exchange / refresh / models / GET 共用） ──
 
 /**
- * 构造 `keyfrom` 身份载荷。
+ * 渠道归属的默认值，也是本插件（官方安装包之外的另一种分发形态）唯一会发的值。
  *
- * 对应 Go 的 `Auth.KeyfromBody()`（`auth.go:37-50`）。三个字段的含义：
+ * 桌面端 `installer` 把渠道写进 `resources/keyfrom/keyfrom.json`（本机为
+ * `{"keyfrom":"official"}`），运行态落 `keyfrom.attribution.v1`，线上请求
+ * 实测发的就是字面量 `official`（`main-2026-11-13.log:12-14/277`）。
+ */
+export const LOBSTERAI_DEFAULT_KEYFROM = 'official'
+
+/** keyfrom 的合法形态（对齐桌面端 `KEYFROM_PATTERN = /^[a-z0-9_-]{1,64}$/`）。 */
+export const LOBSTERAI_KEYFROM_PATTERN = /^[a-z0-9_-]{1,64}$/
+
+/**
+ * 安装级身份字段（**一次安装一套，跨登录/续期恒定**）。
  *
- * - `firstKeyfrom` —— 首次登录时间戳，标识「这个账号是什么时候开始用的」；
- * - `latestKeyfrom` —— 最近活动时间戳，随每次调用更新；
- * - `version` —— 客户端版本号（**动态真值**，见 §7.2 R11 的说明）；
- * - `uuid` / `userId` —— 可选，缺失时不带该键（而非带空串）。
+ * 与桌面端的两个落盘键一一对应：
  *
- * `uuid` / `userId` 缺省时**删除键**而不是写空串：Go 的 `if a.Uuid != ""`
- * 就是「有才带」，空串可能被服务端当成非法值。
+ * - `uuid` ← `installation_uuid`（`main.js:150789-150798`）；
+ * - `firstKeyfrom` / `latestKeyfrom` ← `keyfrom.attribution.v1`
+ *   （`initializeKeyfromAttribution`，`main.js:87017-87141`；时间戳在
+ *   `updatedAt`，**不**在这两个字段里）。
+ */
+export interface LobsteraiIdentityFields {
+  /** 安装 UUID。 */
+  uuid: string
+  /** 首次渠道归属（首次写入后粘住）。 */
+  firstKeyfrom: string
+  /** 当前渠道归属。 */
+  latestKeyfrom: string
+}
+
+/**
+ * 解析 keyfrom：只接受合法渠道标签，其余一律 `undefined`。
+ *
+ * ⚠️ **纯数字视为非法**：桌面端的渠道枚举全是小写字母/下划线（`official`、
+ * `html_share`、`site_deployment`），13 位毫秒串只可能来自本插件旧版本的误读
+ * （见模块头注释）。`KEYFROM_PATTERN` 本身允许纯数字，所以客户端不会因此
+ * 报错 —— 恰恰是这种「能发出去、但服务端不认识」的组合最危险，故在**构造
+ * 请求前**就把它挡掉。
+ */
+export function parseLobsteraiKeyfrom(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const value = raw.trim()
+  if (!LOBSTERAI_KEYFROM_PATTERN.test(value)) return undefined
+  if (/^\d+$/.test(value)) return undefined
+  return value
+}
+
+/** 同 {@link parseLobsteraiKeyfrom}，非法时回落到 {@link LOBSTERAI_DEFAULT_KEYFROM}。 */
+export function sanitizeLobsteraiKeyfrom(raw: unknown): string {
+  return parseLobsteraiKeyfrom(raw) ?? LOBSTERAI_DEFAULT_KEYFROM
+}
+
+/**
+ * 解析安装 UUID：只接受 uuid 形态，其余返回 `undefined`（调用方生成新的）。
+ *
+ * 桌面端 `installation_uuid` 就是 `crypto.randomUUID()` 的产物
+ * （本机实测 `b58139cd-b405-4ec5-92f2-d25bbb7d37c2`），故形态校验足够。
+ * 不做形态校验的后果：状态文档被手工改坏后，把垃圾串当安装身份发上线。
+ */
+export function parseLobsteraiInstallationUuid(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const value = raw.trim()
+  const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  return UUID_PATTERN.test(value) ? value : undefined
+}
+
+/**
+ * 身份载荷的**字段顺序**（与桌面端 `buildKeyfromPayload()` 一致：
+ * `firstKeyfrom, latestKeyfrom, uuid, userId, version`）。
+ *
+ * 用类型别名而不是 `interface`：请求体/query 消费方要把它当
+ * `Record<string, unknown>` 用，interface 没有隐式索引签名。
+ */
+export type LobsteraiKeyfromPayload = {
+  firstKeyfrom: string
+  latestKeyfrom: string
+  uuid?: string
+  userId?: string
+  version: string
+}
+
+/**
+ * 构造身份载荷。
+ *
+ * 三个来源都**先过 sanitizer**：历史凭据里的毫秒 keyfrom、被改坏的 uuid
+ * 因此不会继续上线（服务端只会看到合法的渠道标签 + 安装 UUID）。
+ * `uuid` / `userId` 缺省时**删除键**而不是写空串（对齐桌面端
+ * `buildKeyfromPayload()`：字段为 `undefined` 时被 spread 掉）。
+ */
+export function lobsteraiKeyfromPayload(
+  fields: { firstKeyfrom?: string; latestKeyfrom?: string; uuid?: string; userId?: string },
+  clientVersion: string,
+): LobsteraiKeyfromPayload {
+  const uuid = parseLobsteraiInstallationUuid(fields.uuid)
+  const userId = typeof fields.userId === 'string' && fields.userId.length > 0 ? fields.userId : undefined
+  return {
+    firstKeyfrom: sanitizeLobsteraiKeyfrom(fields.firstKeyfrom),
+    latestKeyfrom: sanitizeLobsteraiKeyfrom(fields.latestKeyfrom),
+    ...uuid === undefined ? {} : { uuid },
+    ...userId === undefined ? {} : { userId },
+    version: clientVersion,
+  }
+}
+
+/**
+ * 构造凭据对应的身份载荷。
+ *
+ * 对应桌面端的 `withKeyfromBody()` / `appendKeyfromQuery()`。纯函数、走
+ * sanitizer，所以即使调用方拿到的是**老凭据**，发出去的 keyfrom 也一定是
+ * 合法渠道标签（uuid 的权威替换由 `withLobsteraiIdentity` 负责）。
  */
 export function lobsteraiKeyfromBody(
   credential: LobsteraiCredential,
   clientVersion: string,
-): Record<string, unknown> {
-  const body: Record<string, unknown> = {
-    firstKeyfrom: credential.first_keyfrom ?? '',
-    // 直接用凭据里**存储的**值，不取当前时刻 —— 严格对齐 Go 的
-    // `KeyfromBody()`（`auth.go:37-50`）：它读的就是 `a.LatestKeyfrom`，
-    // 而 `RefreshToken`（`client.go:137-145`）从不更新该字段。
-    // 因此 Go 每次续期发的都是「登录时的那一刻」，本插件照做。
-    latestKeyfrom: credential.latest_keyfrom ?? '',
-    version: clientVersion,
+): LobsteraiKeyfromPayload {
+  return lobsteraiKeyfromPayload({
+    firstKeyfrom: credential.first_keyfrom,
+    latestKeyfrom: credential.latest_keyfrom,
+    uuid: credential.uuid,
+    userId: credential.user_id,
+  }, clientVersion)
+}
+
+/** 把身份载荷序列化为 query 串（GET 端点用；空值字段不出现）。 */
+export function lobsteraiKeyfromQueryString(payload: LobsteraiKeyfromPayload): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(payload)) {
+    if (typeof value === 'string' && value.length > 0) params.set(key, value)
   }
-  if (credential.uuid !== undefined && credential.uuid.length > 0) body.uuid = credential.uuid
-  if (credential.user_id !== undefined && credential.user_id.length > 0) body.userId = credential.user_id
-  return body
+  return params.toString()
+}
+
+/** 构造凭据对应的身份 query 串（GET 端点用）。 */
+export function lobsteraiKeyfromQuery(
+  credential: LobsteraiCredential,
+  clientVersion: string,
+): string {
+  return lobsteraiKeyfromQueryString(lobsteraiKeyfromBody(credential, clientVersion))
 }
 
 /**
- * 构造续期请求体 = keyfrom 载荷 + `refreshToken`。
+ * 构造续期请求体。
  *
- * `latestKeyfrom` 与 `firstKeyfrom` 都用**凭据里存储的原值**，不取当前时刻
- * （对齐 Go：`KeyfromBody()` 读 `a.LatestKeyfrom`，而 `RefreshToken`
- * 从不更新该字段）。详见 {@link lobsteraiKeyfromBody} 的说明。
+ * 字段顺序对齐桌面端 `POST /api/auth/refresh`（`main.js:184802-184817`）：
+ * `{refreshToken, firstKeyfrom, latestKeyfrom, uuid, userId, version}`。
+ * 与 Go 的 `KeyfromBody()` 内容相同、顺序不同 —— 顺序本身是弱信号，但成本为零。
  *
- * 注意 `version` 由调用方传入而非在函数内取全局缓存：这样本函数是纯函数、
- * 可完整单测，也不把「版本号从哪来」这个决策硬编码进来。
+ * `latestKeyfrom` 用**凭据里的值**（由调用方用安装身份覆盖后再传进来），
+ * 不在这里取当前时刻：它是渠道标签，取时刻正是这次要修掉的 bug。
  */
 export function lobsteraiRefreshBody(
   credential: LobsteraiCredential,
   clientVersion: string,
 ): Record<string, unknown> {
+  const identity = lobsteraiKeyfromBody(credential, clientVersion)
   return {
-    ...lobsteraiKeyfromBody(credential, clientVersion),
     refreshToken: credential.refresh_token,
+    firstKeyfrom: identity.firstKeyfrom,
+    latestKeyfrom: identity.latestKeyfrom,
+    ...identity.uuid === undefined ? {} : { uuid: identity.uuid },
+    ...identity.userId === undefined ? {} : { userId: identity.userId },
+    version: identity.version,
   }
 }
 
@@ -398,12 +539,12 @@ export function resolveLobsteraiUid(payload: LobsteraiTokenPayload): string {
  * 3. 都拿不到则留空（`credentialExpiresAtMs` 会再尝试 JWT，仍失败则
  *    「不判定过期」——见 `isLobsteraiExpired`）。
  *
- * `uuid` / `first_keyfrom` / `latest_keyfrom` 必须由调用方提供 ——
- * 它们不在响应里，而是登录流程自己生成的状态（见 `lobsterai-oauth.ts`）。
+ * `uuid` / `first_keyfrom` / `latest_keyfrom` 必须由调用方提供（安装级身份，
+ * 见 `lobsterai-identity.ts`），**不是**从响应里来。
  */
 export function buildLobsteraiCredential(
   payload: LobsteraiTokenPayload,
-  session: { uuid: string; firstKeyfrom: string; latestKeyfrom: string },
+  identity: LobsteraiIdentityFields,
 ): LobsteraiCredential {
   const expiresAt = payload.expiresIn !== undefined && payload.expiresIn > 0
     ? String(Date.now() + payload.expiresIn * 1000)
@@ -421,25 +562,48 @@ export function buildLobsteraiCredential(
       ? payload.accountUserId
       : (payload.yid ?? ''),
     nickname: payload.nickname ?? '',
-    uuid: session.uuid,
-    first_keyfrom: session.firstKeyfrom,
-    latest_keyfrom: session.latestKeyfrom,
+    uuid: identity.uuid,
+    first_keyfrom: sanitizeLobsteraiKeyfrom(identity.firstKeyfrom),
+    latest_keyfrom: sanitizeLobsteraiKeyfrom(identity.latestKeyfrom),
+  }
+}
+
+/**
+ * 用**安装身份**覆盖凭据里的身份快照。
+ *
+ * 为什么权威值不在凭据里：桌面端每次请求都现读 `installation_uuid` 与
+ * `keyfrom.attribution.v1`，而不是从 token 里反推。本插件同构处理有两个好处：
+ *
+ * 1. **老凭据自愈**：升级前登录的凭据里存的是「毫秒 keyfrom + 每次登录新造的
+ *    uuid」，若继续照发会永远带着坏指纹（续期不会把标记洗掉）。用安装身份覆盖
+ *    后，下一次续期 / GET 起发的就都是合法值；
+ * 2. **单一口径**：登录、续期、模型列表、余额查询都走同一个来源，
+ *    不会出现「某个端点带旧 uuid」的半携带形态。
+ *
+ * 不改变令牌本身（`access_token` / `refresh_token` / 过期时间原样保留）。
+ */
+export function withLobsteraiIdentity(
+  credential: LobsteraiCredential,
+  identity: LobsteraiIdentityFields,
+): LobsteraiCredential {
+  return {
+    ...credential,
+    uuid: identity.uuid,
+    first_keyfrom: sanitizeLobsteraiKeyfrom(identity.firstKeyfrom),
+    latest_keyfrom: sanitizeLobsteraiKeyfrom(identity.latestKeyfrom),
   }
 }
 
 /**
  * 用续期结果更新凭据（保留服务端未返回的字段）。
  *
- * **所有身份字段一律沿用旧值**（`uuid` / `first_keyfrom` / `latest_keyfrom`
+ * **令牌之外的字段一律沿用旧值**（`uuid` / `first_keyfrom` / `latest_keyfrom`
  * / `uid` / `user_id` / `nickname`）：LobsterAI 的 refresh 响应只带令牌，
  * 不含 account 对象。
  *
- * ⚠️ `latest_keyfrom` **刻意不更新为当前时刻**（虽然字段名叫「最近活动」）——
- * 严格对齐 Go：`RefreshToken`（`client.go:137-145`）只改 token 与过期时间，
- * `LatestKeyfrom` 永久停留在登录时那一刻，续期时原样回发。
- * 语义上「刷新即活动、理应更新」是更直觉的读法，但 Go 是唯一在生产验证过的
- * 实现；若服务端对该字段有校验，自作聪明地更新会让续期失败，
- * 而这不是能从代码推导出来的，需要实测支撑（见计划文档 §7.2）。
+ * ⚠️ `latest_keyfrom` 在这里**不取当前时刻**：它是渠道标签（`official`），
+ * 不是「最近活动时间」。真正的权威值来自安装身份，调用方应在续期前先
+ * `withLobsteraiIdentity()`、续期后原样保住它。
  */
 export function applyLobsteraiRefresh(
   previous: LobsteraiCredential,
@@ -465,6 +629,10 @@ export function applyLobsteraiRefresh(
 
 /**
  * 构造带 Bearer 的通用请求头。
+ *
+ * `User-Agent` 用桌面形态串（见 `LOBSTERAI_USER_AGENT`）——桌面端自己不设置
+ * UA、由 Electron 网络栈生成含 `Chrome/…`/`Electron/…` 的真实串；Node 侧
+ * 默认的 `undici` 同样不是官方形态，故必须显式设置同一个形态。
  */
 export function lobsteraiAuthHeaders(
   credential: LobsteraiCredential,
@@ -535,12 +703,21 @@ export function lobsteraiModelsHeaders(
  * 构造无认证请求头（exchange / refresh 用）。
  *
  * 这两个端点**不需要** `Authorization` —— 换 token 时还没有 token，
- * 续期时服务端只认请求体里的 `refreshToken`（`auth.go:104-108` 的
- * `authHeaders` 同样不设该头）。
+ * 续期时服务端只认请求体里的 `refreshToken`。
+ *
+ * ## 只发 `Content-Type` + 桌面形态 UA（与桌面端逐字段对齐）
+ *
+ * 桌面端 `POST /api/auth/exchange` 的头**只有** `Content-Type: application/json`
+ * （`main.js:186853-186867`），refresh 同（`34127-34132`，个人账号的企业头
+ * `buildEnterpriseAccountRequestHeaders` 直接 `return {}`）。这里刻意不再发
+ * `Accept`：不是因为它会惹麻烦，而是「与官方请求完全同形」本身就是要修的东西。
+ *
+ * UA 必须显式设置：桌面端的 UA 由 Electron 网络栈生成，Node 侧若不发就是
+ * `undici`，两者都不是官方形态；发 `LobsterAI/0.1.0` 更是第三方项目的标识
+ * （桌面端 `main.js` 命中 0 次，详见 `LOBSTERAI_USER_AGENT` 说明）。
  */
 export function lobsteraiAnonymousHeaders(product: LobsteraiProduct): Record<string, string> {
   return {
-    Accept: 'application/json',
     'Content-Type': 'application/json',
     'User-Agent': product.userAgent,
   }
@@ -612,19 +789,32 @@ export class LobsteraiClientVersionResolver {
    *
    * 顺序：进程内缓存（未过期）→ 请求上游更新接口 → 兜底常量。
    *
+   * `identity` 提供时会把它拼进 query（桌面端 `prod/update` 也走
+   * `appendKeyfromQuery`，见 `main.js:184766-184777` 与运行日志 `:277`）：
+   * 少这一路归因，同一 uuid/version 就会在不同端点呈现「部分携带」的形态。
+   * 此时还不知道当前版本号，`version` 段用 `fallbackClientVersion` —— 这正是
+   * 一个「尚未更新到最新版」的客户端会发的东西。
+   *
    * **失败不回退到抛错**（与 `sigin.py:73-76` 的「整个脚本放弃签到」不同）：
    * 返回 `fallbackClientVersion` 并在返回值里标出 `source`，
    * 让调用方能决定是否记日志。理由见 `LOBSTERAI_FALLBACK_CLIENT_VERSION` 说明。
    */
-  async resolve(product: LobsteraiProduct): Promise<{ version: string; source: 'cache' | 'remote' | 'fallback' }> {
+  async resolve(
+    product: LobsteraiProduct,
+    identity?: LobsteraiIdentityFields,
+  ): Promise<{ version: string; source: 'cache' | 'remote' | 'fallback' }> {
     const now = this.options.now?.() ?? Date.now()
     const ttl = this.options.ttlMs ?? LOBSTERAI_VERSION_CACHE_TTL_MS
     if (this.cached !== undefined && now - this.cachedAt < ttl) {
       return { version: this.cached, source: 'cache' }
     }
     const fetched = this.options.fetcher ?? fetch
+    const query = identity === undefined
+      ? ''
+      : lobsteraiKeyfromQueryString(lobsteraiKeyfromPayload(identity, product.fallbackClientVersion))
+    const url = query.length === 0 ? product.clientVersionApi : `${product.clientVersionApi}?${query}`
     try {
-      const response = await fetched(product.clientVersionApi, {
+      const response = await fetched(url, {
         method: 'GET',
         headers: { Accept: 'application/json', 'User-Agent': product.userAgent },
         signal: AbortSignal.timeout(LOBSTERAI_REQUEST_TIMEOUT_MS),

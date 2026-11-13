@@ -83,6 +83,10 @@ const suites = [
   ['channel-credits-ui', 'channel-credits-ui-test.mjs', []],
   ['channel-model-actions', 'channel-model-actions-test.mjs', []],
   ['channel-login', 'channel-login-test.mjs', []],
+  // LobsterAI 登录请求参数的「指纹」离线自检（keyfrom 语义、安装 UUID、
+  // UA 形态、登录 URL 参数、GET 身份 query）。这些性质回归时服务端会静默
+  // 把账号判成第三方反代，本地不会有任何报错，只能靠这里锁住。
+  ['lobsterai-fingerprint', 'lobsterai-fingerprint-test.mjs', []],
   ['open-external', 'open-external-test.mjs', []],
   ['channel-image-pricing', 'channel-image-pricing-test.mjs', []],
   ['forward-boot', 'forward-boot-test.mjs', []],

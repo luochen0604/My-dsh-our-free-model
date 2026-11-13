@@ -15,7 +15,13 @@
 
 import { randomUUID } from 'node:crypto'
 import { LOBSTERAI_REQUEST_TIMEOUT_MS, parseLobsteraiEnvelope } from './lobsterai.js'
-import { lobsteraiAuthHeaders, type LobsteraiCredential } from './lobsterai.js'
+import {
+  lobsteraiAuthHeaders,
+  lobsteraiKeyfromQuery,
+  withLobsteraiIdentity,
+  type LobsteraiCredential,
+  type LobsteraiIdentityFields,
+} from './lobsterai.js'
 import type { LobsteraiProduct } from './lobsterai-product.js'
 import type { ClaimOutcome, CreditBalance, CreditPackage } from './credits.js'
 
@@ -291,6 +297,13 @@ export async function claimLobsteraiDailyCheckin(
  * 返回 `null` 表示**查不到**（网络/信封问题），与「余额为 0」严格区分 ——
  * 失败时 UI 应显示原因而不是 0。
  *
+ * ## 身份 query（2026-11-13 补齐）
+ *
+ * 桌面端对服务端 GET **普遍**走 `appendKeyfromQuery`（`main.js:184766-184777`，
+ * `profile-summary` 的调用点在 `187110`），插件早先裸发。这里补上
+ * `uuid`/`version`/`firstKeyfrom`/`latestKeyfrom` —— 否则同一 uuid/version
+ * 在不同端点呈现「部分携带」，本身就是一个客户端形态差异。
+ *
  * 结构对齐 `credits.ts` 的 {@link CreditBalance}，让 `CreditBalanceRow`
  * 组件能直接复用：`creditItems[]` → `packages[]`，`totalCreditsRemaining` → `total`。
  */
@@ -298,9 +311,16 @@ export async function fetchLobsteraiCreditBalance(
   credential: LobsteraiCredential,
   product: LobsteraiProduct,
   fetcher: typeof fetch = fetch,
+  /** 身份来源（安装级）；缺省时退回凭据里的快照（已过 sanitizer）。 */
+  options: { identity?: LobsteraiIdentityFields; clientVersion?: string } = {},
 ): Promise<CreditBalance | null> {
+  const hydrated = options.identity === undefined
+    ? credential
+    : withLobsteraiIdentity(credential, options.identity)
+  const query = lobsteraiKeyfromQuery(hydrated, options.clientVersion ?? product.fallbackClientVersion)
   const result = await requestJson(
-    `${product.apiBase}${LOBSTERAI_PROFILE_SUMMARY_PATH}`, credential, product, fetcher,
+    `${product.apiBase}${LOBSTERAI_PROFILE_SUMMARY_PATH}${query.length === 0 ? '' : `?${query}`}`,
+    credential, product, fetcher,
   )
   if (!result.ok) return null
   const envelope = parseLobsteraiEnvelope(result.body)

@@ -10,7 +10,13 @@
  * - 端点路径与请求头：`lobsterai2api/internal/upstream/client.go`；
  * - 兜底模型表：`lobsterai2api/internal/server/handler.go:94-114`
  *   （注释标明「2026-08-06 从 `GET /api/models/available` 实测拉取」）；
- * - portal 基址：本次实测确认（见下）。
+ * - portal 基址 / 登录入口 / 客户端能力 / UA 形态：**桌面端 2026.11.6 的
+ *   `dist-electron/main.js` 反编译实证**（详见仓库文档
+ *   `登录参数对比与第三方反代判定原因.md`）。
+ *
+ * ⚠️ 与 Go 参考实现（`lobsterai2api`）刻意不同的三处都是**桌面端实证**压过
+ * 「Go 能跑通」：keyfrom 语义、UA、登录入口参数形态。Go 那套会稳定触发
+ * 服务端的「第三方反代」归因（见 `lobsterai.ts` 的 keyfrom 说明）。
  */
 
 /**
@@ -56,13 +62,41 @@ export const LOBSTERAI_API_BASE = 'https://lobsterai-server.youdao.com'
 export const LOBSTERAI_PORTAL_BASE = 'https://lobsterai.youdao.com'
 
 /**
+ * portal 登录页地址（登录入口的**兜底**值）。
+ *
+ * 桌面端 `getPortalLoginUrl()` 就是 `PORTAL_BASE_PROD + "/login"`，实测解析结果
+ * 为 `https://lobsterai.youdao.com/portal#/login`（`endpoints-CEzH9OMP.js:43/49`，
+ * 运行日志 `main-2026-11-13.log:531-537`）。正常路径由 overmind 的
+ * `prod/login-url` 下发（见 {@link LOBSTERAI_LOGIN_URL_API}），这里只在取不到时用。
+ */
+export const LOBSTERAI_PORTAL_LOGIN_URL = `${LOBSTERAI_PORTAL_BASE}/portal#/login`
+
+/**
  * 客户端版本号查询端点（第三方域名）。
  *
  * 注意该响应**不是**统一信封：`code`/`msg` 在**外层**，载荷在 `data.value`。
- * 实测（2026）返回 `version: "2026.9.4"`（日期式版本号）。
+ * 实测返回日期式版本号（2026-11-13 为 `2026.11.6`，与桌面端安装包一致）。
+ *
+ * ⚠️ 桌面端请求它时会**带上完整的身份 query**（`uuid` / `version` /
+ * `firstKeyfrom` / `latestKeyfrom`，见 `main.js:184766-184777` 的
+ * `appendKeyfromQuery`；运行日志 `main-2026-11-13.log:277` 实证）。插件也曾
+ * 裸 GET，少了一路归因 —— 现由 `LobsteraiClientVersionResolver` 补齐。
  */
 export const LOBSTERAI_CLIENT_VERSION_API
   = 'https://api-overmind.youdao.com/openapi/get/luna/hardware/lobsterai/prod/update'
+
+/**
+ * 登录入口地址查询端点（overmind 下发的运行时配置）。
+ *
+ * 桌面端**不硬编码登录页**：`AuthService.fetchLoginUrl()` 先 GET 这个端点
+ * （`endpoints-CEzH9OMP.js:41`、`useDesktopCompanionState-dtwKvfpU.js:8946-8974`），
+ * 取 `data.value` 再 `openExternal`；运行日志 `main-2026-11-13.log:531-537`
+ * 实证它当前返回的就是 `https://lobsterai.youdao.com/portal#/login`。
+ *
+ * 硬编码该值在「官方改道」的那天会立刻把插件留在旧入口，故同样改为运行时取。
+ */
+export const LOBSTERAI_LOGIN_URL_API
+  = 'https://api-overmind.youdao.com/openapi/get/luna/hardware/lobsterai/prod/login-url'
 
 /**
  * 无法动态取到版本号时的兜底值。
@@ -72,40 +106,84 @@ export const LOBSTERAI_CLIENT_VERSION_API
  * 也别让用户完全无法签到 —— 后端对 `version` 并不强校验
  * （反证：Go 侧一直发假值 `0.1.0` 也未导致失败）。
  *
- * 取值来自 2026 年实测的最后一个已知版本；随着客户端更新会逐渐变旧。
+ * 取值 = 本机安装包真实版本（`app.getVersion()`，`LobsterAI.exe` ProductVersion
+ * `2026.11.6.0`）。桌面端发的永远是**安装包自己的版本**，而不再是插件当年
+ * 实测遇到的 `2026.9.4` —— 发一个官方从未发布过的旧版本号本身就是「不是它自称的
+ * 那个客户端」的信号。回退发生时 `LobsteraiAuth.resolveClientVersion` 会打日志。
  */
-export const LOBSTERAI_FALLBACK_CLIENT_VERSION = '2026.9.4'
+export const LOBSTERAI_FALLBACK_CLIENT_VERSION = '2026.11.6'
 
 /**
  * 客户端能力声明（`X-LobsterAI-Client-Capabilities` 头）。
  *
- * 两个能力**都必须声明**，各自解决一个具体问题（2026-09-17 真实凭据实测）：
+ * 桌面端在 chat / models 路径上发**四个** token（`main.js:4753-4763`、
+ * `163250-163253`）：
  *
- * - `kimi-k3-agentic-v1`：**模型列表的准入条件**。不带该能力时
- *   `/api/models/available` 只返回 25 个模型且**没有 `kimi-k3`**；带上才 26 个。
- *   该值来自 `internal/upstream/client.go:99` 的硬编码。
- * - `thinking-level-control-v1`：**思考档位协议的前提**。`reasoning_effort`
- *   的常规档位（low/high/max/xhigh）不需要它，但 `"off"`（关闭思考）
- *   在**不带**该能力时服务端直接 HTTP 500（`{"code":500,"message":"服务器内部错误"}`），
- *   带上则正常返回。也就是说「关掉思考」这条协议要先声明支持它。
+ * | token | 作用 |
+ * |---|---|
+ * | `virtual-models-v1` | 虚拟模型集合 |
+ * | `kimi-k3-agentic-v1` | **模型列表的准入条件**：不带时 `/api/models/available` 只回 25 个且没有 `kimi-k3`，带上才 26 个 |
+ * | `thinking-level-control-v1` | **思考档位协议的前提**：`reasoning_effort:"off"` 在不带该能力时服务端直接 HTTP 500 |
+ * | `upstream-error-details-v1` | 上游错误明细 |
  *
- * 顺序无关（两种顺序都实测通过），但保持与 IDE 的
- * `LOBSTERAI_CLIENT_CAPABILITIES`（`modelRuntimeProfiles.js`）一致的排列。
+ * 顺序照抄桌面端。声明偏少会让服务端把请求归到「较旧的或非官方构建」，并
+ * 顺带解释「kimi-k3 等模型集合被过滤」。
+ *
+ * ⚠️ 这两个头**只属于 chat / models**（见 `main.js:4753-4763`）：auth 端点
+ * （exchange / refresh / logout）**不发**，桌面端在那些路径上没有任何
+ * `X-LobsterAI-Client-*`。
  */
 export const LOBSTERAI_CLIENT_CAPABILITIES
-  = 'kimi-k3-agentic-v1,thinking-level-control-v1'
+  = 'virtual-models-v1,kimi-k3-agentic-v1,thinking-level-control-v1,upstream-error-details-v1'
 
 /**
- * User-Agent。
+ * User-Agent（桌面形态的 Electron 默认 UA）。
  *
- * 原样照抄 `client.go:21` 的 `clientUA = "LobsterAI/0.1.0"`。
+ * ## 为什么不再是 `LobsterAI/0.1.0`
  *
- * **刻意不跟着真版本号改**：Go 侧用这个 UA 是实测可用的，而
- * `X-LobsterAI-Client-Version` 头用真值 `2026.9.4`（见下方说明）。
- * 若同时改两处，一旦服务端行为变化将无法归因是哪一个导致的，
- * 故先只改有确定依据的那一个（版本头），UA 待单独实测。
+ * 那个值原样照抄 `lobsterai2api/internal/upstream/client.go:21` 的
+ * `clientUA = "LobsterAI/0.1.0"`，而它在桌面端 12 MB 的 `main.js` 里**命中 0 次**
+ * —— 是第三方 Go 项目自己的标识。
+ *
+ * 桌面端对龙虾服务端的请求**一处都不设置 UA**：只有 GitHub Copilot、网易云信、
+ * Skill 下载器、飞书 SDK、内置浏览器、undici/axios 这些无关子系统有 UA 代码
+ * （`main.js` 全量 21 处命中，逐条排除见调查文档 §2.4）。所以线上真实发出去的
+ * 就是 **Electron 网络栈生成的默认 UA**，形态含 `Chrome/…` 与 `Electron/…`
+ * 且**不含应用名**（桌面端从未调用 `app.setUserAgentFallback`）。
+ *
+ * Node 侧 `fetch` 的默认 UA 是 `undici`，同样不是官方形态 —— 必须显式设置。
+ * 因此这里直接构造一个 Electron 默认形态的串：
+ *
+ * - Chrome / Electron 版本取**运行进程真实的** `process.versions`（插件跑在
+ *   Electron 宿主里时就是真实网络栈版本；纯 Node 环境才用下面的兜底常量）；
+ * - 平台段取真实 `process.platform`（桌面端在哪个系统上发就带哪个系统的形态）；
+ * - **不带** `LobsterAI/<version>` 应用段：桌面端没有设置过 fallback UA，
+ *   加了反而造出一个官方不存在的前缀。
  */
-export const LOBSTERAI_USER_AGENT = 'LobsterAI/0.1.0'
+export function lobsteraiUserAgent(): string {
+  const chrome = process.versions.chrome ?? FALLBACK_CHROME_VERSION
+  const electron = process.versions.electron ?? FALLBACK_ELECTRON_VERSION
+  return `Mozilla/5.0 (${platformUserAgentToken()}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chrome} Electron/${electron} Safari/537.36`
+}
+
+/** UA 的平台段（与 Electron/Chromium 在对应系统上的默认形态一致）。 */
+function platformUserAgentToken(): string {
+  if (process.platform === 'win32') return 'Windows NT 10.0; Win64; x64'
+  if (process.platform === 'darwin') return 'Macintosh; Intel Mac OS X 10_15_7'
+  return 'X11; Linux x86_64'
+}
+
+/**
+ * 非 Electron 环境下的 Chrome/Electron 版本兜底。
+ *
+ * 只是让 UA **保持 Electron 形态**（含 `Chrome/…`、`Electron/…`），不参与任何
+ * 认证判断；跑在 Electron 宿主里时永远不会用到（以 `process.versions` 为准）。
+ */
+const FALLBACK_CHROME_VERSION = '128.0.6613.186'
+const FALLBACK_ELECTRON_VERSION = '32.2.0'
+
+/** 进程级常量：UA 在一次运行内恒定（真实客户端的 UA 也不会逐请求变）。 */
+export const LOBSTERAI_USER_AGENT = lobsteraiUserAgent()
 
 /**
  * LobsterAI 产品配置。
@@ -117,13 +195,17 @@ export interface LobsteraiProduct {
   displayName: string
   /** 登录门户基址（不含 `/portal` 路径）。 */
   portalBase: string
+  /** 登录页地址的兜底值（overmind 下发失败时用）。 */
+  portalLoginUrl: string
   /** 上游 API 基址（不含路径）。 */
   apiBase: string
   /** 客户端版本号查询端点。 */
   clientVersionApi: string
+  /** 登录入口地址查询端点（overmind 运行时配置）。 */
+  loginUrlApi: string
   /** 版本号动态拉取失败时的兜底值。 */
   fallbackClientVersion: string
-  /** `User-Agent` 头取值。 */
+  /** `User-Agent` 头取值（桌面形态，见 {@link LOBSTERAI_USER_AGENT}）。 */
   userAgent: string
   /** `X-LobsterAI-Client-Capabilities` 头取值。 */
   clientCapabilities: string
@@ -180,8 +262,10 @@ export const LOBSTERAI: LobsteraiProduct = {
   id: 'lobsterai',
   displayName: 'LobsterAI (有道)',
   portalBase: LOBSTERAI_PORTAL_BASE,
+  portalLoginUrl: LOBSTERAI_PORTAL_LOGIN_URL,
   apiBase: LOBSTERAI_API_BASE,
   clientVersionApi: LOBSTERAI_CLIENT_VERSION_API,
+  loginUrlApi: LOBSTERAI_LOGIN_URL_API,
   fallbackClientVersion: LOBSTERAI_FALLBACK_CLIENT_VERSION,
   userAgent: LOBSTERAI_USER_AGENT,
   clientCapabilities: LOBSTERAI_CLIENT_CAPABILITIES,
