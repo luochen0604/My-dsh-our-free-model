@@ -59,13 +59,21 @@ import {
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiCredential } from './gemini.js'
 import {
+  WORKBUDDY_EXPIRY_ACCESSORS,
   WORKBUDDY_ID,
+  WorkbuddyRefreshTokenExpiredError,
   claimWorkbuddyDailyCheckin,
   fetchWorkbuddyCheckinStatus,
+  isCanonicalWorkbuddyCredentialJson,
+  isWorkbuddyRefreshable,
+  normalizeWorkbuddyCredential,
+  refreshWorkbuddyCredential,
+  workbuddyCredentialExpiresAtMs,
   type WorkbuddyCredential,
 } from './workbuddy-credits.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 import { fetchGeminiCreditBalance } from './gemini-credits.js'
+import { shouldRefreshNow, syncAccountExpiry } from './expiry-sync.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
@@ -265,7 +273,7 @@ export const OPS_CHECKIN_PROVIDERS: ReadonlySet<string> = new Set([
  * **不参与唤醒**的平台。当前只有 OpenCode：它在宿主的账号集成被禁用，
  * `account.refresh` 也没有它的分支。
  *
- * ⚠️ **不要**把 WorkBuddy 加进来：它走「重读凭据 + 探活」的唤醒分支
+ * ⚠️ **不要**把 WorkBuddy 加进来：它走「归一化 → 按需续期 → 探活」的唤醒分支
  * （`account.refresh` 的 `WORKBUDDY_ID` case），必须被一键唤醒 / 自动唤醒覆盖。
  * `scripts/channel-ops-rpc-test.mjs` 有反向守护断言。
  */
@@ -2053,30 +2061,80 @@ if (provider === LOBSTERAI.id) {
               break
             case WORKBUDDY_ID: {
               /**
-               * WorkBuddy **没有 OAuth 续期端点**（账号池凭据是直接导入的
-               * access/refresh token；上游 refresh 端点未公开）。
+               * WorkBuddy 的唤醒 = **归一化凭据 → 按需真续期 → 探活 → 回写**。
                *
-               * 与 ZCode 同策略：唤醒 = **重读自己的 ref 并回写账号条目**，
-               * 用户更新凭据后无需重启 DSH。同时用状态端点做一次**真探活**：
-               * HTTP 200 + code 0 ⇒ 凭据有效；401 ⇒ 抛「请重新登录」。
-               * 探活失败不臆造成功 —— 唤醒的语义是「验证它现在活着」。
+               * ## 旧实现错在哪（用户报障「WorkBuddy 账户唤醒失败」的全部原因）
+               *
+               * 旧注释断言「WorkBuddy 没有 OAuth 续期端点」，于是这里只做
+               * 「重读凭据 + 探活」。两处前提都是错的：
+               *
+               * 1. **续期端点存在**：`POST /v2/plugin/auth/token/refresh`。
+               *    依据是桌面端 5.9.3 的 `cli/product.json`
+               *    （`authentication.attributes.prefixPath = "/plugin"`、`platform = "workbuddy"`）
+               *    与 `app.asar` 的 `main/common2.js`
+               *    （`AccountScopedExternalLinkAuthenticationProvider.refreshSession`）。
+               *    完整证据链与实测响应见 `workbuddy-credits.ts` 的
+               *    `WORKBUDDY_TOKEN_REFRESH_PATH`。
+               * 2. **`JSON.parse` 只解一层**，而历史导入脚本把凭据写成了
+               *    **双层 JSON 文本**，解出来是 `string` 而非对象 →
+               *    `accessToken`/`uid` 全是 `undefined` → 直接抛
+               *    「凭据缺少 accessToken/uid」。三条唤醒流水全失败的正是此因。
+               *
+               * ## 现在的语义（三条都是必须的）
+               *
+               * - 归一化会**多解一层**，因此存量双编码凭据在唤醒时自愈。
+               * - 距过期不足 `REFRESH_LEAD_MS`（1 小时）且具备 refreshToken 时
+               *   **真续期**；不临期只对账，避免每次点「唤醒」都轮换令牌。
+               * - 续期被 401/403 拒 → 明确要求重新导入；其它故障（网络/5xx）
+               *   退化为探活，不把网络抖动谎报成凭据失效。
                */
-              const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+              const ref = credentialRef(entry.credentialRef)
+              const resolved = await ctx.credentials.resolve(ref)
               if (!resolved) throw new Error('凭据未配置')
-              let credential: WorkbuddyCredential
-              try {
-                credential = JSON.parse(resolved.value) as WorkbuddyCredential
-              } catch {
-                throw new Error('凭据解析失败')
-              }
-              if (typeof credential.accessToken !== 'string' || credential.accessToken.length === 0
-                || typeof credential.uid !== 'string' || credential.uid.length === 0) {
+              const normalized = normalizeWorkbuddyCredential(resolved.value)
+              if (normalized === undefined) {
                 throw new Error('WorkBuddy 凭据缺少 accessToken/uid，请重新导入该账号')
               }
-              const probe = await fetchWorkbuddyCheckinStatus(credential)
+
+              let effective = normalized
+              let refreshed = false
+              const expiresAt = workbuddyCredentialExpiresAtMs(normalized)
+              if (isWorkbuddyRefreshable(normalized) && shouldRefreshNow(expiresAt)) {
+                try {
+                  effective = await refreshWorkbuddyCredential(normalized)
+                  refreshed = true
+                  // ⚠️ 轮换是**成对**的：旧 refresh_token 续完即不可用，
+                  // 故续期成功必须立刻落盘，否则探活失败时新令牌会丢。
+                  await ctx.credentials.set(ref, JSON.stringify(effective))
+                } catch (error) {
+                  if (error instanceof WorkbuddyRefreshTokenExpiredError) throw error
+                  ctx.logger.warn(
+                    `[channel-pack] WorkBuddy 续期失败，退化为探活：`
+                    + `${error instanceof Error ? error.message : String(error)}`,
+                  )
+                }
+              }
+
+              const probe = await fetchWorkbuddyCheckinStatus(effective)
               if (probe === null) {
                 throw new Error('WorkBuddy 探活失败（凭据失效或网络异常），请检查该账号')
               }
+
+              // 归一化回写：修复存量「双层 JSON」凭据（import 脚本历史缺陷）。
+              // 已续期时上面已写过，这里只处理「凭据形态不规范」的情形。
+              if (!refreshed && !isCanonicalWorkbuddyCredentialJson(resolved.value)) {
+                await ctx.credentials.set(ref, JSON.stringify(effective))
+              }
+              await syncAccountExpiry({
+                pool,
+                provider: WORKBUDDY_ID,
+                credential: effective,
+                accessors: WORKBUDDY_EXPIRY_ACCESSORS,
+                accountId: entry.id,
+                current: entry,
+                tag: '[workbuddy]',
+                warn: (message) => ctx.logger.warn(message),
+              })
               break
             }
             default:

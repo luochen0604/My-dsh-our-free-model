@@ -95,6 +95,7 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds, adapters }) {
         creds.delete(otherRef)
       }
     }
+    await verifyWorkbuddyWake({ ctx, call, creds })
   } finally {
     ctx.credentials.resolve = originalResolve
     globalThis.fetch = originalFetch
@@ -136,4 +137,176 @@ async function verifyRefreshDispatch({ ctx, call }) {
     }
   }
   console.log('ok  refresh RPC: all 10 providers pass exact ref/pool/id; disabled accounts refresh; failures return ok:false')
+}
+
+/**
+ * WorkBuddy 唤醒的**行为级**守护（用户报障：三个 WB 账号唤醒全失败）。
+ *
+ * 覆盖三层真实缺陷/契约：
+ * 1. 历史导入脚本把凭据写成**双层 JSON**，旧实现只 `JSON.parse` 一次 →
+ *    `accessToken` undefined → 抛「凭据缺少 accessToken/uid」。这里断言
+ *    双编码凭据能唤醒成功**且被回写成单层规范 JSON**（存量账号自愈）。
+ * 2. 桌面端（5.9.3）**存在**续期端点：`POST /v2/plugin/auth/token/refresh`
+ *    + `X-Refresh-Token` / `X-Auth-Refresh-Source: plugin` / `X-Domain`。
+ *    这里断言临期账号真的走续期、把轮换后的两个令牌落盘、并把新有效期写回账号池。
+ * 3. 续期被 401 拒绝必须报「请重新导入」；无 refreshToken 时退化为只探活。
+ */
+export async function verifyWorkbuddyWake({ ctx, call, creds }) {
+  const originalFetch = globalThis.fetch
+  const accountId = 'fixture-wb-wake'
+  const ref = 'WORKBUDDY_ACCOUNT_FIXTURE'
+  const uid = '7b7d9fa7-0000-4000-8000-000000000001'
+  const now = Date.now()
+  const seconds = ms => Math.floor(ms / 1000)
+  const farExpSec = seconds(now + 20 * 24 * 3600_000)
+  const nearExpSec = seconds(now + 60_000)
+  const rotatedAccessExpSec = seconds(now + 28 * 24 * 3600_000)
+  const rotatedRefreshExpSec = seconds(now + 30 * 24 * 3600_000)
+  const jwt = payload => [
+    Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url'),
+    Buffer.from(JSON.stringify(payload)).toString('base64url'),
+    'sig',
+  ].join('.')
+  const credential = (overrides = {}) => ({
+    uid,
+    accessToken: jwt({ sub: uid, exp: farExpSec, jti: 'original-access' }),
+    refreshToken: jwt({ sub: uid, exp: farExpSec + 24 * 3600, jti: 'original-refresh' }),
+    domain: 'www.workbuddy.cn',
+    nickname: 'WB fixture',
+    ...overrides,
+  })
+  const probeEnvelope = { code: 0, msg: 'OK', data: { active: true, today_checked_in: false, streak_days: 1, daily_credit: 100, total_credits: 100 } }
+  const requests = []
+  let probeFails = false
+  const fetchStub = async (input, init) => {
+    const url = String(input)
+    const headers = new Headers(init?.headers)
+    requests.push({ url, method: init?.method ?? 'GET', headers, body: init?.body })
+    if (url.endsWith('/v2/plugin/auth/token/refresh')) {
+      if (headers.get('X-Refresh-Token') === 'revoked-refresh') {
+        return Response.json({ code: 401, msg: 'invalid refresh token' }, { status: 401 })
+      }
+      return Response.json({
+        code: 0,
+        msg: 'OK',
+        data: {
+          accessToken: jwt({ sub: uid, exp: rotatedAccessExpSec, jti: 'rotated-access' }),
+          refreshToken: jwt({ sub: uid, exp: rotatedRefreshExpSec, jti: 'rotated-refresh' }),
+          expiresIn: 2419200,
+          refreshExpiresIn: 2591999,
+          tokenType: 'Bearer',
+          sessionState: 'fixture-session',
+          domain: 'www.workbuddy.cn',
+        },
+      })
+    }
+    if (url.endsWith('/billing/meter/checkin-activity-status')) {
+      if (probeFails) return Response.json({ code: 401, msg: 'invalid token' }, { status: 401 })
+      return Response.json(probeEnvelope)
+    }
+    throw new Error(`未预期的替身端点：${url}`)
+  }
+  const byAccount = () => ctx.accountPool.findAccount(accountId)
+  try {
+    globalThis.fetch = fetchStub
+
+    // ── 1. 双层编码凭据：唤醒成功 + 回写单层规范 JSON ──
+    const canonical = credential()
+    // import-wb-pool 历史缺陷的落盘形态：JSON 文本被 stringify 了两次。
+    creds.set(ref, { value: JSON.stringify(JSON.stringify(canonical)) })
+    await ctx.accountPool.addAccount({
+      id: accountId, provider: 'workbuddy', nickname: 'WB fixture',
+      credentialRef: ref, enabled: true, refreshable: true, createdAt: 1, expiresAt: 1,
+    })
+    requests.length = 0
+    const healed = await call('account.refresh', { accountId })
+    assert.deepEqual(healed, { ok: true, value: { success: true } }, '双编码凭据必须能唤醒（旧实现抛「缺少 accessToken/uid」）')
+    assert.equal(
+      requests.some(row => row.url.endsWith('/v2/plugin/auth/token/refresh')), false,
+      '距过期 20 天时不应轮换令牌（避免每次唤醒都换 refresh_token）',
+    )
+    const probeRequest = requests.find(row => row.url.endsWith('/billing/meter/checkin-activity-status'))
+    assert.ok(probeRequest, '唤醒必须真的探活')
+    assert.equal(probeRequest.headers.get('Authorization'), `Bearer ${canonical.accessToken}`)
+    assert.equal(probeRequest.headers.get('X-User-Id'), uid)
+    assert.equal(probeRequest.headers.get('X-Domain'), 'www.workbuddy.cn')
+    const storedHealed = JSON.parse(creds.get(ref).value)
+    assert.equal(typeof storedHealed, 'object', '唤醒后必须把凭据回写成单层 JSON 对象')
+    assert.equal(storedHealed.uid, uid)
+    assert.equal(storedHealed.accessToken, canonical.accessToken)
+    assert.equal(storedHealed.refreshToken, canonical.refreshToken)
+    assert.equal(byAccount().expiresAt, farExpSec * 1000, '账号池 expiresAt 必须与 JWT exp 对齐')
+    assert.equal(byAccount().refreshable, true)
+
+    // ── 2. 临期凭据：真续期（桌面端契约），轮换令牌落盘 ──
+    const expiring = credential({
+      accessToken: jwt({ sub: uid, exp: nearExpSec, jti: 'expiring-access' }),
+      refreshToken: jwt({ sub: uid, exp: farExpSec, jti: 'expiring-refresh' }),
+    })
+    creds.set(ref, { value: JSON.stringify(expiring) })
+    requests.length = 0
+    const refreshed = await call('account.refresh', { accountId })
+    assert.deepEqual(refreshed, { ok: true, value: { success: true } }, '临期凭据必须续期成功')
+    const refreshRequest = requests.find(row => row.url.endsWith('/v2/plugin/auth/token/refresh'))
+    assert.ok(refreshRequest, '临期账号必须命中 /v2/plugin/auth/token/refresh')
+    assert.equal(refreshRequest.url, 'https://www.workbuddy.cn/v2/plugin/auth/token/refresh')
+    assert.equal(refreshRequest.method, 'POST')
+    assert.equal(refreshRequest.headers.get('X-Refresh-Token'), expiring.refreshToken)
+    assert.equal(refreshRequest.headers.get('X-Auth-Refresh-Source'), 'plugin')
+    assert.equal(refreshRequest.headers.get('X-Domain'), 'www.workbuddy.cn')
+    assert.equal(refreshRequest.headers.get('Authorization'), null, '续期请求不带旧的 Authorization')
+    assert.equal(refreshRequest.body, '{}')
+    const storedRefreshed = JSON.parse(creds.get(ref).value)
+    assert.equal(storedRefreshed.uid, uid, '续期不得丢失账号 uid')
+    assert.equal(
+      Buffer.from(storedRefreshed.accessToken.split('.')[1], 'base64url').toString('utf8').includes('rotated-access'),
+      true, '续期后的新 accessToken 必须落盘（轮换是成对的，旧 refresh_token 已不可用）',
+    )
+    assert.equal(
+      Buffer.from(storedRefreshed.refreshToken.split('.')[1], 'base64url').toString('utf8').includes('rotated-refresh'),
+      true, '续期后的新 refreshToken 必须落盘',
+    )
+    assert.equal(byAccount().expiresAt, rotatedAccessExpSec * 1000, '续期后账号池有效期必须前进')
+
+    // ── 3. refresh_token 被 401 拒绝：明确要求重新导入，不谎报成功 ──
+    creds.set(ref, { value: JSON.stringify(credential({
+      accessToken: jwt({ sub: uid, exp: nearExpSec, jti: 'dead-access' }),
+      refreshToken: 'revoked-refresh',
+    })) })
+    const revoked = await call('account.refresh', { accountId })
+    assert.equal(revoked.ok, false, '续期被拒时唤醒必须失败（不得 ok:true）')
+    assert.match(revoked.error.message, /refresh_token 已失效|重新导入/)
+
+    // ── 4. 无 refresh_token：退化为只探活，并把 refreshable 标 false ──
+    const probeOnly = credential({ refreshToken: undefined })
+    delete probeOnly.refreshToken
+    creds.set(ref, { value: JSON.stringify(probeOnly) })
+    requests.length = 0
+    const probeOk = await call('account.refresh', { accountId })
+    assert.deepEqual(probeOk, { ok: true, value: { success: true } }, '无 refresh_token 时探活通过即算唤醒成功')
+    assert.equal(requests.some(row => row.url.endsWith('/v2/plugin/auth/token/refresh')), false)
+    assert.equal(byAccount().refreshable, false, '没有 refresh_token 的账号必须如实标记为不可续期')
+
+    // ── 5. 探活失败：唤醒失败并带原因 ──
+    probeFails = true
+    const dead = await call('account.refresh', { accountId })
+    assert.equal(dead.ok, false)
+    assert.match(dead.error.message, /探活失败/)
+    probeFails = false
+
+    // ── 6. 签到状态也必须容忍双层编码（同一缺陷的另一条路径） ──
+    creds.set(ref, { value: JSON.stringify(JSON.stringify(credential())) })
+    const status = await call('credits.status', { provider: 'workbuddy' })
+    assert.equal(status.ok, true)
+    const row = status.value.accounts.find(item => item.accountId === accountId)
+    assert.ok(row?.status, '双编码凭据下签到状态不得静默为 null')
+    assert.equal(row.status.active, true)
+    assert.equal(row.status.streakDays, 1)
+
+    console.log('ok  WorkBuddy wake: 双编码自愈、桌面端续期契约（/v2/plugin/auth/token/refresh）轮换落盘、401 与探活失败如实报错')
+  } finally {
+    globalThis.fetch = originalFetch
+    await ctx.accountPool.removeAccount(accountId)
+    creds.delete(ref)
+  }
 }

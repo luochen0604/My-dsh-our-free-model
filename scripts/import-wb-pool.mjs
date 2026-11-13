@@ -144,8 +144,10 @@ function backup(file) {
 // ── .credentials.yaml 的最小读写（version:1 records 结构，单引号 JSON 字符串） ──
 
 function parseCredentialYaml(text) {
-  const match = text.match(/^version: (\d+)\nrecords:\n/)
-  if (!match) throw new Error('凭据文件结构不是 version:1 records，停止导入（不要猜）')
+  // ⚠️ 段名两种写法都见过（现网 `refs:`，旧文档 `records:`）：只认一种会让脚本
+  // 在真实文件上直接报「结构不符」，用户会误读成凭据文件损坏。两种都接受。
+  const match = text.match(/^(version: \d+\n(?:refs|records):\n)/)
+  if (!match) throw new Error('凭据文件结构不是 version:1 refs/records，停止导入（不要猜）')
   const header = match[0]
   const body = text.slice(header.length)
   const records = {}
@@ -170,9 +172,19 @@ function parseCredentialYaml(text) {
 function serializeCredentialYaml(header, records) {
   const lines = [header.trimEnd()]
   for (const [ref, value] of Object.entries(records)) {
-    const raw = typeof value === 'string' && !value.startsWith('{') && !value.startsWith('[')
-      ? value
-      : JSON.stringify(value)
+    /**
+     * ⚠️ **字符串值必须原样写出，绝不能再 `JSON.stringify` 一次**。
+     *
+     * 历史缺陷（真实事故：WorkBuddy 账号唤醒全失败）：旧判据是
+     * 「以 `{` 开头的就当对象再序列化」，而 `buildCredentialJson()` 产出的
+     * **就是**一段以 `{` 开头的 JSON 文本 —— 于是被二次编码成
+     * `'"{""uid"":""…""}"'`。读回 `JSON.parse` 只解一层得到 `string`，
+     * OFM 侧 `credential.accessToken` 因此是 `undefined`，唤醒直接抛
+     * 「凭据缺少 accessToken/uid」。
+     *
+     * 判据改为「按 JS 类型分派」：对象才序列化，字符串保持原样。
+     */
+    const raw = typeof value === 'string' ? value : JSON.stringify(value)
     const escaped = raw.replaceAll("'", "''")
     lines.push(`  ${ref}: '${escaped}'`)
   }

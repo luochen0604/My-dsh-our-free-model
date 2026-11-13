@@ -41,8 +41,67 @@
  * | 其它非 0 code              | `failed` code=<业务码>，message=`msg` | 保留原文不吞 |
  */
 
+import { jwtExpiresAtMs } from './credential-expiry.js'
+import type { ExpiryAccessors } from './expiry-sync.js'
+
 /** provider 标识（注册到账号池 / 客户端渠道清单的 id）。 */
 export const WORKBUDDY_ID = 'workbuddy'
+
+/**
+ * WorkBuddy **真实续期端点**（2026-11-13 从桌面端 5.9.3 逆向取证，实测通过）。
+ *
+ * ## 证据链（全部来自本机安装的官方桌面端，非猜测）
+ *
+ * 1. `D:\Program Files (x86)\WorkBuddy\resources\app.asar.unpacked\cli\product.json`
+ *    的 `authentication` 段：
+ *    ```
+ *    { "id": "workbuddy-desktop",
+ *      "type": "account-scoped-external-link",
+ *      "attributes": { "prefixPath": "/plugin", "platform": "workbuddy", ... } }
+ *    endpoint = "https://www.workbuddy.cn"
+ *    ```
+ * 2. `app.asar` 的 `main/common2.js`
+ *    （`AccountScopedExternalLinkAuthenticationProvider.refreshSession`）：
+ *    ```
+ *    this.restOperations.post(`/v2${this.prefixPath}/auth/token/refresh`, {}, {
+ *      headers: { ...this.enterpriseHeaders(e.auth),          // { 'X-Domain': domain }
+ *                 'X-Refresh-Token': e.auth.refreshToken,
+ *                 'X-Auth-Refresh-Source': 'plugin', ... } })
+ *    ```
+ *    `enterpriseHeaders()` 只回 `{'X-Domain': account.domain || endpoint authority}`；
+ *    随后 `calculateExpiresAt()` 用响应的 `expiresIn` 换算 `expiresAt`。
+ * 3. `app.asar` 的 `main/auth-liveness.js` 把
+ *    `POST /v2/*\/auth/token/refresh` 登记为 `login.session.refresh`
+ *    （`replayClass: forbidden`）—— 即这是桌面端唯一的会话续期路由。
+ * 4. **实测（2026-11-13）**：对本机 3 个存活账号之一发上述请求，
+ *    `HTTP 200 → {code:0,msg:"OK",data:{accessToken,refreshToken,tokenType:"Bearer",
+ *    expiresIn:2419200,refreshExpiresIn:2591999,sessionState,domain:"www.workbuddy.cn"}}`；
+ *    access/refresh **两个令牌都会轮换**（新 JWT 的 `jti`/`iat`/`exp` 均变），
+ *    新 accessToken 立即通过 `checkin-activity-status` 探活（code 0）。
+ *
+ * 故此前的「WorkBuddy 没有续期端点」是**错误结论**：端点存在，只是不在
+ * `/v2/auth/...`（那是 CodeBuddy 系产品的无 prefixPath 形态），而在
+ * `/v2/plugin/auth/...`。
+ */
+export const WORKBUDDY_TOKEN_REFRESH_PATH = '/v2/plugin/auth/token/refresh'
+
+/**
+ * 续期请求的来源标记（桌面端同一常量）。
+ *
+ * 桌面端在**插件/CLI 形态**下固定发 `plugin`（见上面的 `refreshSession`），
+ * 服务端据此区分「客户端续期」与「网页续期」。删掉它实测仍能续期，但保持
+ * 与官方客户端逐字段一致可降低风控误判概率 —— 与 UA 伪装同思路。
+ */
+export const WORKBUDDY_AUTH_REFRESH_SOURCE = 'plugin'
+
+/** refresh_token 缺失或已被服务端拒绝（401/403）：只能重新导入/登录。 */
+export class WorkbuddyRefreshTokenExpiredError extends Error {
+  constructor(message = 'WorkBuddy refresh_token 已失效，请重新导入该账号') {
+    super(message)
+    this.name = 'WorkbuddyRefreshTokenExpiredError'
+  }
+}
+
 
 /** 缺省域名（账号池条目未填 `domain` 时使用）。 */
 export const WORKBUDDY_DEFAULT_DOMAIN = 'www.workbuddy.cn'
@@ -74,12 +133,36 @@ export interface WorkbuddyCredential {
   uid: string
   /** Bearer access token。 */
   accessToken: string
-  /** 刷新令牌（本轮未实现续期端点，仅透传保存）。 */
+  /**
+   * 刷新令牌。
+   *
+   * ⚠️ 它**能真的续期**（见 {@link WORKBUDDY_TOKEN_REFRESH_PATH} 的证据链）；
+   * 旧注释写的「本轮未实现续期端点」已作废 —— 端点存在，只是路径带 `/plugin`
+   * 前缀。缺失时唤醒退化为「只探活」，并把账号池的 `refreshable` 标成 false。
+   */
   refreshToken?: string
   /** 站点域名（不带协议；缺省 {@link WORKBUDDY_DEFAULT_DOMAIN}）。 */
   domain?: string
   /** 展示名（可选）。 */
   nickname?: string
+}
+
+/**
+ * 续期请求头（与桌面端 `refreshSession` 逐字段一致）。
+ *
+ * ⚠️ **不**带 `Authorization` / `X-User-Id`：桌面端续期请求只带三者
+ * （`X-Domain`、`X-Refresh-Token`、`X-Auth-Refresh-Source`），且此时旧
+ * accessToken 往往已过期 —— 带上它反而让服务端在两份凭据不一致时拒绝。
+ */
+export function workbuddyRefreshHeaders(credential: WorkbuddyCredential): Headers {
+  const headers = new Headers()
+  headers.set('Content-Type', 'application/json')
+  headers.set('Accept', 'application/json')
+  headers.set('X-Domain', credential.domain ?? WORKBUDDY_DEFAULT_DOMAIN)
+  headers.set('User-Agent', WORKBUDDY_USER_AGENT)
+  headers.set('X-Refresh-Token', credential.refreshToken ?? '')
+  headers.set('X-Auth-Refresh-Source', WORKBUDDY_AUTH_REFRESH_SOURCE)
+  return headers
 }
 
 /** 组装认证 + 身份请求头（与实测抓包逐字段一致）。 */
@@ -195,11 +278,17 @@ export function isWorkbuddyAlreadyChecked(envelope: WorkbuddyEnvelope): boolean 
  * ⚠️ `active` 取 `data.active === true`：不要按「拿到响应」判 true，
  * WB 的活动有开关，关掉时 `active:false`，此时不应尝试领取。
  * ⚠️ `isStreakDay` 语义未知（响应无对应字段），恒 false 不猜测。
+ * ⚠️ 入参是 `unknown`：共享收集器（`collectCreditsStatus`）只做一次
+ * `JSON.parse`，历史**双编码**凭据会解出字符串 —— 必须经
+ * {@link normalizeWorkbuddyCredential} 归一化，否则 `credential.accessToken`
+ * 是 `undefined`、请求带着 `Bearer undefined` 静默失败（真实缺陷，见该函数）。
  */
 export async function fetchWorkbuddyCheckinStatus(
-  credential: WorkbuddyCredential,
+  credentialInput: unknown,
   fetcher: typeof fetch = fetch,
 ): Promise<import('./credits.js').CheckinStatus | null> {
+  const credential = normalizeWorkbuddyCredential(credentialInput)
+  if (credential === undefined) return null
   const result = await requestEnvelope(credential, WORKBUDDY_CHECKIN_STATUS_PATH, fetcher)
   if (!result.ok) return null
   if (result.status !== 200 || result.envelope.code !== 0) return null
@@ -226,11 +315,17 @@ export async function fetchWorkbuddyCheckinStatus(
  * 执行每日签到。完整分类见文件头的错误分类表。
  *
  * ⚠️ 本函数**不抛错**（失败也返回 `failed`），保证批量领取不因单账号中断。
+ * ⚠️ 入参归一化理由同 {@link fetchWorkbuddyCheckinStatus}：双编码凭据必须
+ * 先还原成对象，否则会带着空 accessToken 去请求。
  */
 export async function claimWorkbuddyDailyCheckin(
-  credential: WorkbuddyCredential,
+  credentialInput: unknown,
   fetcher: typeof fetch = fetch,
 ): Promise<import('./credits.js').ClaimOutcome> {
+  const credential = normalizeWorkbuddyCredential(credentialInput)
+  if (credential === undefined) {
+    return { kind: 'failed', code: -1, message: 'WorkBuddy 凭据缺少 accessToken/uid，请重新导入该账号' }
+  }
   const result = await requestEnvelope(credential, WORKBUDDY_DAILY_CHECKIN_PATH, fetcher)
   if (!result.ok) {
     return { kind: 'failed', code: result.status === -1 ? -1 : result.status, message: result.message }
@@ -260,5 +355,213 @@ export async function claimWorkbuddyDailyCheckin(
     credit,
     streakDays: finiteNumber(data.streak_days) ?? 0,
     isStreakDay: false,
+  }
+}
+
+// ───────────────────────── 凭据归一化与真实续期 ─────────────────────────
+
+/**
+ * 解出 JWT 的 payload（**不验签**，只读 `sub`/`exp` 这类自描述字段）。
+ *
+ * 与 `credential-expiry.ts` 的 `jwtExpiresAtMs` 同源做法：仅 base64url 解码
+ * 第二段，失败一律 `undefined`，绝不因凭据格式异常抛错。
+ */
+function workbuddyJwtPayload(token: unknown): Record<string, unknown> | undefined {
+  if (typeof token !== 'string' || token.length === 0) return undefined
+  const parts = token.split('.')
+  if (parts.length < 2) return undefined
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(parts[1] ?? '', 'base64url').toString('utf8'))
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 去掉协议与路径，只留 host（`X-Domain` 与 base 都只要 host）。 */
+function workbuddyDomainOf(value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0) return WORKBUDDY_DEFAULT_DOMAIN
+  const trimmed = value.trim()
+  if (!/^https?:\/\//i.test(trimmed)) return trimmed.replace(/\/+$/, '')
+  try {
+    return new URL(trimmed).host
+  } catch {
+    return WORKBUDDY_DEFAULT_DOMAIN
+  }
+}
+
+/**
+ * 把**任何历史形状**的 WorkBuddy 凭据还原成规范对象；无法还原时返回 `undefined`。
+ *
+ * ## 为什么需要它（真实缺陷：唤醒全失败）
+ *
+ * `scripts/import-wb-pool.mjs` 早期的 `serializeCredentialYaml` 会把
+ * 「已经是 JSON 字符串」的值**再** `JSON.stringify` 一次（判据是
+ * `value.startsWith('{')` 就当成对象再序列化），于是落盘成：
+ *
+ * ```yaml
+ * WORKBUDDY_ACCOUNT_XXXX: '"{""uid"":""...""}"'   # 字符串里套了一段 JSON 文本
+ * ```
+ *
+ * 读回时 `JSON.parse` **只解一层**，得到的是 `string` 而不是对象，
+ * 于是 `credential.accessToken` 为 `undefined` →
+ * `account.refresh` 直接抛「WorkBuddy 凭据缺少 accessToken/uid」，
+ * 签到/签到状态同样带着空 token 静默失败（用户报障「唤醒失败」）。
+ *
+ * 归一化本身即修复：**多解一层**即可自愈存量凭据，无需用户重新导入。
+ * 同时兼容三种输入：规范对象 / 单层 JSON 文本 / 双层 JSON 文本。
+ *
+ * ⚠️ `uid` 缺失时用 accessToken 的 JWT `sub` 兜底（WB 的 `sub` 就是账号
+ * uid；桌面端 `account.uid` 与 `sub` 实测同值），仍取不到才返回 `undefined`。
+ */
+export function normalizeWorkbuddyCredential(input: unknown): WorkbuddyCredential | undefined {
+  let candidate: unknown = input
+  // 最多解两层：单层 = 正常存储；双层 = import 脚本历史缺陷。
+  for (let depth = 0; depth < 2; depth += 1) {
+    if (typeof candidate !== 'string') break
+    try {
+      candidate = JSON.parse(candidate)
+    } catch {
+      return undefined
+    }
+  }
+  if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) return undefined
+
+  const record = candidate as Record<string, unknown>
+  const accessToken = typeof record.accessToken === 'string' ? record.accessToken.trim() : ''
+  if (accessToken.length === 0) return undefined
+
+  const payload = workbuddyJwtPayload(accessToken)
+  const uidFromToken = typeof payload?.sub === 'string' ? payload.sub.trim() : ''
+  const uid = typeof record.uid === 'string' && record.uid.trim().length > 0
+    ? record.uid.trim()
+    : uidFromToken
+  if (uid.length === 0) return undefined
+
+  const refreshToken = typeof record.refreshToken === 'string' && record.refreshToken.trim().length > 0
+    ? record.refreshToken.trim()
+    : undefined
+  const nickname = typeof record.nickname === 'string' ? record.nickname : undefined
+
+  return {
+    uid,
+    accessToken,
+    ...refreshToken === undefined ? {} : { refreshToken },
+    domain: workbuddyDomainOf(record.domain),
+    ...nickname === undefined ? {} : { nickname },
+  }
+}
+
+/** access_token 的过期时刻（毫秒）；读不到返回 `undefined`（不猜）。 */
+export function workbuddyCredentialExpiresAtMs(credential: WorkbuddyCredential): number | undefined {
+  return jwtExpiresAtMs(credential.accessToken)
+}
+
+/**
+ * 存储里的凭据是否已是「规范对象形态」（单层 JSON 对象且带 `uid`）。
+ *
+ * 用于唤醒时判断「是否需要归一化回写」：`false` 即历史双编码/缺 uid，
+ * 唤醒成功后写回一份规范值，**让存量账号自愈**。
+ */
+export function isCanonicalWorkbuddyCredentialJson(value: string): boolean {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return false
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false
+  const uid = (parsed as Record<string, unknown>).uid
+  return typeof uid === 'string' && uid.trim().length > 0
+}
+
+/** 凭据是否具备续期能力（有 refresh_token 才算）。 */
+export function isWorkbuddyRefreshable(credential: WorkbuddyCredential): boolean {
+  return typeof credential.refreshToken === 'string' && credential.refreshToken.length > 0
+}
+
+/** 账号池「有效期 / 可续期」回写所需的提取器（与其余 provider 共用 `syncAccountExpiry`）。 */
+export const WORKBUDDY_EXPIRY_ACCESSORS: ExpiryAccessors<WorkbuddyCredential> = {
+  expiresAtOf: workbuddyCredentialExpiresAtMs,
+  refreshableOf: isWorkbuddyRefreshable,
+  // ⚠️ `identityOf` 的语义是**凭据内容**（access token），不是 ref 名 ——
+  // 传 ref 名会恒匹配失败且静默无报错（`expiry-sync.ts` 已记录该坑）。
+  identityOf: (credential) => credential.accessToken,
+}
+
+/**
+ * 真续期：`POST /v2/plugin/auth/token/refresh`（见 {@link WORKBUDDY_TOKEN_REFRESH_PATH}）。
+ *
+ * 成功返回**合并后**的凭据：响应里的新 `accessToken` / `refreshToken` /
+ * `domain` 覆盖旧值，其余字段（`uid` / `nickname`）保留。
+ *
+ * ⚠️ **两个令牌都会被轮换**（实测），故调用方**必须**把返回值立刻落盘：
+ * 拿着旧 refresh_token 再续期会被拒，账号只能重新导入。
+ * ⚠️ 401/403 归类为 {@link WorkbuddyRefreshTokenExpiredError}（只能重新导入）；
+ * 其余失败（网络、5xx、非 JSON、信封 code!==0）如实抛错，由调用方决定是否
+ * 退化为「只探活」。
+ */
+export async function refreshWorkbuddyCredential(
+  credential: WorkbuddyCredential,
+  fetcher: typeof fetch = fetch,
+): Promise<WorkbuddyCredential> {
+  const refreshToken = credential.refreshToken
+  if (typeof refreshToken !== 'string' || refreshToken.length === 0) {
+    throw new WorkbuddyRefreshTokenExpiredError('WorkBuddy 凭据缺少 refreshToken，无法续期，请重新导入该账号')
+  }
+  const base = `https://${credential.domain ?? WORKBUDDY_DEFAULT_DOMAIN}`
+  let response: Response
+  try {
+    response = await fetcher(`${base}${WORKBUDDY_TOKEN_REFRESH_PATH}`, {
+      method: 'POST',
+      headers: workbuddyRefreshHeaders(credential),
+      body: '{}',
+      signal: AbortSignal.timeout(WORKBUDDY_REQUEST_TIMEOUT_MS),
+    })
+  } catch (error) {
+    throw new Error(
+      `WorkBuddy 续期请求失败（网络异常）：${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+  const text = await response.text()
+  if (response.status === 401 || response.status === 403) {
+    throw new WorkbuddyRefreshTokenExpiredError(
+      `WorkBuddy refresh_token 已失效（HTTP ${response.status}），请重新导入该账号`,
+    )
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error(`WorkBuddy 续期响应非 JSON（HTTP ${response.status}）`)
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error(`WorkBuddy 续期响应无法解析（HTTP ${response.status}）`)
+  }
+  const envelope = parsed as Record<string, unknown>
+  if (envelope.code !== 0) {
+    const message = typeof envelope.msg === 'string' && envelope.msg.length > 0
+      ? envelope.msg
+      : `HTTP ${response.status}，code=${String(envelope.code)}`
+    throw new Error(`WorkBuddy 续期被拒绝：${message}`)
+  }
+  const data = typeof envelope.data === 'object' && envelope.data !== null
+    ? envelope.data as Record<string, unknown>
+    : {}
+  const nextAccessToken = typeof data.accessToken === 'string' ? data.accessToken.trim() : ''
+  if (nextAccessToken.length === 0) {
+    // ⚠️ 缺访问令牌时**绝不**返回不完整凭据：那会把好凭据覆盖成空值。
+    throw new Error('WorkBuddy 续期响应缺少 accessToken，凭据未更新')
+  }
+  const nextRefreshToken = typeof data.refreshToken === 'string' && data.refreshToken.trim().length > 0
+    ? data.refreshToken.trim()
+    : refreshToken
+  return {
+    ...credential,
+    accessToken: nextAccessToken,
+    refreshToken: nextRefreshToken,
+    domain: workbuddyDomainOf(typeof data.domain === 'string' ? data.domain : credential.domain),
   }
 }
