@@ -82,6 +82,7 @@ const suites = [
   ['channel-credits-rpc', 'channel-credits-rpc-test.mjs', []],
   ['channel-credits-ui', 'channel-credits-ui-test.mjs', []],
   ['ops-runner', 'ops-runner-test.mjs', []],
+  ['channel-activity-ui', 'channel-activity-ui-test.mjs', []],
   ['channel-model-actions', 'channel-model-actions-test.mjs', []],
   ['channel-login', 'channel-login-test.mjs', []],
   ['open-external', 'open-external-test.mjs', []],
