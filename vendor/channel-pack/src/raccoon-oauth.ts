@@ -231,11 +231,19 @@ export async function loginRaccoonWithSmsCode(
     fetcher,
   )
   if (envelope.code !== 0) throw envelopeError(envelope, '短信登录失败')
-  return credentialFromEnvelope(envelope)
+  return credentialFromEnvelope(envelope, 'web')
 }
 
-/** 从成功信封里取出凭据；缺 `access_token` 时抛错（不产出半截凭据）。 */
-function credentialFromEnvelope(envelope: RaccoonEnvelope): RaccoonCredential {
+/**
+ * 从成功信封里取出凭据；缺 `access_token` 时抛错（不产出半截凭据）。
+ *
+ * `source` 由调用方给出，标进 `sessionSource`（见该字段注释）—— 每日积分的
+ * 失败文案要靠它区分「今天已领」与「会话来源不对」。
+ */
+function credentialFromEnvelope(
+  envelope: RaccoonEnvelope,
+  source: 'desktop' | 'web',
+): RaccoonCredential {
   const data = envelope.data ?? {}
   const accessToken = typeof data.access_token === 'string' ? data.access_token : ''
   const refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : ''
@@ -249,14 +257,25 @@ function credentialFromEnvelope(envelope: RaccoonEnvelope): RaccoonCredential {
     refresh_token: refreshToken,
     ...expMs !== undefined ? { expires_at: String(expMs) } : {},
     ...officeIdentity.length > 0 ? { office_identity: officeIdentity } : {},
+    sessionSource: source,
   }
 }
 
 /**
- * 用授权码换取凭据（官方桌面端链路）。
+ * 用授权码换取凭据（官方桌面端链路，= **桌面端会话**）。
  *
- * 本插件**当前不走这条路**（收不到自定义协议回调），保留它是为了让
- * 「官方链路」有可单测的落点，并在将来支持自定义协议时可直接复用。
+ * ## 与「网页扫码登录」的区别（这是每日积分的门槛）
+ *
+ * | 登录方式 | 端点 | 会话来源 |
+ * |---|---|---|
+ * | 微信扫码（本插件以前唯一路径） | `login_with_qrcode_code` | 网页 |
+ * | 短信 | `login_with_sms` | 网页 |
+ * | **桌面端授权码**（本函数） | `login_with_authorization_code` | **桌面端** |
+ *
+ * 每日积分端点（`desktop/v1/login/points/grant`）只对**桌面端来源的会话**发放：
+ * 实测同一账号用网页会话调用恒 `granted:false`，而桌面端会话（官方客户端）当天
+ * 首次调用即 `granted:true` + 一条 `daily_grant` 账单（+300）。故本插件要自动
+ * 领取每日积分，必须先把该账号的凭据换成一次**桌面端会话**。
  */
 export async function exchangeRaccoonAuthorizationCode(
   product: RaccoonProduct,
@@ -275,7 +294,7 @@ export async function exchangeRaccoonAuthorizationCode(
     }
     throw envelopeError(envelope, '授权码登录失败')
   }
-  return credentialFromEnvelope(envelope)
+  return credentialFromEnvelope(envelope, 'desktop')
 }
 
 /**

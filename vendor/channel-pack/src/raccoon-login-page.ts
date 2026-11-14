@@ -199,6 +199,9 @@ async function handleRequest(
         access_token: polled.accessToken,
         refresh_token: polled.refreshToken ?? '',
         ...polled.expiresAt !== undefined ? { expires_at: polled.expiresAt } : {},
+        // 微信扫码 = **网页会话**：该端点（`login_with_qrcode_code`）发的 token
+        // 拿不到每日积分（实测）。标出来，领取失败时才能给对成因的提示。
+        sessionSource: 'web',
       }
       deps.settleOk(credential)
       writeJson(response, { status: 'success' })
@@ -305,7 +308,7 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
  *
  * 绑 `127.0.0.1` 而非 `0.0.0.0`：弹窗页只可能来自本机浏览器，不对外暴露。
  */
-function listenOnRandomPort(server: Server): Promise<number> {
+export function listenOnRandomPort(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(0, '127.0.0.1', () => {

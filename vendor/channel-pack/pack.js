@@ -47262,9 +47262,12 @@ async function claimRaccoonDailyPoints(product, credential, fetcher = fetch) {
     };
   }
   if (envelope.data?.granted !== true) {
+    if (credential.sessionSource === "desktop") {
+      return { kind: "already-claimed", message: "\u4ECA\u5929\u5DF2\u9886\u8FC7\u6BCF\u65E5\u79EF\u5206" };
+    }
     return {
       kind: "already-claimed",
-      message: "\u4ECA\u5929\u5DF2\u9886\u8FC7\uFF08\u8BE5\u7AEF\u70B9\u5BF9\u6CA1\u5728\u5546\u6C64\u684C\u9762\u7AEF\u767B\u5F55\u8FC7\u7684\u8D26\u53F7\u4E0D\u53D1\u6BCF\u65E5\u79EF\u5206\uFF09"
+      message: credential.sessionSource === "web" ? "\u672C\u6B21\u672A\u53D1\u653E\uFF1A\u8BE5\u8D26\u53F7\u7684\u51ED\u636E\u662F\u7F51\u9875\u626B\u7801\u4F1A\u8BDD\uFF0C\u5546\u6C64\u7684\u6BCF\u65E5\u79EF\u5206\u53EA\u53D1\u7ED9\u684C\u9762\u7AEF\u4F1A\u8BDD \u2014\u2014 \u8BF7\u5728\u8D26\u53F7\u884C\u70B9\u4E00\u6B21\u300C\u684C\u9762\u7AEF\u6388\u6743\u300D\u5207\u6362\u4F1A\u8BDD\u6765\u6E90" : "\u672C\u6B21\u672A\u53D1\u653E\uFF1A\u8BE5\u51ED\u636E\u4E0D\u662F\u684C\u9762\u7AEF\u6388\u6743\u7801\u6362\u6765\u7684\u4F1A\u8BDD\uFF08\u591A\u534A\u662F\u5FAE\u4FE1\u626B\u7801\uFF09\uFF0C\u6BCF\u65E5\u79EF\u5206\u53EA\u53D1\u7ED9\u684C\u9762\u7AEF\u4F1A\u8BDD \u2014\u2014 \u8BF7\u5728\u8D26\u53F7\u884C\u70B9\u4E00\u6B21\u300C\u684C\u9762\u7AEF\u6388\u6743\u300D"
     };
   }
   const points = grantedPopupPoints(envelope.data) ?? RACCOON_DAILY_GRANT_POINTS;
@@ -47403,9 +47406,9 @@ async function loginRaccoonWithSmsCode(product, phone, smsCode, fetcher = fetch)
     fetcher
   );
   if (envelope.code !== 0) throw envelopeError(envelope, "\u77ED\u4FE1\u767B\u5F55\u5931\u8D25");
-  return credentialFromEnvelope(envelope);
+  return credentialFromEnvelope(envelope, "web");
 }
-function credentialFromEnvelope(envelope) {
+function credentialFromEnvelope(envelope, source) {
   const data = envelope.data ?? {};
   const accessToken = typeof data.access_token === "string" ? data.access_token : "";
   const refreshToken = typeof data.refresh_token === "string" ? data.refresh_token : "";
@@ -47418,8 +47421,23 @@ function credentialFromEnvelope(envelope) {
     access_token: accessToken,
     refresh_token: refreshToken,
     ...expMs !== void 0 ? { expires_at: String(expMs) } : {},
-    ...officeIdentity.length > 0 ? { office_identity: officeIdentity } : {}
+    ...officeIdentity.length > 0 ? { office_identity: officeIdentity } : {},
+    sessionSource: source
   };
+}
+async function exchangeRaccoonAuthorizationCode(product, authorizationCode, fetcher = fetch) {
+  const { envelope } = await postJson(
+    `${product.apiBase}${product.authApiPrefix}/login_with_authorization_code`,
+    { authorization_code: authorizationCode },
+    fetcher
+  );
+  if (envelope.code !== 0) {
+    if (envelope.code === 200035) {
+      throw new Error("raccoon: \u6388\u6743\u7801\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u767B\u5F55");
+    }
+    throw envelopeError(envelope, "\u6388\u6743\u7801\u767B\u5F55\u5931\u8D25");
+  }
+  return credentialFromEnvelope(envelope, "desktop");
 }
 async function refreshRaccoonCredential(product, credential, fetcher = fetch) {
   const { envelope, status } = await postJson(
@@ -47938,7 +47956,10 @@ async function handleRequest2(request, response, deps) {
       const credential = {
         access_token: polled.accessToken,
         refresh_token: polled.refreshToken ?? "",
-        ...polled.expiresAt !== void 0 ? { expires_at: polled.expiresAt } : {}
+        ...polled.expiresAt !== void 0 ? { expires_at: polled.expiresAt } : {},
+        // 微信扫码 = **网页会话**：该端点（`login_with_qrcode_code`）发的 token
+        // 拿不到每日积分（实测）。标出来，领取失败时才能给对成因的提示。
+        sessionSource: "web"
       };
       deps.settleOk(credential);
       writeJson2(response, { status: "success" });
@@ -48259,7 +48280,164 @@ function renderRaccoonLoginPage(product, qrCode) {
 </html>`;
 }
 
+// vendor/channel-pack/src/raccoon-desktop-login.ts
+import { createServer as createServer5 } from "node:http";
+import { randomBytes as randomBytes7 } from "node:crypto";
+var RACCOON_DESKTOP_CALLBACK_PATH = "/auth/callback";
+var RACCOON_DESKTOP_APP_NAME = "\u529E\u516C\u5C0F\u6D63\u718A\u5BA2\u6237\u7AEF";
+function buildRaccoonDesktopAuthorizeUrl(options) {
+  const origin = options.siteOrigin ?? RACCOON.apiBase;
+  const params = new URLSearchParams({
+    login_source: "desktop",
+    appname: RACCOON_DESKTOP_APP_NAME,
+    desktop_callback: "loopback",
+    redirect: `http://127.0.0.1:${String(options.port)}${RACCOON_DESKTOP_CALLBACK_PATH}`,
+    state: options.state
+  });
+  if (options.lang !== void 0 && options.lang.length > 0) params.set("lang", options.lang);
+  return `${origin}/authorize?${params.toString()}`;
+}
+function isRaccoonDesktopCallbackPort(port) {
+  return Number.isInteger(port) && port >= 1024 && port <= 65535 && /^[1-9][0-9]{3,4}$/.test(String(port));
+}
+function generateRaccoonDesktopState() {
+  return randomBytes7(32).toString("hex");
+}
+function callbackPageHtml(ok, message) {
+  return `<!DOCTYPE html><html lang="zh-CN"><meta charset="utf-8">
+<title>${ok ? "\u6388\u6743\u5B8C\u6210" : "\u6388\u6743\u672A\u5B8C\u6210"}</title>
+<body style="font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;background:#f5f6f8;color:#1f2329;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+<div style="background:#fff;border-radius:12px;padding:22px 26px;max-width:420px;box-shadow:0 4px 24px rgba(0,0,0,.08)">
+<h1 style="font-size:16px;margin:0 0 8px">${ok ? "\u684C\u9762\u7AEF\u6388\u6743\u5B8C\u6210" : "\u684C\u9762\u7AEF\u6388\u6743\u672A\u5B8C\u6210"}</h1>
+<p style="font-size:13px;line-height:1.6;margin:0;color:#4e5969">${message}</p>
+</div></body></html>`;
+}
+async function startRaccoonDesktopLogin(options = {}) {
+  const product = options.product ?? RACCOON;
+  const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? RACCOON_LOGIN_TIMEOUT_MS;
+  let resolveResult;
+  let rejectResult;
+  const result = new Promise((resolve2, reject) => {
+    resolveResult = resolve2;
+    rejectResult = reject;
+  });
+  result.catch(() => {
+  });
+  let settled = false;
+  let timer;
+  const settleOk = (value) => {
+    if (settled) return;
+    settled = true;
+    if (timer !== void 0) clearTimeout(timer);
+    resolveResult(value);
+  };
+  const settleErr = (error) => {
+    if (settled) return;
+    settled = true;
+    if (timer !== void 0) clearTimeout(timer);
+    rejectResult(error);
+  };
+  const state = generateRaccoonDesktopState();
+  const server = createServer5((request, response) => {
+    void handleCallback(request, response, { product, fetcher, state, settleOk, settleErr }).catch(
+      (error) => {
+        try {
+          response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" }).end(`\u5185\u90E8\u9519\u8BEF\uFF1A${error instanceof Error ? error.message : String(error)}`);
+        } catch {
+        }
+      }
+    );
+  });
+  const port = await listenOnRandomPort3(server);
+  if (!isRaccoonDesktopCallbackPort(port)) {
+    await new Promise((resolve2) => {
+      server.close(() => {
+        resolve2();
+      });
+    });
+    throw new Error(`raccoon: \u56DE\u73AF\u7AEF\u53E3 ${String(port)} \u4E0D\u7B26\u5408\u5B98\u65B9\u56DE\u8C03\u6821\u9A8C\uFF08\u9700 1024\u201365535 \u4E14 4\u20135 \u4F4D\uFF09`);
+  }
+  const authorizeUrl = buildRaccoonDesktopAuthorizeUrl({
+    port,
+    state,
+    ...options.siteOrigin === void 0 ? {} : { siteOrigin: options.siteOrigin },
+    ...options.lang === void 0 ? {} : { lang: options.lang }
+  });
+  const close = async () => {
+    if (timer !== void 0) clearTimeout(timer);
+    await new Promise((resolve2) => {
+      server.close(() => {
+        resolve2();
+      });
+      server.closeAllConnections?.();
+    });
+  };
+  timer = setTimeout(() => {
+    settleErr(new Error("raccoon: \u684C\u9762\u7AEF\u6388\u6743\u8D85\u65F6\uFF08\u672A\u5B8C\u6210\u6ED1\u5757\u6216\u672A\u56DE\u5230\u672C\u9875\uFF09"));
+    void close();
+  }, timeoutMs);
+  timer.unref?.();
+  result.then(() => {
+    void close();
+  }, () => {
+    void close();
+  });
+  return { loginUrl: authorizeUrl, result, close };
+}
+async function handleCallback(request, response, deps) {
+  const localPort = request.socket.localPort ?? 0;
+  const url = new URL(request.url ?? "/", `http://127.0.0.1:${localPort}`);
+  if (url.pathname !== RACCOON_DESKTOP_CALLBACK_PATH) {
+    response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" }).end("Not found");
+    return;
+  }
+  const state = url.searchParams.get("state") ?? "";
+  if (state.length === 0 || state !== deps.state) {
+    response.writeHead(400, { "Content-Type": "text/html; charset=utf-8" }).end(callbackPageHtml(false, "\u56DE\u8C03\u7684 state \u4E0E\u672C\u6B21\u6388\u6743\u4E0D\u5339\u914D\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u684C\u9762\u7AEF\u6388\u6743\u3002"));
+    return;
+  }
+  const code = (url.searchParams.get("code") ?? url.searchParams.get("authorization_code") ?? "").trim();
+  if (code.length === 0 || code.length > 4096) {
+    response.writeHead(400, { "Content-Type": "text/html; charset=utf-8" }).end(callbackPageHtml(false, "\u56DE\u8C03\u91CC\u6CA1\u6709\u6388\u6743\u7801\uFF0C\u8BF7\u5728\u6388\u6743\u9875\u91CD\u65B0\u786E\u8BA4\u4E00\u6B21\u3002"));
+    return;
+  }
+  try {
+    const credential = await exchangeRaccoonAuthorizationCode(deps.product, code, deps.fetcher);
+    deps.settleOk(credential);
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(callbackPageHtml(true, "\u5DF2\u5207\u6362\u5230\u684C\u9762\u7AEF\u4F1A\u8BDD\uFF0C\u53EF\u4EE5\u5173\u95ED\u8FD9\u4E2A\u6807\u7B7E\u9875\u56DE\u5230 OFM\u3002"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    deps.settleErr(error);
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(callbackPageHtml(false, `\u6362\u53D6\u684C\u9762\u7AEF\u4F1A\u8BDD\u5931\u8D25\uFF1A${message}`));
+  }
+}
+
 // vendor/channel-pack/src/raccoon-auth.ts
+function raccoonDesktopIdentityMismatch(previous, next) {
+  const subOf = (token) => {
+    try {
+      const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+      const sub = payload?.sub;
+      return typeof sub === "string" ? sub : "";
+    } catch {
+      return "";
+    }
+  };
+  const checks = [
+    { before: subOf(previous.access_token ?? ""), after: subOf(next.access_token ?? "") },
+    { before: previous.user_id ?? "", after: next.user_id ?? "" },
+    { before: previous.phone ?? "", after: next.phone ?? "" }
+  ];
+  const comparable = checks.filter((row) => row.before.length > 0 && row.after.length > 0);
+  if (comparable.some((row) => row.before === row.after)) return void 0;
+  if (comparable.length === 0) {
+    return "\u65E0\u6CD5\u6838\u5BF9\u6388\u6743\u8D26\u53F7\u7684\u8EAB\u4EFD\uFF08\u4E24\u4FA7\u90FD\u7F3A\u5C11\u53EF\u6BD4\u5BF9\u7684\u6807\u8BC6\uFF09\uFF0C\u8BF7\u786E\u8BA4\u6D4F\u89C8\u5668\u91CC\u767B\u5F55\u7684\u662F\u540C\u4E00\u4E2A\u5546\u6C64\u8D26\u53F7";
+  }
+  const first = comparable[0];
+  return `\u6388\u6743\u9875\u7684\u8D26\u53F7\u662F ${first.after.slice(0, 12)}\uFF0C\u800C\u672C\u8D26\u53F7\u662F ${first.before.slice(0, 12)}`;
+}
 var RACCOON_EXPIRY_ACCESSORS = {
   expiresAtOf: raccoonCredentialExpiresAtMs,
   refreshableOf: isRaccoonRefreshable,
@@ -48586,6 +48764,78 @@ var RaccoonAuth = class extends Service6 {
     return claimRaccoonLoginReward(this.product, credential, this.fetchImpl);
   }
   /**
+   * 启动一次「桌面端授权」（把该账号的会话升级成桌面端来源）。
+   *
+   * 为什么必须升级：商汤的每日积分只对桌面端来源的会话发放
+   * （见 `raccoon-desktop-login.ts` 文件头的实测表）。
+   *
+   * 本方法**不需要**该账号的凭据 —— 走的是官方 `/authorize` 页 + 回环回调，
+   * 用户在他浏览器里已登录的账号上确认即可。凭据只在 {@link persistDesktopSession}
+   * 里用于**身份核对**。
+   */
+  async startDesktopLogin() {
+    return startRaccoonDesktopLogin({
+      product: this.product,
+      ...this.options.fetcher === void 0 ? {} : { fetcher: this.options.fetcher }
+    });
+  }
+  /**
+   * 把「桌面端授权」换来的会话落盘成该账号的凭据。
+   *
+   * ## ⚠️ 必须核对身份（真实风险，不是防御性摆设）
+   *
+   * 官方授权页认证的是**那个浏览器里登录着的账号**，与本插件选中的账号可能不是
+   * 同一个（多账号切换、或浏览器登录的是同事的号）。授权码换来的新会话会
+   * **覆盖**该账号的凭据 —— 认错人的后果是「A 的凭据变成 B 的会话」：推理照常
+   * 工作（B 也是有效账号），只有积分归属静默出错，事后极难归因。故比对
+   * `user_id` 与 `phone`，任一能对上才放行；两边都拿不到标识时**拒绝**（宁可让用户
+   * 重来一次，也不要静默换错人）。
+   *
+   * ## ⚠️ 绝不继承旧 `refresh_token`
+   *
+   * 旧凭据里的 `refresh_token` 属于**网页会话**；拿它续期会把 token 换回网页来源，
+   * 每日积分立刻又领不到（且全程无报错，只表现为「今天已领」）。故新会话的
+   * refresh_token 以服务端返回值为准，没有就留空（`refreshable:false`），到期后
+   * 由用户重新做一次桌面端授权 —— 与官方桌面端行为一致。
+   *
+   * @throws 身份不匹配 / 缺标识
+   */
+  async persistDesktopSession(session, refName, previous, accountLabel = "\u8BE5\u8D26\u53F7") {
+    let next = session;
+    if (session.user_id === void 0 || session.phone === void 0) {
+      const info = await fetchRaccoonUserInfo(this.product, session, this.fetchImpl);
+      next = {
+        ...session,
+        ...info.userId !== void 0 && session.user_id === void 0 ? { user_id: info.userId } : {},
+        ...info.nickname !== void 0 && session.nickname === void 0 ? { nickname: info.nickname } : {},
+        ...info.officeIdentity !== void 0 && session.office_identity === void 0 ? { office_identity: info.officeIdentity } : {},
+        ...info.phone !== void 0 && session.phone === void 0 ? { phone: info.phone } : {}
+      };
+    }
+    const identityMismatch = raccoonDesktopIdentityMismatch(previous, next);
+    if (identityMismatch !== void 0) {
+      throw new Error(`raccoon: \u684C\u9762\u7AEF\u6388\u6743\u7684\u8D26\u53F7\u4E0E\u300C${accountLabel}\u300D\u4E0D\u662F\u540C\u4E00\u4E2A\uFF08${identityMismatch}\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u8986\u76D6\u51ED\u636E`);
+    }
+    const stored = {
+      // 旧凭据里新会话没有的展示字段（昵称等）作为兜底；token 类字段一律取新会话
+      ...previous,
+      ...next,
+      access_token: next.access_token,
+      refresh_token: next.refresh_token ?? "",
+      expires_at: next.expires_at ?? "",
+      // 每日积分的失败文案要靠这个标记区分「今天已领」与「会话来源不对」
+      sessionSource: "desktop"
+    };
+    const ref = credentialRef7(refName);
+    await this.ctx.credentials.set(ref, JSON.stringify(stored));
+    return {
+      access: JSON.stringify(stored),
+      expires: decodeJwtExpMs(stored.access_token) ?? 0,
+      ref,
+      refreshable: isRaccoonRefreshable(stored)
+    };
+  }
+  /**
    * 领取「每日积分」（`dailyCheckin` 能力）。
    *
    * 与官方桌面端启动时打的**同一个**端点（`login/points/grant`），见
@@ -48842,7 +49092,7 @@ import { Service as Service7 } from "@deepseek-ai/cordis";
 // vendor/channel-pack/src/zcode-captcha.ts
 import { spawn as spawn2, spawnSync } from "node:child_process";
 import { existsSync as existsSync6, mkdtempSync, rmSync, writeFileSync as writeFileSync6 } from "node:fs";
-import { createServer as createServer5 } from "node:net";
+import { createServer as createServer6 } from "node:net";
 import { homedir as homedir2, tmpdir } from "node:os";
 import { basename, isAbsolute, join as join6, posix } from "node:path";
 var ZCODE_CAPTCHA_FALLBACK = {
@@ -49189,7 +49439,7 @@ async function pickFreePort() {
 }
 function isPortFree(port) {
   return new Promise((resolve2) => {
-    const server = createServer5();
+    const server = createServer6();
     server.once("error", () => resolve2(false));
     server.once("listening", () => {
       server.close(() => resolve2(true));
@@ -50622,7 +50872,7 @@ var SerialQueue = class {
 };
 
 // vendor/channel-pack/src/zcode-login.ts
-import { randomBytes as randomBytes7, randomUUID as randomUUID8 } from "node:crypto";
+import { randomBytes as randomBytes8, randomUUID as randomUUID8 } from "node:crypto";
 var ZCODE_ORIGIN = "https://zcode.z.ai";
 var ZCODE_OAUTH_CLI_INIT_URL = `${ZCODE_ORIGIN}/api/v1/oauth/cli/init`;
 var zcodeOauthCliPollUrl = (flowId) => `${ZCODE_ORIGIN}/api/v1/oauth/cli/poll/${encodeURIComponent(flowId)}`;
@@ -50635,7 +50885,7 @@ var ZcodeLoginError = class extends Error {
   }
 };
 function generateFlowSecret() {
-  return randomBytes7(32).toString("hex");
+  return randomBytes8(32).toString("hex");
 }
 function generateDeviceMid() {
   return randomUUID8();
@@ -54813,7 +55063,7 @@ async function fetchMinimaxCreditBalance(credential, fetcher = fetch, product = 
 }
 
 // vendor/channel-pack/src/gemini.ts
-import { randomBytes as randomBytes8 } from "node:crypto";
+import { randomBytes as randomBytes9 } from "node:crypto";
 import { LlmError as LlmError14, ReasoningEffortId as ReasoningEffortId8 } from "@deepseek-ai/dsh-llm";
 var GEMINI_ENDPOINT_DAILY = "https://daily-cloudcode-pa.googleapis.com";
 var GEMINI_ENDPOINT_SANDBOX = "https://daily-cloudcode-pa.sandbox.googleapis.com";
@@ -54924,7 +55174,7 @@ function marshalAlphabetical(value) {
   return sortedStringify(value);
 }
 function newGeminiRequestId(nowMs = Date.now()) {
-  return `agent/${nowMs}/${randomBytes8(4).toString("hex")}`;
+  return `agent/${nowMs}/${randomBytes9(4).toString("hex")}`;
 }
 var GEMINI_UPSTREAM_FLASH = "gemini-3.8-flash";
 var GEMINI_BUDGET_LOW = 1e3;
@@ -57579,7 +57829,7 @@ async function importBackup(credentials, pool, raw) {
 
 // vendor/channel-pack/src/opencode-rpc.ts
 import { credentialRef as credentialRef10 } from "@deepseek-ai/dsh-credentials";
-import { randomBytes as randomBytes9 } from "node:crypto";
+import { randomBytes as randomBytes10 } from "node:crypto";
 
 // vendor/channel-pack/src/opencode-proxy.ts
 var import_undici = __toESM(require_undici(), 1);
@@ -57791,8 +58041,8 @@ async function handleOpencodeRpc(ctx, pool, method, payload) {
       }
       case "opencode.addAnonymous": {
         const req = call.payload;
-        const id = `${OPENCODE.id}-anon-${randomBytes9(3).toString("hex")}`;
-        const refName = `OPENCODE_ANON_${randomBytes9(4).toString("hex").toUpperCase()}`;
+        const id = `${OPENCODE.id}-anon-${randomBytes10(3).toString("hex")}`;
+        const refName = `OPENCODE_ANON_${randomBytes10(4).toString("hex").toUpperCase()}`;
         const count2 = pool.listAccountsByProvider(OPENCODE.id).filter((a) => a.id.startsWith(`${OPENCODE.id}-anon-`)).length;
         const nickname = typeof req?.nickname === "string" && req.nickname.trim().length > 0 ? req.nickname.trim() : `\u533F\u540D\u901A\u9053 ${count2 + 1}`;
         await ctx.credentials.set(credentialRef10(refName), JSON.stringify({
@@ -58908,6 +59158,9 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
   };
   const pendingSmsMsgid = /* @__PURE__ */ new Map();
   const pendingLoginFailures = /* @__PURE__ */ new Map();
+  const pendingDesktopLogin = /* @__PURE__ */ new Map();
+  const desktopLoginCompleted = /* @__PURE__ */ new Set();
+  const pendingDesktopLoginFailures = /* @__PURE__ */ new Map();
   const badgePreferences = createBadgePreferenceStore(ctx);
   const opsJournal = createOpsJournalStore(ctx);
   function checkinOutcomeOf(row) {
@@ -59662,6 +59915,114 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
           if (!isUsableZcodeCredential(parsed)) return { ok: true, value: { done: false } };
         }
         return { ok: true, value: { done: true, success: true } };
+      }
+      /**
+       * 「桌面端授权」启动（仅 raccoon，**已有账号**升级会话来源）。
+       *
+       * ## 为什么需要这一步
+       *
+       * 商汤的**每日积分**只对桌面端来源的会话发放（实测：网页会话打
+       * `desktop/v1/login/points/grant` 恒 `granted:false`；桌面端会话当天首次
+       * 即 `granted:true` + `daily_grant` +300）。本插件的 raccoon 账号全部来自
+       * 微信扫码 = 网页会话 ⇒ 永远领不到。完整取证与三条登录路径的对照表见
+       * `src/raccoon-desktop-login.ts` 文件头。
+       *
+       * ## 为什么走官方页面而不是自己复刻滑块
+       *
+       * 逆向发现官方 `/authorize` 原生支持 `desktop_callback=loopback`：把一次性
+       * code 投递到 `http://127.0.0.1:<port>/auth/callback`（校验 4–5 位端口 +
+       * 64 位 hex `state`）。于是宿主侧起一个回环服务器收 code 换 token，滑块
+       * 留在商汤自己的域名下跑 —— 风控、域绑定、阿里云配置都不用我们复制。
+       *
+       * ## ⚠️ 两段式契约
+       *
+       * 立即返回 `loginUrl`（值是**商汤官方** `/authorize` 页 —— 与 `account.create`
+       * 的 `loginUrl` 同名字段，客户端那段「打开登录页 + 轮询」两边共用），流程在
+       * 后台跑；前端用 `account.desktopLoginPoll` 轮询。成功后**替换**该账号的
+       * 凭据（同一 `credentialRef`）：旧 `refresh_token` 绝不继承（属网页会话，
+       * 用它续期会把来源换回去），且落盘前必须核对身份 —— 见 `persistDesktopSession`。
+       */
+      case "account.desktopLogin": {
+        const req = payload;
+        const account2 = pool.findAccount(req.accountId);
+        if (account2 === void 0) {
+          return { ok: false, error: { code: "bad-request", message: "\u8D26\u53F7\u4E0D\u5B58\u5728" } };
+        }
+        if (account2.provider !== RACCOON.id) {
+          return { ok: false, error: { code: "bad-request", message: `\u684C\u9762\u7AEF\u6388\u6743\u4EC5\u652F\u6301 ${RACCOON.id}` } };
+        }
+        const resolved2 = await ctx.credentials.resolve(credentialRef11(account2.credentialRef));
+        if (!resolved2) {
+          return { ok: false, error: { code: "bad-request", message: "\u51ED\u636E\u672A\u914D\u7F6E\uFF0C\u8BF7\u5148\u767B\u5F55\u8BE5\u8D26\u53F7" } };
+        }
+        let previous;
+        try {
+          previous = JSON.parse(resolved2.value);
+        } catch {
+          return { ok: false, error: { code: "bad-request", message: "\u51ED\u636E\u89E3\u6790\u5931\u8D25" } };
+        }
+        const running2 = pendingDesktopLogin.get(req.accountId);
+        if (running2 !== void 0) {
+          return { ok: true, value: { accountId: req.accountId, loginUrl: running2.loginUrl } };
+        }
+        pendingDesktopLoginFailures.delete(req.accountId);
+        desktopLoginCompleted.delete(req.accountId);
+        let started;
+        try {
+          started = await raccoon.startDesktopLogin();
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return { ok: false, error: { code: "bad-request", message: `\u65E0\u6CD5\u542F\u52A8\u684C\u9762\u7AEF\u6388\u6743\uFF1A${reason}` } };
+        }
+        pendingDesktopLogin.set(req.accountId, started);
+        started.result.then(async (session) => {
+          try {
+            const result = await raccoon.persistDesktopSession(
+              session,
+              account2.credentialRef,
+              previous,
+              account2.nickname ?? account2.id
+            );
+            await pool.updateAccount(account2.id, {
+              expiresAt: result.expires > 0 ? result.expires : void 0,
+              // 桌面端会话可能不带 refresh_token（官方靠重新授权）；有就用，
+              // 没有就如实 false —— 续期定时器据此决定跳过还是尝试。
+              refreshable: result.refreshable
+            });
+            desktopLoginCompleted.add(account2.id);
+          } catch (error) {
+            ctx.logger.warn(`[channel-pack] raccoon desktop login persist failed for ${account2.id}: ${String(error)}`);
+            pendingDesktopLoginFailures.set(account2.id, `\u684C\u9762\u7AEF\u4F1A\u8BDD\u5DF2\u6362\u53D6\u4F46\u672A\u80FD\u843D\u76D8\uFF1A${String(error)}`);
+          } finally {
+            pendingDesktopLogin.delete(account2.id);
+          }
+        }).catch((error) => {
+          pendingDesktopLogin.delete(account2.id);
+          const reason = error instanceof Error ? error.message : String(error);
+          ctx.logger.info(`[channel-pack] raccoon desktop login aborted for ${account2.id}: ${reason}`);
+          pendingDesktopLoginFailures.set(account2.id, reason.slice(0, 500));
+        });
+        return { ok: true, value: { accountId: req.accountId, loginUrl: started.loginUrl } };
+      }
+      /**
+       * 轮询「桌面端授权」结果（与 `login.poll` 同形：`done:false` = 仍在等用户）。
+       *
+       * ⚠️ 判据**只能用内存状态表**，不能用「凭据能否解析」：升级前该账号本来就
+       * 有一份能解析的网页会话凭据，那样判会**立刻**报成功（用户在滑块上还没动），
+       * 界面提示「已切换」但每日积分照样领不到 —— 与 `login.poll` 当年靠
+       * 「占位条目 + 凭据形状」踩过的同类静默假成功一致。
+       */
+      case "account.desktopLoginPoll": {
+        const req = payload;
+        const failure = pendingDesktopLoginFailures.get(req.accountId);
+        if (failure !== void 0) {
+          pendingDesktopLoginFailures.delete(req.accountId);
+          return { ok: true, value: { done: true, success: false, error: failure } };
+        }
+        if (desktopLoginCompleted.delete(req.accountId)) {
+          return { ok: true, value: { done: true, success: true } };
+        }
+        return { ok: true, value: { done: false } };
       }
       /**
        * 下发短信验证码（**仅 Loomy，备用登录路径**）。
@@ -61367,14 +61728,14 @@ function reply(rpcId, result) {
 }
 
 // vendor/channel-pack/src/openai-gateway/server.ts
-import { createServer as createServer6 } from "node:http";
+import { createServer as createServer7 } from "node:http";
 import { randomUUID as randomUUID12 } from "node:crypto";
 import { homedir as homedir4 } from "node:os";
 import { join as join12 } from "node:path";
 
 // vendor/channel-pack/src/openai-gateway/auth.ts
 import { mkdirSync as mkdirSync9, readFileSync as readFileSync11, renameSync as renameSync9, writeFileSync as writeFileSync10, existsSync as existsSync11 } from "node:fs";
-import { randomBytes as randomBytes10 } from "node:crypto";
+import { randomBytes as randomBytes11 } from "node:crypto";
 import { join as join11 } from "node:path";
 var KEY_FILE = "api-key";
 var KEY_PATTERN2 = /^[A-Za-z0-9_-]{43}$/;
@@ -61394,7 +61755,7 @@ function loadOrCreateApiKey(home, env = process.env) {
       `\u7F51\u5173\u5BC6\u94A5\u6587\u4EF6\u5185\u5BB9\u5F02\u5E38\uFF08\u4E0D\u662F\u672C\u63D2\u4EF6\u751F\u6210\u7684\u5F62\u6001\uFF09\uFF1A${path2}\u3002\u53EF\u80FD\u662F\u88AB\u624B\u5DE5\u7F16\u8F91\u6216\u88AB\u5176\u5B83\u7A0B\u5E8F\u6539\u5199\uFF1B\u672C\u63D2\u4EF6\u4E0D\u4F1A\u9759\u9ED8\u66F4\u6362\u5B83\uFF0C\u5426\u5219\u5DF2\u914D\u7F6E\u7684\u5BA2\u6237\u7AEF\u4F1A\u5168\u90E8\u5931\u6548\u3002\u5982\u9700\u66F4\u6362\uFF1A\u5220\u9664\u8BE5\u6587\u4EF6\u540E\u91CD\u542F DSH\uFF08\u4F1A\u91CD\u65B0\u751F\u6210\uFF09\uFF0C\u6216\u6539\u7528 DSH_OPENAI_GATEWAY_API_KEY \u73AF\u5883\u53D8\u91CF\u3002`
     );
   }
-  const key = randomBytes10(32).toString("base64url");
+  const key = randomBytes11(32).toString("base64url");
   mkdirSync9(directory, { recursive: true });
   const temporary = `${path2}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync10(temporary, key, { encoding: "utf8", mode: 384 });
@@ -63035,7 +63396,7 @@ function createOpenAiGateway(options) {
   return {
     async start() {
       if (server !== void 0) return;
-      const current = createServer6(requestHandler);
+      const current = createServer7(requestHandler);
       server = current;
       await new Promise((resolve2, reject) => {
         const onError = (error) => {
@@ -63552,7 +63913,7 @@ import { Service as Service8 } from "@deepseek-ai/cordis";
 import { credentialRef as credentialRef12 } from "@deepseek-ai/dsh-credentials";
 
 // vendor/channel-pack/src/minimax-oauth.ts
-import { createHash as createHash7, randomBytes as randomBytes11 } from "node:crypto";
+import { createHash as createHash7, randomBytes as randomBytes12 } from "node:crypto";
 var MinimaxLoginCancelledError = class extends Error {
   constructor(message = "\u7528\u6237\u53D6\u6D88\u4E86 MiniMax \u6388\u6743") {
     super(message);
@@ -63651,7 +64012,7 @@ function parseMinimaxTokenGrant(payload, previousRefreshToken, product = MINIMAX
   };
 }
 function createMinimaxPkce() {
-  const codeVerifier = randomBytes11(32).toString("base64url");
+  const codeVerifier = randomBytes12(32).toString("base64url");
   const codeChallenge = createHash7("sha256").update(codeVerifier, "ascii").digest("base64url");
   return { codeVerifier, codeChallenge };
 }
@@ -64783,8 +65144,8 @@ function createChannelFetch(options = {}) {
 }
 
 // vendor/channel-pack/src/gemini-oauth.ts
-import { createServer as createServer7 } from "node:http";
-import { randomBytes as randomBytes12 } from "node:crypto";
+import { createServer as createServer8 } from "node:http";
+import { randomBytes as randomBytes13 } from "node:crypto";
 var GEMINI_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 var GEMINI_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 var GEMINI_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo";
@@ -64985,7 +65346,7 @@ async function fetchGeminiUserInfo(accessToken, options = {}) {
 var GEMINI_CALLBACK_HTML = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>\u6388\u6743\u5B8C\u6210</title><style>body{font:15px/1.7 -apple-system,"Segoe UI",sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f1115;color:#e6e8eb}.b{text-align:center}.k{font-size:34px;margin-bottom:8px}</style></head><body><div class="b"><div class="k">\u2713</div><div>\u6388\u6743\u5DF2\u5B8C\u6210\uFF0C\u53EF\u4EE5\u5173\u95ED\u6B64\u9875\u56DE\u5230\u9762\u677F\u3002</div></div></body></html>`;
 function pickFreePort2() {
   return new Promise((resolve2, reject) => {
-    const probe = createServer7();
+    const probe = createServer8();
     probe.once("error", reject);
     probe.listen(0, "127.0.0.1", () => {
       const address = probe.address();
@@ -64999,7 +65360,7 @@ function pickFreePort2() {
 }
 async function listenCallback(handler, preferredPort) {
   const attempt = (port) => {
-    const primary = createServer7(handler);
+    const primary = createServer8(handler);
     return new Promise((resolve2, reject) => {
       primary.once("error", (error) => {
         if (error.code === "EADDRINUSE" && port !== 0) {
@@ -65011,7 +65372,7 @@ async function listenCallback(handler, preferredPort) {
       primary.listen(port, "127.0.0.1", () => {
         const address = primary.address();
         const assigned = typeof address === "object" && address !== null ? address.port : 0;
-        const secondary = createServer7(handler);
+        const secondary = createServer8(handler);
         secondary.once("error", () => {
           resolve2({ port: assigned, servers: [primary] });
         });
@@ -65024,7 +65385,7 @@ async function listenCallback(handler, preferredPort) {
   return attempt(preferredPort);
 }
 async function startGeminiOAuthFlow(options = {}) {
-  const state = randomBytes12(16).toString("hex");
+  const state = randomBytes13(16).toString("hex");
   let resolveCode = () => {
   };
   let rejectCode = () => {

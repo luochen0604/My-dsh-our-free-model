@@ -48,6 +48,7 @@ import type { ZcodeBalanceResult } from './zcode-upstream.js'
 import { ZCODE_LOGIN_PROVIDER, type ZcodeLoginProvider } from './zcode-login.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
+import type { StartedRaccoonDesktopLoginFlow } from './raccoon-desktop-login.js'
 import { MINIMAX } from './minimax-product.js'
 import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
 import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
@@ -151,6 +152,10 @@ import type {
   RpcCreateAccountResponse,
   RpcPollLoginRequest,
   RpcPollLoginResponse,
+  RpcDesktopLoginRequest,
+  RpcDesktopLoginResponse,
+  RpcDesktopLoginPollRequest,
+  RpcDesktopLoginPollResponse,
   RpcUpdateAccountRequest,
   RpcDeleteAccountRequest,
   RpcReorderAccountsRequest,
@@ -1009,6 +1014,18 @@ function registerChannelPackEndpoints(
    * 而不是继续等待十分钟直到超时。
    */
   const pendingLoginFailures = new Map<string, string>()
+
+  /**
+   * raccoon「桌面端授权」流程的中间状态（账号 id → 流程句柄 / 已完成集合）。
+   *
+   * 与 `pendingSmsMsgid` 同理：都是**一次性中间态**，放内存不写凭据存储。
+   * `desktopLoginCompleted` 存在的意义是让轮询能报「成功」，而**不能**用
+   * 「凭据能否解析」当成功判据（升级前就有一份能解析的网页会话凭据）。
+   * 集合上限天然受账号数约束（每个 id 被 poll 消费一次即删除）。
+   */
+  const pendingDesktopLogin = new Map<string, StartedRaccoonDesktopLoginFlow>()
+  const desktopLoginCompleted = new Set<string>()
+  const pendingDesktopLoginFailures = new Map<string, string>()
 
   /**
    * 用量徽标的显示偏好（`$DSH_HOME/channel-pack/ui-preferences.json`）。
@@ -2227,6 +2244,115 @@ if (provider === LOBSTERAI.id) {
           if (!isUsableZcodeCredential(parsed)) return { ok: true, value: { done: false } }
         }
         return { ok: true, value: { done: true, success: true } }
+      }
+
+       /**
+        * 「桌面端授权」启动（仅 raccoon，**已有账号**升级会话来源）。
+        *
+        * ## 为什么需要这一步
+        *
+        * 商汤的**每日积分**只对桌面端来源的会话发放（实测：网页会话打
+        * `desktop/v1/login/points/grant` 恒 `granted:false`；桌面端会话当天首次
+        * 即 `granted:true` + `daily_grant` +300）。本插件的 raccoon 账号全部来自
+        * 微信扫码 = 网页会话 ⇒ 永远领不到。完整取证与三条登录路径的对照表见
+        * `src/raccoon-desktop-login.ts` 文件头。
+        *
+        * ## 为什么走官方页面而不是自己复刻滑块
+        *
+        * 逆向发现官方 `/authorize` 原生支持 `desktop_callback=loopback`：把一次性
+        * code 投递到 `http://127.0.0.1:<port>/auth/callback`（校验 4–5 位端口 +
+        * 64 位 hex `state`）。于是宿主侧起一个回环服务器收 code 换 token，滑块
+        * 留在商汤自己的域名下跑 —— 风控、域绑定、阿里云配置都不用我们复制。
+        *
+        * ## ⚠️ 两段式契约
+        *
+        * 立即返回 `loginUrl`（值是**商汤官方** `/authorize` 页 —— 与 `account.create`
+        * 的 `loginUrl` 同名字段，客户端那段「打开登录页 + 轮询」两边共用），流程在
+        * 后台跑；前端用 `account.desktopLoginPoll` 轮询。成功后**替换**该账号的
+        * 凭据（同一 `credentialRef`）：旧 `refresh_token` 绝不继承（属网页会话，
+        * 用它续期会把来源换回去），且落盘前必须核对身份 —— 见 `persistDesktopSession`。
+        */
+      case 'account.desktopLogin': {
+        const req = payload as RpcDesktopLoginRequest
+        const account = pool.findAccount(req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '账号不存在' } }
+        }
+        if (account.provider !== RACCOON.id) {
+          return { ok: false, error: { code: 'bad-request', message: `桌面端授权仅支持 ${RACCOON.id}` } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (!resolved) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据未配置，请先登录该账号' } }
+        }
+        let previous: RaccoonCredential
+        try {
+          previous = JSON.parse(resolved.value) as RaccoonCredential
+        } catch {
+          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
+        }
+        // 同一账号重复点击：复用已在跑的那一轮地址，不再起第二个回环服务器。
+        const running = pendingDesktopLogin.get(req.accountId)
+        if (running !== undefined) {
+          return { ok: true, value: { accountId: req.accountId, loginUrl: running.loginUrl } satisfies RpcDesktopLoginResponse }
+        }
+        pendingDesktopLoginFailures.delete(req.accountId)
+        desktopLoginCompleted.delete(req.accountId)
+        let started: StartedRaccoonDesktopLoginFlow
+        try {
+          started = await raccoon.startDesktopLogin()
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          return { ok: false, error: { code: 'bad-request', message: `无法启动桌面端授权：${reason}` } }
+        }
+        pendingDesktopLogin.set(req.accountId, started)
+        started.result.then(async (session) => {
+          try {
+            const result = await raccoon.persistDesktopSession(
+              session, account.credentialRef, previous, account.nickname ?? account.id,
+            )
+            await pool.updateAccount(account.id, {
+              expiresAt: result.expires > 0 ? result.expires : undefined,
+              // 桌面端会话可能不带 refresh_token（官方靠重新授权）；有就用，
+              // 没有就如实 false —— 续期定时器据此决定跳过还是尝试。
+              refreshable: result.refreshable,
+            })
+            desktopLoginCompleted.add(account.id)
+          } catch (error) {
+            ctx.logger.warn(`[channel-pack] raccoon desktop login persist failed for ${account.id}: ${String(error)}`)
+            pendingDesktopLoginFailures.set(account.id, `桌面端会话已换取但未能落盘：${String(error)}`)
+          } finally {
+            pendingDesktopLogin.delete(account.id)
+          }
+        }).catch((error: unknown) => {
+          pendingDesktopLogin.delete(account.id)
+          // 用户没完成授权/超时是常态，不当作 RPC 错误；轮询侧给可读原因。
+          const reason = error instanceof Error ? error.message : String(error)
+          ctx.logger.info(`[channel-pack] raccoon desktop login aborted for ${account.id}: ${reason}`)
+          pendingDesktopLoginFailures.set(account.id, reason.slice(0, 500))
+        })
+        return { ok: true, value: { accountId: req.accountId, loginUrl: started.loginUrl } satisfies RpcDesktopLoginResponse }
+      }
+
+      /**
+       * 轮询「桌面端授权」结果（与 `login.poll` 同形：`done:false` = 仍在等用户）。
+       *
+       * ⚠️ 判据**只能用内存状态表**，不能用「凭据能否解析」：升级前该账号本来就
+       * 有一份能解析的网页会话凭据，那样判会**立刻**报成功（用户在滑块上还没动），
+       * 界面提示「已切换」但每日积分照样领不到 —— 与 `login.poll` 当年靠
+       * 「占位条目 + 凭据形状」踩过的同类静默假成功一致。
+       */
+      case 'account.desktopLoginPoll': {
+        const req = payload as RpcDesktopLoginPollRequest
+        const failure = pendingDesktopLoginFailures.get(req.accountId)
+        if (failure !== undefined) {
+          pendingDesktopLoginFailures.delete(req.accountId)
+          return { ok: true, value: { done: true, success: false, error: failure } satisfies RpcDesktopLoginPollResponse }
+        }
+        if (desktopLoginCompleted.delete(req.accountId)) {
+          return { ok: true, value: { done: true, success: true } satisfies RpcDesktopLoginPollResponse }
+        }
+        return { ok: true, value: { done: false } satisfies RpcDesktopLoginPollResponse }
       }
 
       /**

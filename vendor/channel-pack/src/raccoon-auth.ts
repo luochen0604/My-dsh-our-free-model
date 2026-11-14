@@ -49,9 +49,52 @@ import {
   type StartedRaccoonLoginFlow,
 } from './raccoon-login-page.js'
 import {
+  startRaccoonDesktopLogin,
+  type StartedRaccoonDesktopLoginFlow,
+} from './raccoon-desktop-login.js'
+import {
   syncAccountExpiry,
   type ExpiryAccessors,
 } from './expiry-sync.js'
+
+/**
+ * 核对「桌面端授权」换来的会话与账号原有凭据是否同一个人。
+ *
+ * 返回 `undefined` = 放行；返回字符串 = 拒绝原因。
+ *
+ * 判据（任一对上即认定同人）：JWT 的 `sub`（最可靠，无需额外请求）→
+ * `user_id` → `phone`。
+ *
+ * ⚠️ 两边都取不到任何可比对标识时**拒绝**（不是放行）：本插件的凭据在
+ * `persistLogin` 阶段就会补 `user_id`/`phone`，取不到说明是手工导入或老数据，
+ * 此时静默覆盖凭据的风险（换错人）远大于让用户重试一次的代价。
+ */
+export function raccoonDesktopIdentityMismatch(
+  previous: RaccoonCredential,
+  next: RaccoonCredential,
+): string | undefined {
+  const subOf = (token: string): string => {
+    try {
+      const payload: unknown = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8'))
+      const sub = (payload as Record<string, unknown>)?.sub
+      return typeof sub === 'string' ? sub : ''
+    } catch {
+      return ''
+    }
+  }
+  const checks: Array<{ before: string; after: string }> = [
+    { before: subOf(previous.access_token ?? ''), after: subOf(next.access_token ?? '') },
+    { before: previous.user_id ?? '', after: next.user_id ?? '' },
+    { before: previous.phone ?? '', after: next.phone ?? '' },
+  ]
+  const comparable = checks.filter((row) => row.before.length > 0 && row.after.length > 0)
+  if (comparable.some((row) => row.before === row.after)) return undefined
+  if (comparable.length === 0) {
+    return '无法核对授权账号的身份（两侧都缺少可比对的标识），请确认浏览器里登录的是同一个商汤账号'
+  }
+  const first = comparable[0] as { before: string; after: string }
+  return `授权页的账号是 ${first.after.slice(0, 12)}，而本账号是 ${first.before.slice(0, 12)}`
+}
 
 /**
  * Raccoon 凭据 → 账号池有效期的提取器。
@@ -525,6 +568,87 @@ export class RaccoonAuth extends Service {
   /** 领取一次性登录奖励。 */
   async claimLoginReward(credential: RaccoonCredential): Promise<ClaimOutcome> {
     return claimRaccoonLoginReward(this.product, credential, this.fetchImpl)
+  }
+
+  /**
+   * 启动一次「桌面端授权」（把该账号的会话升级成桌面端来源）。
+   *
+   * 为什么必须升级：商汤的每日积分只对桌面端来源的会话发放
+   * （见 `raccoon-desktop-login.ts` 文件头的实测表）。
+   *
+   * 本方法**不需要**该账号的凭据 —— 走的是官方 `/authorize` 页 + 回环回调，
+   * 用户在他浏览器里已登录的账号上确认即可。凭据只在 {@link persistDesktopSession}
+   * 里用于**身份核对**。
+   */
+  async startDesktopLogin(): Promise<StartedRaccoonDesktopLoginFlow> {
+    return startRaccoonDesktopLogin({
+      product: this.product,
+      ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
+    })
+  }
+
+  /**
+   * 把「桌面端授权」换来的会话落盘成该账号的凭据。
+   *
+   * ## ⚠️ 必须核对身份（真实风险，不是防御性摆设）
+   *
+   * 官方授权页认证的是**那个浏览器里登录着的账号**，与本插件选中的账号可能不是
+   * 同一个（多账号切换、或浏览器登录的是同事的号）。授权码换来的新会话会
+   * **覆盖**该账号的凭据 —— 认错人的后果是「A 的凭据变成 B 的会话」：推理照常
+   * 工作（B 也是有效账号），只有积分归属静默出错，事后极难归因。故比对
+   * `user_id` 与 `phone`，任一能对上才放行；两边都拿不到标识时**拒绝**（宁可让用户
+   * 重来一次，也不要静默换错人）。
+   *
+   * ## ⚠️ 绝不继承旧 `refresh_token`
+   *
+   * 旧凭据里的 `refresh_token` 属于**网页会话**；拿它续期会把 token 换回网页来源，
+   * 每日积分立刻又领不到（且全程无报错，只表现为「今天已领」）。故新会话的
+   * refresh_token 以服务端返回值为准，没有就留空（`refreshable:false`），到期后
+   * 由用户重新做一次桌面端授权 —— 与官方桌面端行为一致。
+   *
+   * @throws 身份不匹配 / 缺标识
+   */
+  async persistDesktopSession(
+    session: RaccoonCredential,
+    refName: string,
+    previous: RaccoonCredential,
+    accountLabel = '该账号',
+  ): Promise<RaccoonLoginResult> {
+    // 尽力补全**新会话**的用户信息（只读），用于核对与展示。
+    let next: RaccoonCredential = session
+    if (session.user_id === undefined || session.phone === undefined) {
+      const info = await fetchRaccoonUserInfo(this.product, session, this.fetchImpl)
+      next = {
+        ...session,
+        ...info.userId !== undefined && session.user_id === undefined ? { user_id: info.userId } : {},
+        ...info.nickname !== undefined && session.nickname === undefined ? { nickname: info.nickname } : {},
+        ...info.officeIdentity !== undefined && session.office_identity === undefined
+          ? { office_identity: info.officeIdentity } : {},
+        ...info.phone !== undefined && session.phone === undefined ? { phone: info.phone } : {},
+      }
+    }
+    const identityMismatch = raccoonDesktopIdentityMismatch(previous, next)
+    if (identityMismatch !== undefined) {
+      throw new Error(`raccoon: 桌面端授权的账号与「${accountLabel}」不是同一个（${identityMismatch}），已拒绝覆盖凭据`)
+    }
+    const stored: RaccoonCredential = {
+      // 旧凭据里新会话没有的展示字段（昵称等）作为兜底；token 类字段一律取新会话
+      ...previous,
+      ...next,
+      access_token: next.access_token,
+      refresh_token: next.refresh_token ?? '',
+      expires_at: next.expires_at ?? '',
+      // 每日积分的失败文案要靠这个标记区分「今天已领」与「会话来源不对」
+      sessionSource: 'desktop',
+    }
+    const ref = credentialRef(refName)
+    await this.ctx.credentials.set(ref, JSON.stringify(stored))
+    return {
+      access: JSON.stringify(stored),
+      expires: decodeJwtExpMs(stored.access_token) ?? 0,
+      ref,
+      refreshable: isRaccoonRefreshable(stored),
+    }
   }
 
   /**

@@ -136,6 +136,21 @@ export interface RaccoonCredential {
   phone?: string
   /** 设备指纹（32 位 hex），用于 `X-Client-Device-ID`。 */
   device_id?: string
+  /**
+   * 会话来源标记（**本插件自己写的**，服务端无此字段）。
+   *
+   * ## 为什么需要它
+   *
+   * 每日积分端点对「今天不再发放」与「该会话不是桌面端来源」回的是**同一个**
+   * `granted:false`，端点本身分不出这两种。而本插件知道自己是走哪条登录路径
+   * 拿到这份凭据的：`login_with_qrcode_code` / `login_with_sms` = 网页会话，
+   * `login_with_authorization_code` = 桌面端会话。打上标记后，领取失败时才能
+   * 给出**针对成因**的提示（去做桌面端授权），而不是笼统说一句「今天已领」。
+   *
+   * ⚠️ 缺省（老凭据、手工导入）= 未知，按 `web` 处理：宁可提示用户去做一次
+   * 授权（无害、幂等），也不要在领不到时谎报「今天已领」。
+   */
+  sessionSource?: 'desktop' | 'web'
 }
 
 /**

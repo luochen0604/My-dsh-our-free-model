@@ -28,6 +28,22 @@
  * 只发一次性登录奖励。此时本模块返回 `already-claimed` 并给出可读原因，
  * 而不是谎报领取成功。
  *
+ * ⚠️ **资格判据在 token 里（会话来源），不在请求头里**（2026-11-14 实测，逐条对齐）：
+ *
+ * | 观测 | 结论 |
+ * |---|---|
+ * | 把官方桌面端头集补齐（`X-Client-Name: raccoon-work`、`X-Client-Page: local-agent`、`X-Client-Version`、含中文的桌面端 UA、`Origin: raccoon-desktop://shell`、`Sec-Fetch-*`）再用**网页扫码会话**的 token 调用 | 仍全部 `granted:false`、余额不动 ⇒ 头不是判据 |
+ * | 桌面端每次启动后 4–5 秒，**该会话**必然出现一条 `daily_grant`（本机两账号共 6 条，与 `~/.office-raccoon/logs/raccoon.log` 的 `[desktop-client] startup` 时刻一一对齐，含跨零点的 00:04:44→00:04:49） | 每日一份，按桌面会话发放 |
+ * | 网页会话做过桌面登录的那次（11-12 21:14:18 / 22:26:22，其中 22:26:22 与桌面 token 的 `iat` 22:26:21 相差 1 秒） | 发放在**桌面会话**身上 |
+ * | 同一账号的**网页** token 此后每天调用（本机 7991226：它的桌面会话 11-12/11-13/11-14 连日拿到 `daily_grant`，而它的网页 token 同期调用**恒** `granted:false`） | **资格挂在会话上，不在账号上** —— 与「该账号历史上有没有用过客户端」无关，也与「今天有没有开过客户端」无关 |
+ *
+ * ⇒ 要让「不开客户端」也能领，唯一办法是把该账号的凭据换成一次**桌面端会话**
+ * （`login_with_authorization_code`）—— 见 `raccoon-desktop-login.ts`。
+ *
+ * ⚠️ 另一处易混：一次性的 `桌面端登录奖励`（3000，`biz_type=reward_grant`）**不**受
+ * 此限制 —— 本插件用网页 token 加 `X-Client-Platform` 就能领到（本机两号各 3000
+ * 都是 OFM 领的）。只有 `daily_grant` 这条要求桌面会话。
+ *
  * ## 只读优先
  *
  * 余额查询用 `GET /points/v1/balance`（**只读**）。在「打开面板」这类
@@ -356,9 +372,11 @@ export async function claimRaccoonLoginReward(
  * ## 判据与文案
  *
  * - `granted:true` ⇒ `claimed`，额度取 popup（缺失按 300）；
- * - `granted:false` ⇒ `already-claimed`。**注意**：服务端对「从没在桌面端
- *   登录过」的账号永久回 false（实测纯扫码登录的账号不发每日积分），
- *   文案必须把这两种可能都说出来，不能让用户以为只是「今天已领」。
+ * - `granted:false` ⇒ `already-claimed`。**两种成因**（端点本身分不出）：
+ *   ① 今天确实已发过；② 该账号的会话**不是桌面端来源**（本插件以前只有
+ *   微信扫码 = 网页会话，实测网页会话调用该端点**永远** false）。
+ *   文案必须把第 ② 种的说辞与解法讲出来（账号行的「桌面端授权」按钮），
+ *   否则用户只能看到一句误导性的「今天已领」。
  * - 网络/信封失败 ⇒ `failed`（自动签到据此不记今日，下一轮会重试）。
  *
  * 本函数**不抛错**，保证批量领取不会因单个账号中断。
@@ -379,9 +397,25 @@ export async function claimRaccoonDailyPoints(
   }
 
   if (envelope.data?.granted !== true) {
+    // 两种成因端点分不出（都回 `granted:false`），用「本插件自己标的会话来源」
+    // 消歧（见 `RaccoonCredential.sessionSource`）：
+    //
+    // ⚠️ **每日积分发放的对象是「桌面端授权码登录换来的那个会话」**，判据在
+    // 服务端记录里，不在请求头 —— 实测把官方桌面端的头集（`X-Client-Name` /
+    // `X-Client-Page` / `X-Client-Version` / 中文 UA / `Origin: raccoon-desktop://shell`）
+    // 逐条补齐，用网页扫码会话的 token 调用仍然全部 `granted:false`；而同一个
+    // 账号在桌面端启动的那一秒（21:14:18 / 22:26:22 / 23:34:39 / 00:04:49）必然
+    // 出现一条 `daily_grant`。⇒ 差异只在 token 本身（会话来源）。
+    // 故网页会话是**永远**领不到每日积分的，此时那句「今天已领」会把用户
+    // 引到完全错误的方向。
+    if (credential.sessionSource === 'desktop') {
+      return { kind: 'already-claimed', message: '今天已领过每日积分' }
+    }
     return {
       kind: 'already-claimed',
-      message: '今天已领过（该端点对没在商汤桌面端登录过的账号不发每日积分）',
+      message: credential.sessionSource === 'web'
+        ? '本次未发放：该账号的凭据是网页扫码会话，商汤的每日积分只发给桌面端会话 —— 请在账号行点一次「桌面端授权」切换会话来源'
+        : '本次未发放：该凭据不是桌面端授权码换来的会话（多半是微信扫码），每日积分只发给桌面端会话 —— 请在账号行点一次「桌面端授权」',
     }
   }
 

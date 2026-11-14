@@ -550,6 +550,13 @@ window.__ModuleLoader__.load({
         'chan.claim.result': '已领取 {count} 个账号，共 {credit} 积分。',
         'chan.claim.none': '今天没有可领取的积分。',
         'chan.credit.today': '今日已领 {credit}',
+        'chan.desktop.act': '桌面端授权',
+        'chan.desktop.waiting': '已打开授权页，等待你完成滑块验证…（最长 10 分钟）',
+        'chan.desktop.open': '授权页没弹出？点此重新打开',
+        'chan.desktop.done': '已切换为桌面端会话，每日积分现在可以领取了。',
+        'chan.desktop.failed': '桌面端授权未完成：{reason}',
+        'chan.desktop.timeout': '等待超时，请重新发起授权。',
+        'chan.desktop.why': '商汤的每日积分只发给「桌面端来源」的会话；本渠道账号是微信扫码登录（网页会话），需先做一次桌面端授权。',
         'chan.model.free': '免费额度',
         'chan.model.dead': '已下架',
         'chan.model.hidden': '已隐藏',
@@ -1466,6 +1473,13 @@ window.__ModuleLoader__.load({
         'chan.claim.result': 'Claimed for {count} account(s), {credit} credits in total.',
         'chan.claim.none': 'Nothing to claim today.',
         'chan.credit.today': '{credit} claimed today',
+        'chan.desktop.act': 'Desktop session',
+        'chan.desktop.waiting': 'Authorization page opened — finish the slider there… (up to 10 minutes)',
+        'chan.desktop.open': 'Page did not open? Click to reopen it',
+        'chan.desktop.done': 'Switched to a desktop session — daily points can be claimed now.',
+        'chan.desktop.failed': 'Desktop authorization did not complete: {reason}',
+        'chan.desktop.timeout': 'Timed out — start the authorization again.',
+        'chan.desktop.why': 'SenseTime only grants daily points to desktop-originated sessions; these accounts come from WeChat QR sign-in (a web session), so one desktop authorization is needed first.',
         'chan.model.free': 'Free quota',
         'chan.model.dead': 'Retired',
         'chan.model.hidden': 'Hidden',
@@ -2236,6 +2250,7 @@ window.__ModuleLoader__.load({
 .ofm_acctname{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px}
 .ofm_acctmeta{font-size:10.5px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}
 .ofm_balanceerror{flex-basis:100%;overflow-wrap:anywhere;color:var(--dsw-alias-state-error-primary);font-size:11px}
+.ofm_desktopnote{flex-basis:100%;overflow-wrap:anywhere;color:var(--dsw-alias-label-tertiary);font-size:11px;display:flex;align-items:center;gap:4px}
 .ofm_acctacts{margin-left:auto;display:flex;gap:5px;flex-wrap:wrap}
 .ofm_modellist{display:flex;flex-direction:column;gap:4px;max-height:238px;overflow:auto;padding-right:2px}
 .ofm_modelrow{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:9px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 55%,transparent);font-size:11.5px;transition:background .15s ease}
@@ -4817,7 +4832,9 @@ window.__ModuleLoader__.load({
       loomy: { claim: true },
       // 每日积分：打的就是官方桌面端启动时那个 `login/points/grant`
       // （当天首次 granted:true +300）。状态取自账单里当天的 `daily_grant`。
-      raccoon: { claim: true, status: true },
+      // `desktop: true` ⇒ 账号行给出「桌面端授权」按钮：该端点只认桌面端来源的
+      // 会话，而本渠道账号来自微信扫码（网页会话），不先升级会话就领不到。
+      raccoon: { claim: true, status: true, desktop: true },
       minimax: { claim: true, status: true },
       zcode: { claim: true, unit: 'tokens' },
       gemini: { unit: 'quota', quota: true },
@@ -4921,6 +4938,9 @@ window.__ModuleLoader__.load({
         try { return window.localStorage?.getItem(ZCODE_PROVIDER_KEY) === 'zai' ? 'zai' : 'bigmodel' } catch { return 'bigmodel' }
       })
       const loginAttempt = useRef(null)
+      // raccoon「桌面端授权」的进行中流程（{ accountId, url, startedAt, done, success, error }）。
+      // 用状态而不是 busy：一轮要等用户点滑块（最长十分钟），不能让整张卡进入 busy。
+      const [desktopFlow, setDesktopFlow] = useState(null)
       const chooseZcodeProvider = value => {
         if (value !== 'bigmodel' && value !== 'zai') return
         setZcodeProvider(value)
@@ -5158,6 +5178,59 @@ window.__ModuleLoader__.load({
         })
       }
 
+      // raccoon：把账号的会话升级成「桌面端来源」。每日积分只发给桌面端会话，
+      // 而本插件的 raccoon 账号来自微信扫码（= 网页会话），不做这一步就领不到。
+      const startDesktopLogin = async accountId => {
+        if (desktopFlow?.accountId === accountId && desktopFlow.done !== true) return
+        setDesktopFlow({ accountId, url: '', startedAt: Date.now() })
+        try {
+          const value = await rpc('account.desktopLogin', { accountId }, 90_000)
+          // `loginUrl` 是**商汤官方**页面（我们只在本地起一个回环端口收 code）。
+          const url = value?.loginUrl
+          if (typeof url === 'string' && url !== '') {
+            let opened = false
+            try {
+              const popup = window.open(url, '_blank')
+              if (popup) { popup.opener = null; opened = true }
+            } catch { /* 交给宿主打开 */ }
+            if (!opened) {
+              try { opened = (await post('/open-external', { url }, 15_000))?.opened === true } catch { /* 手动链接仍可用 */ }
+            }
+            setDesktopFlow(current => (current?.accountId === accountId ? { ...current, url, opened } : current))
+          }
+        } catch (error) {
+          setDesktopFlow(current => (current?.accountId === accountId
+            ? { ...current, done: true, success: false, error: String(error?.message ?? error) }
+            : current))
+        }
+      }
+
+      // 轮询桌面端授权结果：成功后立刻重查积分，让用户当天就能看到那 +300。
+      useEffect(() => {
+        if (!desktopFlow || desktopFlow.done === true) return undefined
+        const flow = desktopFlow
+        const timer = setInterval(async () => {
+          if (Date.now() - flow.startedAt > 11 * 60_000) {
+            setDesktopFlow(current => (current && current.accountId === flow.accountId
+              ? { ...current, done: true, success: false, error: t('chan.desktop.timeout') }
+              : current))
+            return
+          }
+          try {
+            const value = await rpc('account.desktopLoginPoll', { accountId: flow.accountId }, 30_000)
+            if (value?.done !== true) return
+            setDesktopFlow(current => (current && current.accountId === flow.accountId
+              ? { ...current, done: true, success: value?.success === true, error: value?.error ?? '' }
+              : current))
+            onChanged()
+            await loadAccounts()
+            void loadBalances(true)
+            void loadCredits()
+          } catch { /* 下一次轮询继续 */ }
+        }, 2000)
+        return () => clearInterval(timer)
+      }, [desktopFlow, rpc, t, onChanged, loadAccounts, loadBalances, loadCredits])
+
       const claim = async () => {
         if (!creditCapability?.claim || busy !== '' || claimPending.current) return
         claimPending.current = true
@@ -5317,10 +5390,32 @@ window.__ModuleLoader__.load({
                         onChanged(); await loadAccounts()
                       }),
                     }, row.enabled === false ? t('chan.act.enable') : t('chan.act.disable')),
+                    creditCapability?.desktop === true ? h('button', {
+                      type: 'button', className: 'ofm_minibtn', disabled: busy !== '' || !rpc,
+                      title: t('chan.desktop.why'),
+                      onClick: () => void startDesktopLogin(row.id),
+                    }, t('chan.desktop.act')) : null,
                     h('button', {
                       type: 'button', className: 'ofm_minibtn danger', disabled: busy !== '' || !rpc,
                       onClick: () => void removeAccount(row.id),
-                    }, t('chan.act.delete'))))
+                    }, t('chan.act.delete'))),
+                  // 桌面端授权的进行中/结果提示（`.ofm_desktopnote` 是整行宽度，
+                  // 与 `.ofm_balanceerror` 同法，避免把账号行撑成好几屏）。
+                  creditCapability?.desktop === true && desktopFlow?.accountId === row.id
+                    ? h('p', {
+                      className: desktopFlow.done === true && desktopFlow.success !== true ? 'ofm_balanceerror' : 'ofm_desktopnote',
+                      role: 'status',
+                    },
+                    desktopFlow.done !== true
+                      ? h(Fragment, null, t('chan.desktop.waiting'), desktopFlow.url !== '' ? h('button', {
+                        type: 'button', className: 'ofm_linkbtn',
+                        onClick: () => {
+                          try { const popup = window.open(desktopFlow.url, '_blank'); if (popup) popup.opener = null } catch { /* 忽略 */ }
+                        },
+                      }, t('chan.desktop.open')) : null)
+                      : desktopFlow.success === true ? t('chan.desktop.done')
+                        : t('chan.desktop.failed').replace('{reason}', desktopFlow.error ?? ''))
+                    : null)
               }))) : null,
         open === 'models' ? h('div', { className: 'ofm_chanfold' },
           models === undefined ? h('div', { className: 'ofm_skel', style: { minHeight: 44 } })

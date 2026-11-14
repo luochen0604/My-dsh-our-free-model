@@ -195,6 +195,43 @@ export interface RpcPollLoginResponse {
   error?: string
 }
 
+/**
+ * RPC: 把**已有账号**的会话升级成「桌面端来源」（商汤每日积分的前置条件）。
+ *
+ * 为什么需要独立 RPC 而不是复用 `account.create`：`account.create` 是**新建**
+ * 账号（先落占位条目再等凭据）；本操作是给**已存在**的账号换一份会话
+ * （同一 `credentialRef`），完成后账号本身不变。
+ */
+export interface RpcDesktopLoginRequest {
+  /** 目标账号 id（必须是 raccoon 账号）。 */
+  accountId: string
+}
+
+export interface RpcDesktopLoginResponse {
+  accountId: string
+  /**
+   * 要在系统浏览器里打开的**商汤官方** `/authorize` 页地址（带
+   * `desktop_callback=loopback` 与一次性 `state`）。字段名与 `account.create`
+   * 的 `loginUrl` 保持一致：客户端那段「打开登录页 + 轮询」的逻辑两边共用。
+   *
+   * ⚠️ 滑块由商汤页面在它自己的域下跑，本插件只起一个 127.0.0.1 回环端口收
+   * code（见 `src/raccoon-desktop-login.ts`）。
+   */
+  loginUrl: string
+}
+
+/** RPC: 轮询「桌面端授权」流程是否结束（与 `login.poll` 同形）。 */
+export interface RpcDesktopLoginPollRequest {
+  accountId: string
+}
+
+export interface RpcDesktopLoginPollResponse {
+  /** 未开始 / 仍在等用户完成滑块 ⇒ `false`。 */
+  done: boolean
+  success?: boolean
+  error?: string
+}
+
 export interface RpcUpdateAccountRequest {
   accountId: string
   patch: Partial<Pick<ProviderAccountEntry, 'nickname' | 'enabled'>>
