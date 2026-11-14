@@ -248,11 +248,47 @@ export const DOUBAO_SSE = Object.freeze({
   err: 'err',
 })
 
-/** 凭据失效/需要重新登录的错误特征。 */
+/**
+ * 凭据失效/需要重新登录的错误特征。
+ *
+ * ## 2026-11-14 实测校正（重要）
+ *
+ * 豆包的业务错误是 **HTTP 200 + 业务 code**，不是 HTTP 4xx。实测（不带 cookie
+ * 直接打真实端点）得到：
+ *
+ * ```json
+ * {"data":null,"code":710012001,"msg":"登录已过期，请重新登录",
+ *  "message":"login invalid","error":{"code":710012001,"message":"...","locale":"zh"}}
+ * ```
+ *
+ * 而 chat 流式端点则以 SSE 帧返回同类错误：
+ *
+ * ```
+ * event: gateway-error
+ * data: {"code":"Internal","message":"ErrorX:code=710012000 stable=true ..."}
+ * ```
+ *
+ * 故 401/403 判断**不够**——必须同时识别这两个业务码，否则会把"登录过期"
+ * 误判成普通业务失败，用户在界面上只看到含糊的报错。
+ */
+export const DOUBAO_LOGIN_INVALID_CODES: readonly number[] = Object.freeze([
+  // 实测：登录已过期
+  710012001,
+  // 实测（chat SSE gateway-error）：未登录/登录态缺失
+  710012000,
+])
+
 export function isDoubaoAuthError(status: number, body: string): boolean {
   if (status === 401 || status === 403) return true
   const text = String(body ?? '')
-  return /not[_\s-]?login|sessionid|登录|未登录|no[_\s-]?auth/i.test(text)
+  // 业务码优先（HTTP 200 也可能是登录失效）。
+  for (const code of DOUBAO_LOGIN_INVALID_CODES) {
+    if (text.includes(String(code))) return true
+  }
+  if (/login invalid|登录已过期|请重新登录|not[_\s-]?login|no[_\s-]?auth/i.test(text)) return true
+  // chat 的 gateway-error 帧同样意味着登录态不可用。
+  if (/gateway-error/i.test(text)) return true
+  return false
 }
 
 /**

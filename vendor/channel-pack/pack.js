@@ -42189,10 +42189,21 @@ var DOUBAO_SSE = Object.freeze({
   /** 服务端错误。 */
   err: "err"
 });
+var DOUBAO_LOGIN_INVALID_CODES = Object.freeze([
+  // 实测：登录已过期
+  710012001,
+  // 实测（chat SSE gateway-error）：未登录/登录态缺失
+  710012e3
+]);
 function isDoubaoAuthError(status, body) {
   if (status === 401 || status === 403) return true;
   const text = String(body ?? "");
-  return /not[_\s-]?login|sessionid|登录|未登录|no[_\s-]?auth/i.test(text);
+  for (const code of DOUBAO_LOGIN_INVALID_CODES) {
+    if (text.includes(String(code))) return true;
+  }
+  if (/login invalid|登录已过期|请重新登录|not[_\s-]?login|no[_\s-]?auth/i.test(text)) return true;
+  if (/gateway-error/i.test(text)) return true;
+  return false;
 }
 function isDoubaoQuotaError(status, body) {
   if (status === 429) return true;
@@ -42323,7 +42334,7 @@ async function fetchDoubaoCheckinStatus(credential, product = DOUBAO, fetchImpl 
   };
 }
 async function claimDoubaoDailyPoints(credential, product = DOUBAO, fetchImpl = fetch) {
-  const body = { scene: "", biz_params: "", AgwCommonParam: {} };
+  const body = { scene: "", biz_params: {}, AgwCommonParam: {} };
   let result;
   try {
     result = await post(credential, ALICE_CHECKIN_PATH, body, product, fetchImpl);
@@ -42845,6 +42856,12 @@ var DoubaoAdapter = class extends LlmAdapter7 {
           }
           if (frame.event === DOUBAO_SSE.err) {
             throw new LlmError12(`doubao: server error: ${frame.data.slice(0, 300)}`, "PROVIDER");
+          }
+          if (frame.event === "gateway-error") {
+            throw new LlmError12(
+              `doubao: gateway error: ${frame.data.slice(0, 300)}`,
+              isDoubaoAuthError(200, frame.data) ? "AUTH" : "PROVIDER"
+            );
           }
           if (frame.event === DOUBAO_SSE.pb) {
             throw new LlmError12(

@@ -239,8 +239,13 @@ export async function claimDoubaoDailyPoints(
   fetchImpl: typeof fetch = fetch,
 ): Promise<ClaimOutcome> {
   // 观察：body 形状 `{ scene, biz_params, AgwCommonParam }`。
-  // `scene` 的具体字面量未取证；空串让服务端走默认场景。
-  const body = { scene: '', biz_params: '', AgwCommonParam: {} }
+  // ⚠️ **2026-11-14 实测校正**：`biz_params` 必须是 **map（对象）**，不是字符串。
+  // 服务端原文（不带 cookie 直接 POST 得到）：
+  //   {"code":"InvalidRequest","message":".(1)request.(2)biz_params:
+  //    invalid request value, expected map, actual value: (stri..."}
+  // 这条错误说明：① 端点路径正确；② 请求体已被解析到字段级校验；
+  // ③ **没有 X-Bogus/msToken 签名要求**（否则会在签名层就被拒，不会到字段校验）。
+  const body = { scene: '', biz_params: {}, AgwCommonParam: {} }
 
   let result: PostResult
   try {

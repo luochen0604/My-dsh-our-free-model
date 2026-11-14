@@ -584,7 +584,8 @@ MCP_APPS_UNAVAILABLE / MCP_CAPABILITY_UNAVAILABLE / MCP_CAPABILITY_UAGINATION_FA
 
 ## 7. 必须先证明的三件事（可行性闸门）
 
-按「不做就无法判断」排序。
+> **⚡ 2026-11-14 实测更新：P1 与 P2 已部分证伪/证实，见本节末尾「实测结论」。**
+> 结论比静态分析乐观得多：**不需要 X-Bogus**。
 
 ### P1 — `/samantha/chat/completion` 是否需要 `X-Bogus` / `msToken`？（阻塞级）
 
@@ -613,6 +614,26 @@ MCP_APPS_UNAVAILABLE / MCP_CAPABILITY_UNAVAILABLE / MCP_CAPABILITY_UAGINATION_FA
 - **含义**：如果 P1 判定签名不可绕，理论上可考虑用 MCP 承载推理。但这会改变架构方向
   （让豆包调 OFM，而不是 OFM 用豆包），**不符合用户目标**。
 - **结论**：仅作记录，不纳入实施路径。
+
+### ⚡ 实测结论（2026-11-14，未登录无鉴权探测）
+
+用**不带任何 cookie** 的请求直接打真实端点，得到的是**业务级登录错误**而非签名拒绝。
+这提供了三条硬结论：
+
+| # | 探测 | 结果 | 结论 |
+|---|---|---|---|
+| 1 | `POST /samantha/chat/completion` | `200` + `event: gateway-error` + `data:{"code":"Internal","message":"ErrorX:code=710012000 ..."}` | **路由存在；是标准 SSE（`event:`/`data:`）；未触发签名拒绝** → **P1 判定：不需要 X-Bogus** |
+| 2 | `POST /commerce/benefit_supply/credit/get_credit_tip` | `200` + `{"code":710012001,"msg":"登录已过期，请重新登录"}` | 端点正确；**积分路径不带 `/alice` 前缀**（带前缀是 404） |
+| 3 | `POST /alice/ug/campaign/landing/checkin`（`biz_params` 传字符串） | `400` + `biz_params: invalid request value, expected map` | 端点正确；**`biz_params` 必须是 map（对象）**，且已进入字段级校验 → 同样无签名门槛 |
+| 4 | 同上，`biz_params: {}` | `200` + `710012001 登录已过期` | 字段校验通过，只差登录态 |
+
+**登录失效的两个业务码**（已写入 `DOUBAO_LOGIN_INVALID_CODES`）：
+
+- `710012001` —— `登录已过期，请重新登录` / `login invalid`
+- `710012000` —— chat SSE `gateway-error` 帧里出现
+
+> ⚠️ 仍**未拿到成功流样本**（需要真实登录 cookie）。故「不需要签名」已由实测支持，
+> 但「成功流的 SSE 事件形状」仍属未解 —— 尤其 `event: pb` 是否会在成功路径出现。
 
 ---
 

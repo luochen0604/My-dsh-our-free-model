@@ -36,9 +36,9 @@ export const ALICE_CHECKIN_PATH = '/alice/ug/campaign/landing/checkin'
 export const ALICE_CAMPAIGN_LANDING_PATH = '/alice/ug/campaign/landing/get'
 /** 任务奖励领取（观察：`ClaimCampaignReward`，body 含 `campaign_item_code` 等）。 */
 export const ALICE_CLAIM_PATH = '/alice/ug/campaign/item/reward/claim/'
-/** 积分用量历史（观察：`/commerce/benefit_supply/credit/get_credit_usage_history`）。 */
+/** 积分用量历史（**实测 200**：`/commerce/...`，无 `/alice` 前缀）。 */
 export const ALICE_CREDIT_USAGE_PATH = '/commerce/benefit_supply/credit/get_credit_usage_history'
-/** 积分提示/可用任务（观察：`get_credit_tip` / `get_credit_num_optional_tasks`）。 */
+/** 积分提示/可用任务（**实测 200**：`/commerce/...` 无 `/alice` 前缀）。 */
 export const ALICE_CREDIT_TIP_PATH = '/commerce/benefit_supply/credit/get_credit_tip'
 
 /** 会话列表（观察：`/samantha/conversation/list`）。 */

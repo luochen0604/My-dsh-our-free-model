@@ -337,6 +337,29 @@ export class DoubaoAdapter extends LlmAdapter {
           if (frame.event === DOUBAO_SSE.err) {
             throw new LlmError(`doubao: server error: ${frame.data.slice(0, 300)}`, 'PROVIDER')
           }
+          /**
+           * `gateway-error` —— **2026-11-14 实测确认的真实事件名**。
+           *
+           * 不带 cookie 直接 POST `/samantha/chat/completion` 得到：
+           *
+           * ```
+           * event: gateway-error
+           * data: {"code":"Internal","message":"ErrorX:code=710012000 stable=true ..."}
+           * ```
+           *
+           * 两点结论：
+           * 1. **这是标准 SSE（`event:` + `data:`）**，与官方解析器的 `case"json"`
+           *    分支配得上 —— 至少错误帧是 JSON；
+           * 2. **不需要 X-Bogus/msToken**：请求已进入业务层（报的是登录态），
+           *    而不是被风控/签名层拒掉。P1 由此得到实测支持（但仍未拿到
+           *    成功流的样本，见文件头未知 #1）。
+           */
+          if (frame.event === 'gateway-error') {
+            throw new LlmError(
+              `doubao: gateway error: ${frame.data.slice(0, 300)}`,
+              isDoubaoAuthError(200, frame.data) ? 'AUTH' : 'PROVIDER',
+            )
+          }
           if (frame.event === DOUBAO_SSE.pb) {
             // ⚠️ 明确不支持，而不是静默丢帧 —— 见文件头未知 #1。
             throw new LlmError(
