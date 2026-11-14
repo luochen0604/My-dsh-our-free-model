@@ -184,8 +184,13 @@ async function verifyRaccoonDailyClaim({ ctx, call, creds }) {
     bills = []
     const third = await call('credits.claimAll', { provider })
     assert.equal(third.ok, true, '已领不是错误')
-    assert.equal(third.value.results[0].outcome.kind, 'already-claimed', 'granted:false 必须映射成已领')
-    assert.match(third.value.results[0].outcome.message, /桌面端/)
+    assert.equal(third.value.results[0].outcome.kind, 'already-claimed', 'granted:false 必须映射成「未领取」类别')
+    // ⚠️ 回归守护（真实缺陷 2026-11-14）：`granted:false` 且账单里**没有**今天的
+    // `daily_grant` ⇒ 绝不能报「今天已领过」。用户就是因为这句谎报而无从判断
+    // （按提示做完桌面端授权，一分为未进却看到「今天已领过每日积分」）。
+    const message = third.value.results[0].outcome.message
+    assert.match(message, /桌面端/, '必须给出与桌面端会话相关的可操作提示')
+    assert.doesNotMatch(message, /今天已领过/, '当天无 daily_grant 时不得声称今天已领')
     console.log('ok  raccoon daily claim: 账单状态预检、桌面端 login/points/grant、granted 幂等映射')
   } finally {
     globalThis.fetch = savedFetch

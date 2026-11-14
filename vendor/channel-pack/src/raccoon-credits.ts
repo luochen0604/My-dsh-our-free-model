@@ -360,6 +360,27 @@ export async function claimRaccoonLoginReward(
 }
 
 /**
+ * 今天是否**真的**收到过每日积分（以账单为唯一判据）。
+ *
+ * @returns `true` 有当天 `daily_grant`；`false` 明确没有；`undefined` 查不到（网络/凭据）。
+ *
+ * ⚠️ 存在理由见 `claimRaccoonDailyPoints` 里「`granted:false` 有三种成因」的表：
+ * 端点的 `granted:false` **不能**当作「今天已发」的证据（用户实测过一分未进却被
+ * 报成已领）。只有账单里那条 `biz_type === 'daily_grant'` 且日期为今天（UTC+8）
+ * 的记录才是事实。
+ */
+async function hasRaccoonDailyGrantToday(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  fetcher: typeof fetch,
+  nowMs: number = Date.now(),
+): Promise<boolean | undefined> {
+  const status = await fetchRaccoonDailyCheckinStatus(product, credential, fetcher, nowMs)
+  if (status === null) return undefined
+  return status.todayCheckedIn
+}
+
+/**
  * 领取「每日积分」（每次调用都幂等：当天首次 `granted:true`，之后 `false`）。
  *
  * ## 这就是官方桌面端的签到动作
@@ -397,25 +418,42 @@ export async function claimRaccoonDailyPoints(
   }
 
   if (envelope.data?.granted !== true) {
-    // 两种成因端点分不出（都回 `granted:false`），用「本插件自己标的会话来源」
-    // 消歧（见 `RaccoonCredential.sessionSource`）：
-    //
-    // ⚠️ **每日积分发放的对象是「桌面端授权码登录换来的那个会话」**，判据在
-    // 服务端记录里，不在请求头 —— 实测把官方桌面端的头集（`X-Client-Name` /
-    // `X-Client-Page` / `X-Client-Version` / 中文 UA / `Origin: raccoon-desktop://shell`）
-    // 逐条补齐，用网页扫码会话的 token 调用仍然全部 `granted:false`；而同一个
-    // 账号在桌面端启动的那一秒（21:14:18 / 22:26:22 / 23:34:39 / 00:04:49）必然
-    // 出现一条 `daily_grant`。⇒ 差异只在 token 本身（会话来源）。
-    // 故网页会话是**永远**领不到每日积分的，此时那句「今天已领」会把用户
-    // 引到完全错误的方向。
-    if (credential.sessionSource === 'desktop') {
+    /**
+     * ⚠️⚠️ `granted:false` 是**三种**成因共用的同一个响应，端点不区分（2026-11-14 实测）：
+     *
+     * | 成因 | 证据 | 正确文案 |
+     * |---|---|---|
+     * | ① 今天已经发过 | 7991226 在 00:04:49 收到当天的 `daily_grant` 后再调 → false | 「今天已领过」 |
+     * | ② 会话不是桌面端来源 | 网页扫码 token 调用 → 永远 false | 「去做桌面端授权」 |
+     * | ③ 会话虽是桌面端授权换来、服务端仍未发放 | 7990525 于 10:52 完成桌面端授权后仍 false，当天账单**没有** `daily_grant`、余额一分未加 | 「重做授权」 |
+     *
+     * ## ③ 是真实缺陷，不是理论分支（用户报障 2026-11-14）
+     *
+     * 用户按提示完成「桌面端授权」后，本函数仍拿到 `granted:false`，而**旧代码直接
+     * 报了「今天已领过每日积分」** —— 账单里当天根本没有 `daily_grant`，用户实际
+     * 一分未进。根因是把「端点说没发」当成了「今天已发」。
+     *
+     * 现在**先查账单再下结论**：只有账单里真有当天 `daily_grant` 才敢说「今天已领」；
+     * 否则一律按「未发放」给出可操作方向。宁可让用户看到一句需要动手的提示，
+     * 也不要谎报已领 —— 与 `credits.ts` 的 `coversToday` 同一条教训：
+     * **判据只能来自看得见该事实的那一层**。
+     */
+    const grantedToday = await hasRaccoonDailyGrantToday(product, credential, fetcher)
+    if (grantedToday === true) {
       return { kind: 'already-claimed', message: '今天已领过每日积分' }
+    }
+    if (grantedToday === undefined) {
+      // 账单查不到（网络/凭据）：既不能断定已领，也不能报一个未发生的成功。
+      return {
+        kind: 'already-claimed',
+        message: '本次未发放（未能核对今日账单，请稍后重试）',
+      }
     }
     return {
       kind: 'already-claimed',
-      message: credential.sessionSource === 'web'
-        ? '本次未发放：该账号的凭据是网页扫码会话，商汤的每日积分只发给桌面端会话 —— 请在账号行点一次「桌面端授权」切换会话来源'
-        : '本次未发放：该凭据不是桌面端授权码换来的会话（多半是微信扫码），每日积分只发给桌面端会话 —— 请在账号行点一次「桌面端授权」',
+      message: credential.sessionSource === 'desktop'
+        ? '本次未发放：该会话虽是桌面端授权换来，服务端仍未发放每日积分 —— 请在账号行重做一次「桌面端授权」'
+        : '本次未发放：该凭据不是桌面端授权码换来的会话，每日积分只发给桌面端会话 —— 请在账号行点一次「桌面端授权」',
     }
   }
 
