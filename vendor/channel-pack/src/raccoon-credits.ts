@@ -375,9 +375,44 @@ async function hasRaccoonDailyGrantToday(
   fetcher: typeof fetch,
   nowMs: number = Date.now(),
 ): Promise<boolean | undefined> {
-  const status = await fetchRaccoonDailyCheckinStatus(product, credential, fetcher, nowMs)
-  if (status === null) return undefined
-  return status.todayCheckedIn
+  const granted = await todaysRaccoonDailyGrantPoints(product, credential, fetcher, nowMs)
+  if (granted === undefined) return undefined
+  return granted !== null
+}
+
+/**
+ * 今天那笔 `daily_grant` 的积分值；今天没有则 `null`，查不到则 `undefined`。
+ *
+ * 与 `hasRaccoonDailyGrantToday` 共用一个实现，避免两处「今天」的判据漂移
+ * （一处按 `grant_at`、一处按 `created_at` 就会对不上）。判据取 `grant_at`
+ * 的日期（服务端语义：这笔属于哪一天），与 `fetchRaccoonDailyCheckinStatus` 一致。
+ */
+async function todaysRaccoonDailyGrantPoints(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  fetcher: typeof fetch,
+  nowMs: number = Date.now(),
+): Promise<number | null | undefined> {
+  const envelope = await requestJson(
+    `${product.apiBase}${RACCOON_POINTS_V2_PREFIX}/bills?paging.limit=20&type=income`,
+    credential,
+    product,
+    { method: 'GET' },
+    fetcher,
+  )
+  if (!envelope.ok || envelope.data === undefined) return undefined
+  const items = Array.isArray(envelope.data.items) ? envelope.data.items : []
+  const today = utc8DateString(nowMs)
+  for (const raw of items) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) continue
+    const item = raw as Record<string, unknown>
+    if (item.biz_type !== 'daily_grant') continue
+    const grantAt = typeof item.grant_at === 'string' ? item.grant_at : ''
+    if (grantAt.length < 10) continue
+    if (grantAt.slice(0, 10) !== today) continue
+    return readNumber(item.points) ?? RACCOON_DAILY_GRANT_POINTS
+  }
+  return null
 }
 
 /**
@@ -419,28 +454,41 @@ export async function claimRaccoonDailyPoints(
 
   if (envelope.data?.granted !== true) {
     /**
-     * ⚠️⚠️ `granted:false` 是**三种**成因共用的同一个响应，端点不区分（2026-11-14 实测）：
+     * ⚠️⚠️⚠️ `granted:false` **不代表没领到**。2026-11-14 抓官方客户端真实登录得到决定性反例：
      *
-     * | 成因 | 证据 | 正确文案 |
+     * | 时刻 | 事件 | 结果 |
      * |---|---|---|
-     * | ① 今天已经发过 | 7991226 在 00:04:49 收到当天的 `daily_grant` 后再调 → false | 「今天已领过」 |
-     * | ② 会话不是桌面端来源 | 网页扫码 token 调用 → 永远 false | 「去做桌面端授权」 |
-     * | ③ 会话虽是桌面端授权换来、服务端仍未发放 | 7990525 于 10:52 完成桌面端授权后仍 false，当天账单**没有** `daily_grant`、余额一分未加 | 「重做授权」 |
+     * | 12:16:54.668 | **官方客户端自己** POST `/points/grant` | `{"granted":false,"popup":null}` |
+     * | 12:16:56 | 账单出现 `daily_grant` | **+300**，expire +7 天 |
      *
-     * ## ③ 是真实缺陷，不是理论分支（用户报障 2026-11-14）
+     * 即客户端自己的调用返回了 false，1.3 秒后积分照样到账。⇒ `granted` 只表示
+     * 「**本次调用**是否新发了一笔」，不表示「今天有没有分」。原因：真正触发发放的是
+     * **登录/会话事件**，POST 只是撞上了「今天已发」。
      *
-     * 用户按提示完成「桌面端授权」后，本函数仍拿到 `granted:false`，而**旧代码直接
-     * 报了「今天已领过每日积分」** —— 账单里当天根本没有 `daily_grant`，用户实际
-     * 一分未进。根因是把「端点说没发」当成了「今天已发」。
+     * 另有两条实测支撑：
+     * - 11-13 的 `daily_grant` 出现在 `00:00:00`，而当天客户端 23:34 才启动 ⇒ 服务端
+     *   定时任务可在无客户端时发放，与 POST 无关；
+     * - OFM 在 10:52 登录后连续 POST 9 次，`daily_points` 始终 41、`expire_at` 不动
+     *   ⇒ 光调 POST 永远拿不到这 300 分（这也直接否定了本插件早期的实现方向）。
      *
-     * 现在**先查账单再下结论**：只有账单里真有当天 `daily_grant` 才敢说「今天已领」；
-     * 否则一律按「未发放」给出可操作方向。宁可让用户看到一句需要动手的提示，
-     * 也不要谎报已领 —— 与 `credits.ts` 的 `coversToday` 同一条教训：
-     * **判据只能来自看得见该事实的那一层**。
+     * ## 因此：判据只能是账单
+     *
+     * 先用 `hasRaccoonDailyGrantToday` 查账单，只有它说「今天确有 `daily_grant`」
+     * 才敢讲已领；否则如实说未发放。
+     *
+     * ⚠️ 这里**不做**「等几秒重查」：既然 POST 本身不产生发放（见上表第 3 条），
+     * 等待不会让分进来，只会拖慢批量签到。真正的到账发生在**登录那一刻**，
+     * 等登录流程结束后由 `credits.status` 的下一次轮询自然反映。
      */
     const grantedToday = await hasRaccoonDailyGrantToday(product, credential, fetcher)
     if (grantedToday === true) {
-      return { kind: 'already-claimed', message: '今天已领过每日积分' }
+      const credit = await todaysRaccoonDailyGrantPoints(product, credential, fetcher)
+      return {
+        kind: 'already-claimed',
+        message: credit === undefined
+          ? '今天已领过每日积分'
+          : `今天已领过每日积分（+${credit}）`,
+      }
     }
     if (grantedToday === undefined) {
       // 账单查不到（网络/凭据）：既不能断定已领，也不能报一个未发生的成功。

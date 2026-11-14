@@ -191,6 +191,25 @@ async function verifyRaccoonDailyClaim({ ctx, call, creds }) {
     const message = third.value.results[0].outcome.message
     assert.match(message, /桌面端/, '必须给出与桌面端会话相关的可操作提示')
     assert.doesNotMatch(message, /今天已领过/, '当天无 daily_grant 时不得声称今天已领')
+
+    // ④ 官方客户端的真实情形（2026-11-14 抓包，决定性反例）：
+    //    客户端自己 POST grant 拿到 `granted:false`，1.3 秒后账单照样出现当天
+    //    `daily_grant` 并 +300。⇒ `granted:false` 与「今天有没有分」是两件事，
+    //    文案必须以**账单**为准：账单里有就必须报「已领」，绝不能报「未发放」。
+    //    这条走的是 claimAll 的状态预检分支（已领就不再打写端点），文案是
+    //    「今天已签到」；关键是**不能**出现「未发放」这类误导性说法。
+    granted = false
+    bills = [{ biz_type: 'daily_grant', grant_at: `${todayUtc8}T00:00:00+08:00`, points: 300 }]
+    const fourth = await call('credits.claimAll', { provider })
+    assert.equal(fourth.ok, true)
+    const fourthOutcome = fourth.value.results[0].outcome
+    assert.equal(fourthOutcome.kind, 'already-claimed')
+    assert.match(
+      fourthOutcome.message,
+      /今天已(领过|签到)/,
+      'granted:false 但账单有当天 daily_grant（官方客户端实测形态）⇒ 必须报已领/已签到',
+    )
+    assert.doesNotMatch(fourthOutcome.message, /未发放/, '账单显示已发放时不得说未发放')
     console.log('ok  raccoon daily claim: 账单状态预检、桌面端 login/points/grant、granted 幂等映射')
   } finally {
     globalThis.fetch = savedFetch

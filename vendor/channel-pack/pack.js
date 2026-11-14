@@ -47253,9 +47253,31 @@ async function claimRaccoonLoginReward(product, credential, fetcher = fetch) {
   return { kind: "claimed", credit: points, streakDays: 0, isStreakDay: false };
 }
 async function hasRaccoonDailyGrantToday(product, credential, fetcher, nowMs = Date.now()) {
-  const status = await fetchRaccoonDailyCheckinStatus(product, credential, fetcher, nowMs);
-  if (status === null) return void 0;
-  return status.todayCheckedIn;
+  const granted = await todaysRaccoonDailyGrantPoints(product, credential, fetcher, nowMs);
+  if (granted === void 0) return void 0;
+  return granted !== null;
+}
+async function todaysRaccoonDailyGrantPoints(product, credential, fetcher, nowMs = Date.now()) {
+  const envelope = await requestJson2(
+    `${product.apiBase}${RACCOON_POINTS_V2_PREFIX}/bills?paging.limit=20&type=income`,
+    credential,
+    product,
+    { method: "GET" },
+    fetcher
+  );
+  if (!envelope.ok || envelope.data === void 0) return void 0;
+  const items = Array.isArray(envelope.data.items) ? envelope.data.items : [];
+  const today = utc8DateString(nowMs);
+  for (const raw of items) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+    const item = raw;
+    if (item.biz_type !== "daily_grant") continue;
+    const grantAt = typeof item.grant_at === "string" ? item.grant_at : "";
+    if (grantAt.length < 10) continue;
+    if (grantAt.slice(0, 10) !== today) continue;
+    return readNumber3(item.points) ?? RACCOON_DAILY_GRANT_POINTS;
+  }
+  return null;
 }
 async function claimRaccoonDailyPoints(product, credential, fetcher = fetch) {
   const envelope = await postDesktopLoginGrant(product, credential, fetcher);
@@ -47269,7 +47291,11 @@ async function claimRaccoonDailyPoints(product, credential, fetcher = fetch) {
   if (envelope.data?.granted !== true) {
     const grantedToday = await hasRaccoonDailyGrantToday(product, credential, fetcher);
     if (grantedToday === true) {
-      return { kind: "already-claimed", message: "\u4ECA\u5929\u5DF2\u9886\u8FC7\u6BCF\u65E5\u79EF\u5206" };
+      const credit = await todaysRaccoonDailyGrantPoints(product, credential, fetcher);
+      return {
+        kind: "already-claimed",
+        message: credit === void 0 ? "\u4ECA\u5929\u5DF2\u9886\u8FC7\u6BCF\u65E5\u79EF\u5206" : `\u4ECA\u5929\u5DF2\u9886\u8FC7\u6BCF\u65E5\u79EF\u5206\uFF08+${credit}\uFF09`
+      };
     }
     if (grantedToday === void 0) {
       return {

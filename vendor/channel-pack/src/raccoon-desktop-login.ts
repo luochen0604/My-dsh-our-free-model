@@ -35,27 +35,51 @@
  * 那条链路早年被实测验证过；而授权码这条链路有官方页面可用 —— 复刻反而是
  * 多养一份会漂移的实现，且要自己承担「SceneId 与本插件页面 origin 不匹配」的风险。
  *
- * ## ⚠️ 已知边界：这一步**不保证**每日积分立刻可领（2026-11-14 实测）
+ * ## ⚠️ 已知边界：这一步**不保证**每日积分到账（2026-11-14 抓真实登录后修订）
  *
- * 授权码登录确实产出一份「桌面端来源」会话（这是官方桌面端用的同一条链路；我们
- * 的换 token 请求与官方 `desktopLogin.js` 逐字节一致：`POST`、
- * `Content-Type: application/json`、body `{authorization_code}`）。但实测它
- * **不等于**「能领每日积分」：
+ * 先纠正本文件早前的一个错误结论：曾写「把 7991226 的凭据换成授权码会话后仍 false
+ * ⇒ 换会话把资格降级了」。**那是误判** —— 7991226 当天 00:04:49 已由官方客户端领过，
+ * 它返回 false 只是「今天已发」，不构成降级证据。
  *
- * | 观测 | 结论 |
- * |---|---|
- * | 7990525 于 10:52 完成本流程 → `granted:false`，当天账单**无** `daily_grant`、余额未变 | 授权码会话没拿到发放资格 |
- * | 同机 7991226 同日 00:04:49 由**官方客户端**启动 → `daily_grant` +300 | 客户端路径能拿到 |
- * | 把 7991226 的凭据也换成授权码会话后再调 grant → 仍 false | 换会话反而把它的资格降级了 |
- * | 三条会话 JWT claims 完全同构（仅 sid/iat/jti 不同）；设备 bind/trusted/online + heartbeat + 官方头集（含中文 UA、Origin、Sec-Fetch）全补齐后仍 false | 判据不在 token、不在请求头、也不在设备绑定 |
- * | 账号级状态（user_info / entitlement / tasks）两号完全一致；用随机 device id 试「每设备每日一次」仍 false | 排除账号状态与设备维度 |
+ * ## 真正抓到的决定性对照（同一账号 7990525，同一天）
  *
- * ⇒ 本流程的定位必须诚实：**按官方桌面端登录协议换一次会话**，不承诺换完即可领。
- * UI 文案与失败提示都按此事实写（见 `claimRaccoonDailyPoints` 的三成因表）。
+ * | 时刻 | 事件 | 结果 |
+ * |---|---|---|
+ * | 10:52 | **本插件**授权码登录（回环 http 回调）成功 | 会话正常，但**账单当天一直无** `daily_grant` |
+ * | 11:04–11:15 | 随后连打 9 次 `POST /points/grant` | 全部 `granted:false`，`daily_points` 41 不动 |
+ * | 12:16:53 | **官方客户端**启动 → 点登录 → 浏览器深链回调完成登录 | — |
+ * | 12:16:54.668 | 官方客户端**自己** POST `/points/grant` | `{"granted":false,"popup":null}` |
+ * | 12:16:56 | 账单出现 `daily_grant` | **+300**，`expire` = +7 天 |
  *
- * 剩余未验证的假设（要继续挖就必须抓官方客户端 `login_with_authorization_code`
- * **之后的完整请求序列**）：资格可能绑在「由客户端进程建立、随后被 IAM 侧标记为
- * 可信设备会话的那条 connection」上，而纯 API 换来的授权码会话不在其列。
+ * 两条重要结论：
+ * 1. **`granted:false` 不代表没领到** —— 客户端自己拿到 false，1.3 秒后积分照样到账。
+ *    真正触发发放的是**登录事件**，POST 只是撞上「今天已发」。故判据只能用账单
+ *    （见 `claimRaccoonDailyPoints`）。
+ * 2. **本插件的回环授权码登录没有触发发放**，而官方客户端那次触发了 ⇒ 两条链路在
+ *    服务端看来不等价。
+ *
+ * ## 当前最强的未验证假设（下一步就该测这个）
+ *
+ * 官方客户端的授权 URL **只带两个参数**（`build/electron/main/account/desktopLogin.js`
+ * 的 `DESKTOP_AUTH_PARAMS`）：
+ *
+ * ```js
+ * { login_source: 'desktop', appname: '办公小浣熊客户端' }
+ * ```
+ *
+ * 它**没有** `desktop_callback`，回调走自定义协议深链 `office-raccoon://auth/callback`
+ * （`parseDesktopLoginCode` 严格校验该协议）。而本文件为了拿到 code，显式加了
+ * `desktop_callback=loopback` + `http://127.0.0.1:PORT/auth/callback`。
+ *
+ * ⇒ 假设：**服务端在发放授权码时记录了回调类型，只有深链那类 code 换来的会话才带
+ * 每日积分资格**。若要继续验证，最小实验是让本插件改走深链回调（注册
+ * `office-raccoon://` 协议或起一个能接该深链的进程），其余参数与官方完全一致，
+ * 再看账单是否出现 `daily_grant`。
+ *
+ * 已排除的解释（都实测过）：JWT claims 差异（三条会话仅 sid/iat/jti 不同）、
+ * 请求头（官方头集全补齐仍 false）、设备绑定（bind→trusted→online + heartbeat，
+ * 仍 false）、账号级状态（两号 user_info/entitlement/tasks 一致）、每设备每日一次
+ * （随机 device id 仍 false）、页面/客户端版本号。
  *
  * ## ⚠️ 身份必须核对
  *
