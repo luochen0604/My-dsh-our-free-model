@@ -548,6 +548,7 @@ window.__ModuleLoader__.load({
         'chan.test.ok': '连接正常（{ms} ms）',
         'chan.test.failed': '测试失败：{reason}',
         'chan.claim.result': '已领取 {count} 个账号，共 {credit} 积分。',
+        'chan.claim.result.checkpoints': '已签 {count} 处（灵犀算力点 / 福利中心 / 任务中心）。',
         'chan.claim.none': '今天没有可领取的积分。',
         'chan.credit.today': '今日已领 {credit}',
         'chan.desktop.act': '桌面端授权',
@@ -1471,6 +1472,7 @@ window.__ModuleLoader__.load({
         'chan.test.ok': 'Connection healthy ({ms} ms)',
         'chan.test.failed': 'Test failed: {reason}',
         'chan.claim.result': 'Claimed for {count} account(s), {credit} credits in total.',
+        'chan.claim.result.checkpoints': 'Signed in at {count} checkpoint(s) (Lingxi points / benefits / tasks).',
         'chan.claim.none': 'Nothing to claim today.',
         'chan.credit.today': '{credit} claimed today',
         'chan.desktop.act': 'Desktop session',
@@ -4817,9 +4819,16 @@ window.__ModuleLoader__.load({
       { id: 'cline', name: 'Cline', org: 'Cline', accent: '#5B5BD6', note: 'Cline 账号免费额度', login: 'browser' },
       { id: 'loomy', name: 'Loomy', org: '讯飞', accent: '#2F6BFF', note: '微信扫码，或短信验证码备用', login: 'browser+sms' },
       { id: 'raccoon', name: 'Raccoon', org: '商汤', accent: '#00A6A6', note: '手机号登录 · 每日积分', login: 'browser' },
+      // WPS 三处签到（灵犀算力点 / 福利中心 / 任务中心）共用一个 wps_sid，
+      // 挂在 lingxi 一个 provider 下 —— note 必须让用户一眼看出「一号三签」。
+      { id: 'lingxi', name: 'WPS 灵犀', org: 'WPS', accent: '#E85D04', note: '一个账号三处每日签到：灵犀算力点 · 福利中心 · 任务中心', login: 'browser', signInOnly: true },
       { id: 'minimax', name: 'MiniMax Code', org: 'MiniMax', accent: '#E4007F', note: '设备码 + PKCE，每日签到', login: 'browser' },
       { id: 'zcode', name: 'ZCode', org: '智谱', accent: '#3B6EF6', note: '浏览器登录（需本机可开浏览器）', login: 'browser' },
       { id: 'gemini', name: 'Gemini', org: 'Google Code Assist', accent: '#4285F4', note: '本地回调 OAuth 免费线', login: 'browser' },
+      // 豆包工作：**cookie 直填**渠道（login: 'cookie'）。字节 passport 的扫码/短信
+      // 链路没有实测样本且要过阿里云滑块，照猜实现只会交付一个必然失败的登录页 ——
+      // 故改为「在豆包工作里登录一次，把 cookie 粘进来」。理由见 doubao-auth.ts 模块头。
+      { id: 'doubao', name: '豆包工作', org: '字节', accent: '#3C6BFF', note: 'Cookie 导入（在豆包工作中登录后粘贴）', login: 'cookie' },
     ]
 
     /** 与现有 RPC 的能力对应：余额、每日领取及独立签到状态分别判断。 */
@@ -4837,6 +4846,17 @@ window.__ModuleLoader__.load({
       raccoon: { claim: true, status: true, desktop: true },
       minimax: { claim: true, status: true },
       zcode: { claim: true, unit: 'tokens' },
+      // WPS 灵犀：单位是「算力点」（credits/balance 的 total_balance，见
+      // channel-pack-rpc.ts 的 credits.balances lingxi 分支 package unit:'points'）。
+      // claim 一轮对每账号产出三条 outcome（灵犀/福利/任务），成功通知用
+      // 「处」计数而不是账号数（见 claim() 里的 lingxi 分支文案）。
+      lingxi: { claim: true, status: true, unit: 'points' },
+      // 豆包工作：积分单位是「积分」（与契约缺省一致，故不传 unit）。
+      // `status: true` ⇒ 显示独立签到状态。
+      // ⚠️ **不置 `desktop: true`**：豆包是否有「只认桌面端会话」的门槛**尚未验证**
+      // （Raccoon 已被证实有）。若实测 `granted:false` 且今日无记录，再补这个开关
+      // 并实现 account.desktopLogin —— 不要预先加上，那会给用户一个无用的按钮。
+      doubao: { claim: true, status: true },
       gemini: { unit: 'quota', quota: true },
     }
 
@@ -5241,7 +5261,12 @@ window.__ModuleLoader__.load({
           const claimed = Number(summary?.claimed ?? 0)
           const credit = Number(summary?.totalCredit ?? 0)
           const failed = (value?.results ?? []).filter(row => row.outcome?.kind === 'failed')
-          const successText = t('chan.claim.result').replace('{count}', String(claimed)).replace('{credit}', String(credit))
+          // WPS 灵犀一轮对每账号产出三条 outcome（灵犀/福利/任务）——
+          // summary.claimed 是「处」不是「账号」，成功文案必须用「处」计数，
+          // 否则 3 个账号会显示成「已领取 9 个账号」。
+          const successText = channel.id === 'lingxi'
+            ? t('chan.claim.result.checkpoints').replace('{count}', String(claimed))
+            : t('chan.claim.result').replace('{count}', String(claimed)).replace('{credit}', String(credit))
           const failureText = t('chan.claim.failed').replace('{reason}', failed.map(row => row.outcome.message).join('；'))
           setNotice(failed.length > 0 ? claimed > 0 ? `${successText}；${failureText}` : failureText
             : claimed > 0 ? successText : t('chan.claim.none'))
@@ -5540,11 +5565,16 @@ window.__ModuleLoader__.load({
         showToast({ title: t('chan.error').replace('{reason}', reason).slice(0, 120), body: channel.name, tone: 'warn' })
       }, [t])
 
+      // `signInOnly: true` 的渠道只参与签到/唤醒，**没有 LLM adapter**（不提供模型推理）。
+      // 渠道页按 `ctx.llm.listProviders()` 的能力给卡片，把它们渲染出来只会是一张
+      // 永远「未连接」的空卡（且有卡片无 adapter 会让 UI/挂载一致性断言失败），
+      // 故此处剔除；但条目本身仍保留在本清单里 —— 签到与唤醒页用 `nameOf()` 取中文名。
+      const CHANNEL_DIRECTORY = CHANNEL_PROVIDERS.filter(row => row.signInOnly !== true)
       const stateOf = channel => !available ? 'disconnected' : statuses?.[channel.id]?.closed === true ? 'closed'
         : (statuses?.[channel.id]?.accounts?.enabled ?? 0) > 0 ? 'connected' : 'disconnected'
-      const connected = CHANNEL_PROVIDERS.filter(row => stateOf(row) === 'connected').length
+      const connected = CHANNEL_DIRECTORY.filter(row => stateOf(row) === 'connected').length
       const needle = query.trim().toLowerCase()
-      const rows = CHANNEL_PROVIDERS.filter(channel =>
+      const rows = CHANNEL_DIRECTORY.filter(channel =>
         (filter === '' || (statuses !== undefined || !available) && stateOf(channel) === filter)
         && (needle === '' || `${channel.id} ${channel.name} ${channel.org}`.toLowerCase().includes(needle)))
       const failed = !ready && pack.state === 'failed'
@@ -5557,8 +5587,8 @@ window.__ModuleLoader__.load({
               h('p', { className: 'ofm_pagesub' }, t('chan.sub'))),
             h('div', { className: 'ofm_pills' },
               h(Pill, { strong: true, tone: ready ? 'ok' : failed ? 'err' : 'warn' },
-                ready ? `${connected}/${CHANNEL_PROVIDERS.length} ${t('chan.state.on')}` : t('chan.state.off')),
-              h(Pill, null, `${t('chan.meta.accounts')} ${statuses === undefined ? '—' : CHANNEL_PROVIDERS.reduce((sum, row) => sum + (statuses[row.id]?.accounts?.enabled ?? 0), 0)}`)))),
+                ready ? `${connected}/${CHANNEL_DIRECTORY.length} ${t('chan.state.on')}` : t('chan.state.off')),
+              h(Pill, null, `${t('chan.meta.accounts')} ${statuses === undefined ? '—' : CHANNEL_DIRECTORY.reduce((sum, row) => sum + (statuses[row.id]?.accounts?.enabled ?? 0), 0)}`)))),
         failed ? h('div', { className: 'ofm_callout ofm_error' },
           h('div', null, t('chan.pack.failed').replace('{reason}', pack.error ?? ''), h('div', { className: 'ofm_note' }, t('chan.pack.hint')))) : null,
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
@@ -5575,7 +5605,7 @@ window.__ModuleLoader__.load({
               h('option', { value: 'disconnected' }, t('chan.state.off')),
               h('option', { value: 'closed' }, t('chan.state.closed'))))),
         h('div', { className: 'ofm_directorycount', role: 'status' },
-          t('chan.showing').replace('{shown}', String(rows.length)).replace('{total}', String(CHANNEL_PROVIDERS.length))),
+          t('chan.showing').replace('{shown}', String(rows.length)).replace('{total}', String(CHANNEL_DIRECTORY.length))),
         rows.length === 0 ? h('p', { className: 'ofm_note' }, t('chan.filterEmpty')) : null,
         h('div', { className: 'ofm_directory' }, rows.map(channel => h(ChannelCard, {
           key: channel.id,
@@ -7844,7 +7874,7 @@ window.__ModuleLoader__.load({
       const tabs = [
         ['free', t('nav.tab.free'), freePoolView(data).total],
         ['eac', t('nav.tab.eac'), data.catalog.filter(m => m.channel === 'eac').length],
-        ['channels', t('nav.tab.channels'), CHANNEL_PROVIDERS.length],
+        ['channels', t('nav.tab.channels'), CHANNEL_DIRECTORY.length],
         ['aggregate', t('nav.tab.aggregate'), data.catalog.filter(m => m.channel === 'aggregate').length],
         ['workspace', t('nav.tab.workspace'), data.catalog.filter(m => m.channel === 'subscription').length],
         ['extensions', t('nav.tab.extensions'), (data.extensions?.installed ?? []).length],

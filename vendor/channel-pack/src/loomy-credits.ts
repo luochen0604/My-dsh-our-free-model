@@ -45,6 +45,7 @@ import {
   type LoomyCredential,
 } from './loomy.js'
 import type { LoomyProduct } from './loomy-product.js'
+import { buildLoomyFirstLoginBody, resolveLoomyChannelAttribution } from './loomy-channel.js'
 
 /** 「一键签到」的语义说明（供 UI 提示用，避免写成「+5000 积分」）。 */
 export const LOOMY_DAILY_QUOTA_DESCRIPTION = '每日赠送额度（消耗后不回补）'
@@ -211,7 +212,9 @@ export async function claimLoomyDailyQuota(
   fetcher: typeof fetch = fetch,
 ): Promise<ClaimOutcome> {
   const result = await tryRequestLoomy<Record<string, unknown>>(
-    credential, product, '/points/first-login', { method: 'POST', body: {} }, fetcher,
+    credential, product, '/points/first-login',
+    { method: 'POST', body: buildLoomyFirstLoginBody(resolveLoomyChannelAttribution()) },
+    fetcher,
   )
 
   if (!result.ok) {

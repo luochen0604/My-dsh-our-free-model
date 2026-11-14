@@ -347,52 +347,85 @@ export function parseTraeCallbackDetailed(rawUrl: string): TraeCallbackParseResu
 /**
  * 用**回调解出的凭证**换取最终凭据（供回调服务器与 E2E 复用）。
  *
- * 对齐 `login.sh:168-212` 的两条分支：
- * 1. 有 `refreshToken` → `ExchangeToken` 换新 access（并**轮换** refreshToken）；
- * 2. 无 `refreshToken` → 直接用 `userJwt.Token` 兜底，不走 ExchangeToken。
+ * ## 两条分支都按客户端 `main.js` 的请求体形状实现
+ *
+ * 1. **PKCE 分支**（`authCode` 存在）→ 客户端 `exchangeTokenByAuthCode`：
+ *    ```js
+ *    { ClientID, AuthCode, CodeVerifier, DeviceInfo, IDEVersion }
+ *    ```
+ *    `ClientID` = `SS(productService)`（IDE 包是 `ono9krqynydwx5`），
+ *    `CodeVerifier` = 登录 URL 里 `code_challenge` 的原像。
+ * 2. **refreshToken 分支** → 客户端 `exchangeTokenByRefreshToken`：
+ *    ```js
+ *    { ClientID, ClientSecret:"", RefreshToken, DeviceInfo, DeviceProof, IDEVersion }
+ *    ```
+ *    `DeviceProof` 是用**设备 EC 私钥**对
+ *    `"POST\n/path\nclientId\nrefreshToken\ntimestamp\nnonce"` 的 SHA-256 签名。
+ *
+ * ## ⚠️ 与旧实现的三处差异（都是真实缺陷）
+ *
+ * - **`AuthCode` 分支此前根本没实现**：旧代码把 PKCE 回调判成"暂不支持"直接
+ *   失败，而上游授权页**正在走 PKCE**（回调带 `authCodeInfo.AuthCode`）。
+ * - **`DeviceInfo` 此前完全缺失**：客户端每次都发，它是设备指纹的一部分。
+ * - **`ClientSecret` 值是 `""`**，不是 `'-'`：`'-'` 是 Go 端快照的占位符。
  *
  * 随后调 `GetUserInfo` 补齐 uid / nickname / enterpriseId；**失败不阻塞**
- * （回退用回调 `userInfo` 的值）—— 对齐 `login.sh:197-209` 的容错。
- *
- * 不涉及本地服务器，纯 HTTP 请求。
+ * （回退用回调 `userInfo` 的值）。
  *
  * @param callback `parseTraeCallback` 的解出结果
- * @param session 登录时生成的 machineId / deviceId
+ * @param session 登录身份（machineId / deviceId / PKCE verifier）
  * @param product 产品配置
  * @param fetcher fetch 实现
  * @param nowMs 当前时间（测试注入）
  */
 export async function exchangeTraeCallback(
   callback: TraeCallbackInfo,
-  session: { machineId: string; deviceId: string },
+  session: TraeLoginSession,
   product: TraeProduct,
   fetcher: typeof fetch = fetch,
   nowMs: number = Date.now(),
 ): Promise<TraeCredential> {
+  const exchangeUrl = `${product.oauthHost}${TRAE_EXCHANGE_PATH}`
   let exchange: TraeExchangeResult
-  if (callback.refreshToken.length > 0) {
-    // ── 分支 1：ExchangeToken（access + refreshToken 轮换）──
-    const exchangeBody = {
+
+  if (callback.authCode !== undefined && callback.authCode.length > 0) {
+    // ── 分支 1（客户端主流程）：PKCE 授权码换 token ──
+    if (session.codeVerifier.length === 0) {
+      throw new Error('TRAE 回调返回了授权码，但本次登录没有 PKCE code_verifier，无法换取 token')
+    }
+    const deviceInfo = await buildTraeDeviceInfo(session, product)
+    const body = {
       ClientID: product.clientId,
+      AuthCode: callback.authCode,
+      CodeVerifier: session.codeVerifier,
+      DeviceInfo: deviceInfo,
+      IDEVersion: product.appVersion,
+    }
+    exchange = await postTraeExchange(exchangeUrl, body, '', product, fetcher)
+  } else if (callback.refreshToken.length > 0) {
+    // ── 分支 2：refreshToken 换 token（客户端 `exchangeTokenByRefreshToken`）──
+    const deviceInfo = await buildTraeDeviceInfo(session, product)
+    const proof = session.deviceProof === undefined
+      ? undefined
+      : createTraeDeviceProof({
+        method: 'POST',
+        path: TRAE_EXCHANGE_PATH,
+        clientId: product.clientId,
+        refreshToken: callback.refreshToken,
+        privateKeyPem: session.deviceProof.privateKeyPem,
+      })
+    const body = {
+      ClientID: product.clientId,
+      // ⚠️ 客户端发的是空串（`ClientSecret:""`），不是 `'-'`。
+      ClientSecret: '',
       RefreshToken: callback.refreshToken,
-      ClientSecret: '-',
-      UserID: '',
+      DeviceInfo: deviceInfo,
+      ...proof === undefined ? {} : { DeviceProof: proof },
+      IDEVersion: product.appVersion,
     }
-    const exchangeResp = await fetcher(`${product.oauthHost}${TRAE_EXCHANGE_PATH}`, {
-      method: 'POST',
-      headers: traeOAuthHeaders(product),
-      body: JSON.stringify(exchangeBody),
-      signal: AbortSignal.timeout(TRAE_REQUEST_TIMEOUT_MS),
-    })
-    if (!exchangeResp.ok) {
-      const text = await exchangeResp.text().catch(() => '')
-      throw new Error(`TRAE ExchangeToken 失败（HTTP ${exchangeResp.status}）：${text.length > 200 ? text.slice(0, 200) : text}`)
-    }
-    const parsed = parseTraeExchangeResponse(await exchangeResp.json() as Record<string, unknown>)
-    if (parsed === undefined) throw new Error('TRAE ExchangeToken 响应缺少 Token')
-    exchange = parsed
+    exchange = await postTraeExchange(exchangeUrl, body, '', product, fetcher)
   } else {
-    // ── 分支 2：无 refreshToken，直接用 userJwt.Token 兜底 ──
+    // ── 分支 3：无授权码也无 refreshToken，用回调里的 userJwt.Token 兜底 ──
     exchange = {
       accessToken: callback.accessToken,
       refreshToken: '',

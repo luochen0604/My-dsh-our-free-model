@@ -73,6 +73,14 @@ globalThis.fetch = offlineFetch
 const dispose = []
 const routes = []
 const adapters = new Map()
+/**
+ * 纯签到渠道：只有账号池与签到/唤醒能力，**没有 LLM adapter**（不提供模型推理）。
+ *
+ * 与 `client.js` 的 `signInOnly: true` 同义（UI 侧据此从渠道目录里剔除，
+ * 否则会渲染成一张永远「未连接」的空卡）。这里显式列出来，好让「已挂载 adapter
+ * 集合」能与「SUPPORTED_PROVIDERS」对上账而不必写死数字。
+ */
+const SIGNIN_ONLY_PROVIDERS = new Set(['workbuddy', 'lingxi'])
 const writes = []
 const creds = new Map([['OPENCODE_ACCOUNT_EXISTING', { value: '{"api_key":"test-existing-key"}' }]])
 const services = {
@@ -121,7 +129,24 @@ try {
   apply(ctx, { disableOpencode: true })
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(adapters.has('opencode'), false, 'disabled account provider is not registered')
-  assert.equal(adapters.size, 10, 'all other account providers remain registered')
+  // 不硬编码 provider 数：断言的是「除被禁用的 opencode 外，其余全部仍挂载」这件事本身。
+  // （2026-11-14 加 doubao 时这里仍写死 10，多一个渠道就误报 —— 与上面 cards 同款问题。）
+  //
+  // ⚠️ 真值源**不能**用 store 的 SUPPORTED_PROVIDERS：那张表还包含**纯签到渠道**
+  // （workbuddy / lingxi —— 只有账号池与签到，没有 LLM adapter，见 client.js 的
+  // `signInOnly`），它们的数量天然多于已挂载的 adapter 数。这里断言的是
+  // 「每个**有推理能力**的 provider 都在，且 opencode 被禁用」。
+  const supported = pack.SUPPORTED_PROVIDERS
+  assert.ok(Array.isArray(supported) && supported.length > 0,
+    'pack must export SUPPORTED_PROVIDERS so tests can derive provider sets instead of hardcoding them')
+  // 有 LLM adapter 的渠道 = 支持表里去掉纯签到渠道。
+  const expectedAdapters = supported.filter(provider =>
+    provider !== 'opencode' && !SIGNIN_ONLY_PROVIDERS.has(provider))
+  assert.deepEqual(
+    [...adapters.keys()].sort(),
+    expectedAdapters.sort(),
+    'exactly the inference-capable providers are mounted (opencode disabled, sign-in-only channels excluded)',
+  )
   verifyChannelImagePricing(adapters)
   console.log('ok  十渠道同步图片计价：缺失及默认方法兜底，厂商计价优先，重复图片与已卸载图片正确计数')
   assert.equal(writes.length, 0, 'mount neither creates nor deletes credentials')
@@ -283,10 +308,12 @@ try {
     visit(node.children)
   }
   visit(tree)
-  assert.equal(cards.length, 10)
+  // 不硬编码 provider 数：断言的是「UI 卡片 == 已挂载账户 provider」这件事本身。
+  // （2026-11-14 加 lingxi 时这里曾写死 10，多一个渠道就误报。）
+  assert.equal(cards.length, adapters.size, `UI 卡片数应与已挂载 provider 数一致（${adapters.size}）`)
   for (const provider of ['opencode', 'unsupported-alpha', 'unsupported-beta']) assert.equal(cards.includes(provider), false)
   assert.deepEqual([...cards].sort(), [...adapters.keys()].sort(), 'UI and mounted account providers agree')
-  console.log('ok  actual channel page: 10 account cards, OpenCode and unsupported providers removed')
+  console.log(`ok  actual channel page: ${cards.length} account cards, OpenCode and unsupported providers removed`)
   await verifyChannelModelActions()
   await verifyChannelCreditsUi()
   console.log('ok  共享渠道余额：十渠道能力、失败原因、重试、签到反馈和请求交错')

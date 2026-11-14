@@ -57,6 +57,15 @@ export interface LoomyProduct {
   accessKeySecret: string
   /** 讯飞 appId（账号请求体 `base.appid`）。 */
   appId: string
+  /**
+   * 微信登录的讯飞侧 `authconf`（可选）。
+   *
+   * 客户端从 `.env.prod` 的 `LOOMY_XFYUN_WECHAT_AUTHCONF` 读取，
+   * **生产包里没有该键** —— 注释写明「讯飞侧走 default 槽位所以 authconf 缺省」。
+   * 故此处保持可选且缺省：非空时才随 `bind/auth` 等端点发送
+   * （客户端 `if (this.config.wechatAuthconf)`）。
+   */
+  wechatAuthconf?: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
   /** 远端模型列表不可用时的兜底模型目录（8 个 chat 模型）。 */

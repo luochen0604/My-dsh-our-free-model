@@ -393,14 +393,18 @@ function randomHex(n: number): string {
 /**
  * 构造 OAuth（ExchangeToken / GetUserInfo）请求头。
  *
- * 对齐 Go 端 `OAuthHeaders`（`headers.go:60-64`）：无签名，仅 UA。
- * GetUserInfo 需要额外 `X-Cloudide-Token` 头，由调用方自行添加。
+ * 客户端 `request.js` 的两个方法都只用 `getHeaders(token)`：
+ * `{ 'Content-Type': 'application/json', 'x-cloudide-token': <token> }`
+ * —— **没有** UA 或其它自定义头（`q1.request` 统一加代理相关头，与本协议无关）。
+ * 早期这里的 `Accept` / `User-Agent` 是 Go 端快照的遗留，客户端并不发送。
+ *
+ * GetUserInfo 的 `x-cloudide-token` 由调用方传入；ExchangeToken 传空串
+ * （客户端 `getHeaders("")` 同款）。
  */
-export function traeOAuthHeaders(product: TraeProduct): Record<string, string> {
+export function traeOAuthHeaders(token = ''): Record<string, string> {
   return {
     'Content-Type': 'application/json',
-    Accept: 'application/json',
-    'User-Agent': product.userAgent,
+    'x-cloudide-token': token,
   }
 }
 

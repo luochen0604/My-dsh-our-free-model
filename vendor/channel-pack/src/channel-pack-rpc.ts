@@ -39,6 +39,14 @@ import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
 import type { RaccoonAuth } from './raccoon-auth.js'
+import type { DoubaoAuth } from './doubao-auth.js'
+import { DOUBAO } from './doubao-product.js'
+import {
+  claimDoubaoDailyPoints,
+  fetchDoubaoCheckinStatus,
+  fetchDoubaoCreditBalance,
+} from './doubao-credits.js'
+import type { DoubaoCredential } from './doubao.js'
 import { claimRaccoonDailyPoints, fetchRaccoonDailyCheckinStatus } from './raccoon-credits.js'
 import type { ZcodeAuth } from './zcode-auth.js'
 import { ZCODE } from './zcode-product.js'
@@ -73,6 +81,16 @@ import {
   workbuddyCredentialExpiresAtMs,
   type WorkbuddyCredential,
 } from './workbuddy-credits.js'
+import {
+  LINGXI_ID,
+  claimLingxiDailyCheckin,
+  claimWpsFuliCheckin,
+  claimWpsTaskCheckin,
+  fetchLingxiBalance,
+  fetchLingxiCheckinStatus,
+  wpsAuthCheck,
+  type LingxiCredential,
+} from './wps-credits.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 import { fetchGeminiCreditBalance } from './gemini-credits.js'
 import { shouldRefreshNow, syncAccountExpiry } from './expiry-sync.js'
@@ -278,6 +296,8 @@ export const OPS_CHECKIN_PROVIDERS: ReadonlySet<string> = new Set([
   MINIMAX.id,
   ZCODE.id,
   WORKBUDDY_ID,
+  // WPS（灵犀/福利中心/任务中心，共用一个 wps_sid）有真实签到接口，参与签到。
+  LINGXI_ID,
 ])
 
 /**
@@ -839,6 +859,13 @@ export function registerChannelPackRpc(
    */
   gemini: GeminiAuth,
   /**
+   * 豆包工作（cookie 直填渠道）。
+   *
+   * ⚠️ 追加在 `gemini` **之后**（而非插到它前面）：本仓库调用点是位置传参，
+   * 新 provider 一律追加末尾才不会错位既有调用点。
+   */
+  doubao: DoubaoAuth,
+  /**
    * provider → 适配器实例（可选）。
    *
    * 用于「显示列表」拿到**不受用户黑名单影响**的全量目录（`listAllModels`），
@@ -851,7 +878,7 @@ export function registerChannelPackRpc(
   ctx.inject(['connection'], (connectionCtx) => {
     registerChannelPackEndpoints(
       connectionCtx as Context, pool, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config,
+      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, doubao, modelAdapters, config,
     )
   })
 }
@@ -961,6 +988,7 @@ function registerChannelPackEndpoints(
   minimax: MinimaxAuth,
   zcode: ZcodeAuth,
   gemini: GeminiAuth,
+  doubao: DoubaoAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
   config: ChannelPackRpcConfig = {},
 ): void {
@@ -1969,6 +1997,69 @@ if (provider === LOBSTERAI.id) {
         return { ok: true, value: undefined }
       }
 
+      /**
+       * 导入 cookie 型凭据（当前仅豆包 `doubao`）。
+       *
+       * ## 为什么是独立方法，而不是 `account.create` 的一个分支
+       *
+       * 其余 provider 的 `account.create` 是**两段式**：先建占位账号、返回
+       * `loginUrl`、后台轮询把凭据回填。豆包没有 URL（用户从豆包工作复制
+       * cookie 粘贴进来），塞进那条链会让 `loginAttempt` 一直等一个永远不来的
+       * popup。独立方法语义更直白：**一次调用即完成创建 + 验证 + 落盘**。
+       *
+       * ⚠️ 验证失败必须**不留下账号**（否则用户会看到一个永远连不上的空卡片）。
+       * 故顺序是：先 `importCookie`（含探活，失败即抛）→ 成功后才 `pool.addAccount`。
+       */
+      case 'account.importCookie': {
+        const req = payload as {
+          provider?: string
+          cookie?: string
+          nickname?: string
+        }
+        if (req.provider !== DOUBAO.id) {
+          return { ok: false, error: { code: 'bad-request', message: `该渠道不支持 cookie 导入：${String(req.provider)}` } }
+        }
+        const cookieInput = typeof req.cookie === 'string' ? req.cookie.trim() : ''
+        if (cookieInput.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: '请粘贴豆包的 cookie（至少包含 sessionid=...）' } }
+        }
+
+        const id = `${DOUBAO.id}-${shortId()}`
+        const refName = `DOUBAO_ACCOUNT_${shortId().toUpperCase()}`
+
+        let loginResult
+        try {
+          loginResult = await doubao.importCookie(cookieInput, {
+            nickname: typeof req.nickname === 'string' ? req.nickname : '',
+            refName,
+          })
+        } catch (error) {
+          // 探活失败：不建账号，把可读原因回给前端。
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          }
+        }
+
+        await pool.addAccount({
+          id,
+          provider: DOUBAO.id,
+          nickname: typeof req.nickname === 'string' && req.nickname.length > 0
+            ? req.nickname
+            : `豆包 ${id.slice(-6)}`,
+          enabled: true,
+          credentialRef: loginResult.ref,
+          // 豆包无续期端点 ⇒ 恒 false（续期定时器据此跳过）。
+          refreshable: false,
+          createdAt: Date.now(),
+        })
+
+        return { ok: true, value: { accountId: id } }
+      }
+
       case 'account.delete': {
         const req = payload as RpcDeleteAccountRequest
         await pool.removeAccount(req.accountId)
@@ -2158,6 +2249,41 @@ if (provider === LOBSTERAI.id) {
                 tag: '[workbuddy]',
                 warn: (message) => ctx.logger.warn(message),
               })
+              break
+            }
+            case LINGXI_ID: {
+              /**
+               * WPS（灵犀/福利中心/任务中心）的唤醒 = **探活式刷新**，不是续期。
+               *
+               * `wps_sid` **无 set-cookie 轮换、稳定不失效**（源码注释明确），
+               * 没有续期端点 —— 与 ZCode 同策略：
+               * 1. `auth/check` 验证 sid 仍有效（无效 ⇒ 抛「请重新导入」）；
+               * 2. 读一次 `credits/balance` 刷新额度读数（唤醒顺带把余额对一遍账）。
+               * 余额读不到不臆造成功 —— 探活是「验证它现在活着」。
+               */
+              const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+              if (!resolved) throw new Error('凭据未配置')
+              let credential: LingxiCredential
+              try {
+                credential = JSON.parse(resolved.value) as LingxiCredential
+              } catch {
+                throw new Error('凭据解析失败')
+              }
+              if (typeof credential.wpsSid !== 'string' || credential.wpsSid.length === 0
+                || typeof credential.uid !== 'string' || credential.uid.length === 0) {
+                throw new Error('Lingxi 凭据缺少 wpsSid/uid，请重新导入该账号')
+              }
+              const probe = await wpsAuthCheck(credential)
+              if (probe === null) {
+                throw new Error('Lingxi 探活失败（wps_sid 已失效或网络异常），请重新导入该账号')
+              }
+              const balance = await fetchLingxiBalance(credential)
+              if (balance === null) {
+                // sid 有效但余额读不到：探活本身已通过，不失败，只记一条 warn。
+                ctx.logger.warn(
+                  `[channel-pack] lingxi 账号 ${entry.id} 探活通过但余额读取失败（不失败，仅告警）`,
+                )
+              }
               break
             }
             default:
@@ -2799,6 +2925,22 @@ if (provider === LOBSTERAI.id) {
           )
           return { ok: true, value: { accounts: value } satisfies RpcCreditsStatusResponse }
         }
+        if (req.provider === LINGXI_ID) {
+          // ⚠️ WPS（灵犀/福利中心/任务中心）：灵犀 claim **没有**独立 status 端点
+          //（`daily_check_in/status` 实测 404），但福利中心与任务中心有只读状态。
+          // `fetchLingxiCheckinStatus` 读那两个只读端点做汇总，**不产生入账**。
+          // ⚠️ 且「已签」时灵犀 claim 也回 `result:'ok'` —— 状态查询绝不能靠调
+          // claim 推导，那会真的触发一次入账路径（虽然幂等，但没必要多发）。
+          const lingxiStatusAccounts = await pool.listAccounts(req.provider)
+          const value = await collectCreditsStatus<LingxiCredential, undefined>(
+            lingxiStatusAccounts, undefined, {
+              resolve: (ref) => ctx.credentials.resolve(ref),
+              fetchStatus: (credential) => fetchLingxiCheckinStatus(credential),
+              warn: (msg) => ctx.logger?.warn?.(msg),
+            },
+          )
+          return { ok: true, value: { accounts: value } satisfies RpcCreditsStatusResponse }
+        }
         return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
       }
 
@@ -3031,6 +3173,82 @@ if (provider === LOBSTERAI.id) {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchStatus: (credential) => fetchWorkbuddyCheckinStatus(credential),
             claim: (credential) => claimWorkbuddyDailyCheckin(credential),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return record(value)
+        }
+        if (req.provider === LINGXI_ID) {
+          // WPS 每日签到：一个账号 = **三处独立签到**（灵犀算力点 + 福利中心 +
+          // 任务中心），共用一个 `wps_sid`。
+          //
+          // ⚠️ **precheckStatus: false** —— 灵犀 claim 没有独立 status 端点
+          //（`daily_check_in/status` 实测 404），`fetchLingxiCheckinStatus` 只覆盖
+          // 福利/任务两处，用它预检会在灵犀未签时误判「已签」（todayCheckedIn
+          // 要求两处都签）—— 漏签远比多发一次幂等请求严重。幂等与「ok 不等于
+          // 入账」都由各 claim 函数**内部的二次复核**兜住（见 wps-credits.ts
+          // 文件头）：灵犀靠余额差值、福利/任务靠状态端点回读。
+          //
+          // ⚠️ 一个账号产出**三条** outcome（每处签到各一条）—— `collectClaimResults`
+          // 只装一条（与 zcode「一个账号多条 plan」同型的形状不匹配），故这里
+          // 自己逐账号遍历，逐条展开进 results。
+          const results: RpcCreditsClaimAllResponse['results'] = []
+          const outcomes: ClaimOutcome[] = []
+          for (const account of accounts) {
+            let credential: LingxiCredential | undefined
+            try {
+              const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+              if (resolved === undefined) {
+                outcomes.push({ kind: 'failed', code: -1, message: '凭据未配置' })
+              } else {
+                try {
+                  credential = JSON.parse(resolved.value) as LingxiCredential
+                } catch {
+                  credential = undefined
+                }
+                if (credential === undefined) {
+                  outcomes.push({ kind: 'failed', code: -1, message: '凭据解析失败' })
+                } else if (typeof credential.wpsSid !== 'string' || credential.wpsSid.length === 0
+                  || typeof credential.uid !== 'string' || credential.uid.length === 0) {
+                  outcomes.push({ kind: 'failed', code: -1, message: 'Lingxi 凭据缺少 wpsSid/uid' })
+                } else {
+                  // 三处签到的顺序：灵犀（决定性复核 = 余额差值）→ 福利 → 任务。
+                  // 顺序无关紧要（三处互不影响），但失败要逐条独立结算。
+                  outcomes.push(await claimLingxiDailyCheckin(credential))
+                  outcomes.push(await claimWpsFuliCheckin(credential))
+                  outcomes.push(await claimWpsTaskCheckin(credential))
+                }
+              }
+            } catch (error) {
+              outcomes.push({
+                kind: 'failed', code: -1,
+                message: error instanceof Error ? error.message : String(error),
+              })
+            }
+            // 每条 outcome 都落同一个 accountId（面板按账号聚合展示三行）。
+            for (const outcome of outcomes.slice(-3)) {
+              results.push({ accountId: account.id, nickname: account.nickname, outcome })
+            }
+          }
+          const value: RpcCreditsClaimAllResponse = { results, summary: computeClaimSummary(outcomes) }
+          return record(value)
+        }
+        if (req.provider === DOUBAO.id) {
+          // 豆包每日积分：`POST /alice/ug/campaign/landing/checkin`。
+          //
+          // ⚠️ **precheckStatus 保持默认（true）**：`fetchDoubaoCheckinStatus`
+          // 端点（`landing/get`）是**推断**来的，若它 404 会返回 undefined，
+          // `collectClaimResults` 把 undefined 当"查不到状态"→ 仍然尝试领取。
+          // 这个降级路径正是我们想要的：状态查不到不代表不能领。
+          //
+          // ⚠️ `claimDoubaoDailyPoints` 内部已做二次复核（granted:false 时回查
+          // 今日记录，才区分 already-claimed / inactive）—— 与 raccoon 踩过的
+          // 「granted:false 谎报今天已领」同一个坑，已在该函数里堵死。
+          const value = await collectClaimResults<DoubaoCredential, typeof DOUBAO>(accounts, DOUBAO, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            // 契约要求 status 为 `null`，而 credits 模块用 `undefined` 表达"查不到"。
+            fetchStatus: async (credential, product) =>
+              await fetchDoubaoCheckinStatus(credential, product) ?? null,
+            claim: (credential, product) => claimDoubaoDailyPoints(credential, product),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return record(value)
@@ -3440,6 +3658,102 @@ if (provider === LOBSTERAI.id) {
             balance: null,
             error: 'WorkBuddy 无余额查询接口（balance 端点 404）；签到积分可在签到面板查看',
           }))
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === LINGXI_ID) {
+          // 余额来自 `GET lingxi.kdocs.cn/api/public/v1/credits/balance`（**只读**）。
+          // ⚠️ 单位是「算力点」（points），`total_bonus`（奖励积分）是签到入账的
+          // 观察量 —— 余额卡展示 totalBalance；奖励/购买两个子口径留在注释层，
+          // CreditBalance 的 packages 结构不需要逐包拆分（灵犀响应只有计数，
+          // bonus_credits[] 的逐包字段未在本轮接入，需要时再补）。
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (!resolved) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置',
+              })
+              continue
+            }
+            let credential: LingxiCredential
+            try {
+              credential = JSON.parse(resolved.value) as LingxiCredential
+            } catch {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据解析失败',
+              })
+              continue
+            }
+            const balance = await fetchLingxiBalance(credential)
+            if (balance === null) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '算力点查询失败（凭据失效或网络异常）',
+              })
+              continue
+            }
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance: {
+                total: balance.totalBalance,
+                packages: [{
+                  // 奖励积分与购买积分同池可用；拆包只报一条汇总。
+                  name: '灵犀算力点',
+                  unit: 'points',
+                  remaining: balance.totalBalance,
+                  total: Math.round((balance.bonus + balance.purchased) * 100) / 100,
+                  used: Math.max(0,
+                    Math.round(((balance.bonus + balance.purchased) - balance.totalBalance) * 100) / 100),
+                  active: true,
+                  cycleStartTime: '',
+                  cycleEndTime: '',
+                  expiredTime: '',
+                }],
+                expiredTotal: 0,
+              },
+            })
+          }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === DOUBAO.id) {
+          // 余额来自 `/commerce/benefit_supply/credit/*`（**只读**）。
+          // ⚠️ 该端点的响应体字段名**未实测**（本机 cookie 被 Chromium 独占锁，
+          // 拿不到真实样本），故 `fetchDoubaoCreditBalance` 走「候选键 + 安全降级」：
+          // 读不到就返回 undefined，这里如实报原因，**不填 0**。
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (!resolved) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置',
+              })
+              continue
+            }
+            let credential: DoubaoCredential
+            try {
+              credential = JSON.parse(resolved.value) as DoubaoCredential
+            } catch {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据解析失败',
+              })
+              continue
+            }
+            const balance = await fetchDoubaoCreditBalance(credential, DOUBAO)
+            if (balance === undefined) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null,
+                error: '豆包积分查询失败（端点响应形态未实测；若持续失败请反馈抓包）',
+              })
+              continue
+            }
+            values.push({ accountId: account.id, nickname: account.nickname, balance })
+          }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }

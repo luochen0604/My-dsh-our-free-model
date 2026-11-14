@@ -11,11 +11,14 @@
  *
  * ```
  * POST {accountBase}/login/phone/sendMsgCode   { base, param:{ ccode, phone, expire:300 } }
- * POST {accountBase}/login/phone/checkCode     { base, param:{ ccode, phone, mcode, msgid, expire:1209600 } }
+ * POST {accountBase}/login/phone/checkCode     { base, param:{ ccode, phone, mcode, msgid, expire:1209600[, channel] } }
  * ```
  *
  * ⚠️ 认证是 **HMAC-SHA1 签名**（`Authorization: account {ak}:{sig}`），
  * 不是 Bearer。见 `loomy-sign.ts`。
+ * ⚠️ `checkCode` 会带**渠道归因** `channel`（有值时），`sendMsgCode` **不带** ——
+ * 两者不对称是客户端 `account-service.js:sendSmsCode/loginBySmsCode` 的原样行为，
+ * 见 `loomy-channel.ts`。渠道号缺失时 body 与不带该键时完全相同。
  * ⚠️ body 必须**先序列化成字符串**，签名与发送共用同一个字符串 ——
  * 二次序列化会改变字节（键序/空格）导致签名失效。
  * ⚠️ `ua` 硬编码 `Loomy|Desktop|Electron|macOS`，Windows 上也是这个值。
@@ -25,6 +28,10 @@ import { randomUUID } from 'node:crypto'
 import { LOOMY_REQUEST_TIMEOUT_MS, parseLoomyEnvelope } from './loomy.js'
 import { loomyAuthHeaders } from './loomy-sign.js'
 import type { LoomyProduct } from './loomy-product.js'
+import {
+  applyLoomyChannelParam,
+  resolveLoomyChannelAttribution,
+} from './loomy-channel.js'
 
 /** 短信验证码有效期（秒）。 */
 export const LOOMY_SMS_CODE_TTL_SECONDS = 300
@@ -163,13 +170,16 @@ export async function loginLoomyBySmsCode(
   product: LoomyProduct,
   fetcher: typeof fetch = fetch,
 ): Promise<LoomyLoginResult> {
-  const body = buildLoomyAccountBody(product, {
+  const param: Record<string, unknown> = {
     ccode: '86',
     phone,
     mcode: code,
     msgid,
     expire: LOOMY_SESSION_TTL_SECONDS,
-  })
+  }
+  // 渠道归因：有渠道号才写键（客户端 `if (channel) param.channel = channel`）。
+  applyLoomyChannelParam(param, resolveLoomyChannelAttribution())
+  const body = buildLoomyAccountBody(product, param)
   const data = await postLoomyAccount('/login/phone/checkCode', body, product, fetcher)
   const record = (data ?? {}) as Record<string, unknown>
   const session = typeof record.session === 'string' ? record.session : ''
@@ -216,10 +226,18 @@ export async function bindLoomyThirdAccount(
   product: LoomyProduct,
   fetcher: typeof fetch = fetch,
 ): Promise<LoomyWechatBindAuth> {
-  const body = buildLoomyAccountBody(product, {
+  const param: Record<string, unknown> = {
     tcode: { code },
     type: 'wx',
-  })
+  }
+  // 渠道归因：客户端在第一步 bind/auth 就上报（`account-service.js:463-466`）。
+  applyLoomyChannelParam(param, resolveLoomyChannelAttribution())
+  // `authconf`：客户端仅在该配置非空时才发（生产包缺省，故通常不出现）。
+  const authconf = product.wechatAuthconf
+  if (typeof authconf === 'string' && authconf.trim().length > 0) {
+    param.authconf = authconf.trim()
+  }
+  const body = buildLoomyAccountBody(product, param)
   const data = await postLoomyAccount('/login/thirdAccount/bind/auth', body, product, fetcher)
   const record = (data ?? {}) as Record<string, unknown>
   const rcode = typeof record.rcode === 'string' ? record.rcode : ''

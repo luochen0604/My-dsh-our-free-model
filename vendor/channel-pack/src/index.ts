@@ -8,6 +8,10 @@ import { registerTraeLlm } from './trae-adapter.js'
 import { registerClineLlm } from './cline-adapter.js'
 import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
 import { registerRaccoonLlm } from './raccoon-adapter.js'
+import { DoubaoAuth } from './doubao-auth.js'
+import { registerDoubaoLlm } from './doubao-adapter.js'
+import { DOUBAO } from './doubao-product.js'
+import type { DoubaoCredential } from './doubao.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
@@ -67,6 +71,9 @@ import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './openco
 import { closeAllProxyDispatchers } from './opencode-proxy.js'
 import { createChannelFetch, type ChannelOutlet } from './channel-fetch.js'
 export { createChannelFetch, parseWindowsProxy, channelProxyBypassed } from './channel-fetch.js'
+// 渠道清单的单一真相源：供测试派生「卡片数 == 已挂载 provider 数」这类关系式断言，
+// 避免每加一个 provider 就要改一遍写死的数字（历史误报见 channel-pack-test.mjs）。
+export { SUPPORTED_PROVIDERS } from './channel-pack-store.js'
 import { execFile } from 'node:child_process'
 
 /**
@@ -891,6 +898,59 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
     product: RACCOON,
   })
 
+  // ===== 豆包工作（DoubaoWork）服务 =====
+  //
+  // ⚠️ 与其余十个 provider 的根本差异：**鉴权是纯 cookie，不是 bearer token**。
+  //
+  // 因此本 provider **不注册 OAuth / 扫码 / 短信登录**，走「凭据导入」：
+  // 用户在豆包工作里登录一次，把 cookie 粘进来。理由见 `doubao-auth.ts` 模块头
+  // （字节 passport 的登录链路没有实测样本，且短信要过阿里云滑块；照猜实现
+  // 必然交付一个必然失败的东西）。
+  //
+  // ⚠️ 本适配器**尚未端到端验证**。两处已知未解（见
+  // `docs/research/doubaowork/README.md` §7）：
+  //   1. `event: pb` 的 protobuf 帧解不了（`pb.desc` 里无 samantha 对话 schema）；
+  //   2. `aid` / `botId` 是占位值，未取到真实字面量。
+  // 故 `stream()` 遇到 pb 帧会**抛明确错误**，不静默返回空流。
+  //
+  // 服务名由 DoubaoAuth 依 product.id 派生，注册为 ctx.doubaoAuth。
+  const doubao = new DoubaoAuth(ctx)
+  const doubaoAdapter = registerDoubaoLlm(ctx, {
+    ctx,
+    credentialRef: credentialRef(DOUBAO.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 doubao 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      const available = await pool.getAvailableAccount(DOUBAO.id, '')
+      if (available) {
+        reportLedgerAccount(DOUBAO.id, available.entry.id)
+        return available.credential as unknown as DoubaoCredential
+      }
+      const resolved = await ctx.credentials.resolve(credentialRef(DOUBAO.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as DoubaoCredential
+      } catch {
+        return undefined
+      }
+    },
+    // 豆包没有续期端点，"刷新"= 探活 + 更新时间戳（见 doubao-auth.ts）。
+    refresh: async (accountId?: string) => {
+      const entry = accountId === undefined ? undefined
+        : pool.listAccountsByProvider(DOUBAO.id).find(account => account.id === accountId)
+      if (accountId !== undefined && entry === undefined) throw new Error('doubao: account no longer exists')
+      if (entry) await doubao.refreshAccountCredential(entry.credentialRef)
+      else await doubao.refresh()
+      const resolved = await ctx.credentials.resolve(
+        credentialRef(entry?.credentialRef ?? DOUBAO.defaultCredentialRef),
+      )
+      if (!resolved) throw new Error('doubao: credential no longer exists')
+      return JSON.parse(resolved.value) as DoubaoCredential
+    },
+    accountPool: pool,
+    product: DOUBAO,
+  })
+
   // ===== MiniMax Code（中国版）服务 =====
   //
   // ⚠️ 登录走 **OAuth 设备码 + PKCE**（与 Qoder 同型：不起本地监听端口，
@@ -1657,6 +1717,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     minimax: pruned(MINIMAX.id, minimaxAdapter),
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
+    doubao: pruned(DOUBAO.id, doubaoAdapter),
     ...(opencodeAdapter === undefined ? {} : { opencode: pruned(OPENCODE.id, opencodeAdapter) }),
   }
 
@@ -1665,7 +1726,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 丢的却是「下一轮工具调用能不能带上签名」。
   ctx.effect(() => () => { void geminiSigStore.flush().catch(() => {}) })
 
-  registerChannelPackRpc(ctx, pool, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
+  registerChannelPackRpc(ctx, pool, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, doubao, modelAdapters, {
     ...config,
   })
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已

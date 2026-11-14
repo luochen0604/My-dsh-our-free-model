@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+// 任务中心签到前要取 RSA 公钥：替身必须现造一对真密钥，否则实现拿不到 PEM 会整条记 failed。
+import { generateKeyPairSync } from 'node:crypto'
 
 /** 使用实际已打包 RPC，只提供账号池 ref，禁止真实网络与旧单凭据回退。 */
 export async function verifyChannelCreditsRpc({ ctx, call, creds, adapters }) {
@@ -97,6 +99,7 @@ export async function verifyChannelCreditsRpc({ ctx, call, creds, adapters }) {
     }
     await verifyWorkbuddyWake({ ctx, call, creds })
     await verifyRaccoonDailyClaim({ ctx, call, creds })
+    await verifyLingxiCredits({ ctx, call, creds })
   } finally {
     ctx.credentials.resolve = originalResolve
     globalThis.fetch = originalFetch
@@ -416,6 +419,132 @@ export async function verifyWorkbuddyWake({ ctx, call, creds }) {
     assert.equal(row.status.streakDays, 1)
 
     console.log('ok  WorkBuddy wake: 双编码自愈、桌面端续期契约（/v2/plugin/auth/token/refresh）轮换落盘、401 与探活失败如实报错')
+  } finally {
+    globalThis.fetch = originalFetch
+    await ctx.accountPool.removeAccount(accountId)
+    creds.delete(ref)
+  }
+}
+
+/**
+ * WPS 灵犀（lingxi）的 UI 契约守护（2026-11-14 接入）：
+ *
+ * 1. **单位是「算力点」**：`credits.balances` 的 lingxi 分支 package `unit:'points'`，
+ *    客户端 `CHANNEL_CREDITS.lingxi.unit` 必须与它一致（UI 余额卡据此选标签）。
+ * 2. **一键签到 = 三处**：`credits.claimAll` 对同一账号产出**三条** outcome
+ *    （灵犀算力点 → 福利中心 → 任务中心），`summary.claimed` 计的是「处」不是
+ *    「账号」—— 客户端成功文案按「处」计数，不能照抄「N 个账号」。
+ * 3. **状态端点存在**：`credits.status` 返回汇总（福利+任务都签才算已签），
+ *    客户端 `CHANNEL_CREDITS.lingxi.status` 才能为 true。
+ *
+ * 用本地替身端点（明文 JSON 两个域 + 任务中心 RSA+AES），零真实网络。
+ */
+export async function verifyLingxiCredits({ ctx, call, creds }) {
+  const originalFetch = globalThis.fetch
+  const accountId = 'fixture-lingxi-credits'
+  const ref = 'LINGXI_ACCOUNT_FIXTURE'
+  const uid = '1234567890'
+  const wpsSid = 'fixture-wps-sid'
+  const requests = []
+  let balanceBonus = 100
+  let lingxiSigned = false
+  let fuliSigned = false
+  let taskSigned = false
+  const today = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10)
+  const envelope = (data, msg = 'OK') => ({ result: 'ok', msg, data: data ?? {} })
+  const credential = () => JSON.stringify({ uid, wpsSid, nickname: 'Lingxi fixture' })
+  const fetchStub = async (input, init) => {
+    const url = new URL(String(input))
+    requests.push({ url: url.toString(), method: init?.method ?? 'GET' })
+    if (url.host === 'lingxi.kdocs.cn') {
+      if (url.pathname.endsWith('/credits/balance')) {
+        return Response.json(envelope({ total_balance: balanceBonus, total_bonus: balanceBonus, total_purchased: 0 }))
+      }
+      if (url.pathname.endsWith('/tasks/daily_check_in/claim')) {
+        // ★ 真实服务端的语义：当天已领过就不再涨余额（已签时仍回 result:'ok'，
+        // 这正是实现必须靠「余额差值」复核的原因）。替身无条件 +5 会让第二轮
+        // 幂等断言（应当 already-claimed）误判成再次 claimed。
+        if (lingxiSigned) return Response.json(envelope({ reward_amount: 0 }))
+        lingxiSigned = true
+        balanceBonus += 5
+        return Response.json(envelope({ reward_amount: 5 }))
+      }
+    }
+    if (url.host === 'personal-act.wps.cn') {
+      if (url.pathname.endsWith('/page_info')) {
+        return Response.json(envelope({ fragment_collect: {
+          sign_series_id: 'fixture-series',
+          sign_records: [{ sign_date: today, sign_status: fuliSigned ? 'signed' : 'unsigned', reward_title: '积分+5' }],
+        } }))
+      }
+      if (url.pathname.endsWith('/component_action')) {
+        fuliSigned = true
+        return Response.json(envelope({ fragment_collect: { success: true } }))
+      }
+    }
+    if (url.host === 'personal-bus.wps.cn') {
+      if (url.pathname.endsWith('/user_stat')) {
+        return Response.json(envelope({ has_signed: taskSigned, today_reward: ['积分+1'], month_continuous_days: 2 }))
+      }
+      if (url.pathname.endsWith('/encrypt/key')) {
+        // 任务中心签到前要取一次 RSA 公钥。真实接口把 PEM 放在 `data` 且是
+        // **base64 编码过的字符串** —— 实现里先 `Buffer.from(pemRaw, 'base64').toString('utf8')`
+        // 再当 PEM 用。替身必须按同一约定返回（直接给明文 PEM 会被 base64 解码成乱码，
+        // animate 出「构造加密载荷失败」，整条记 failed）。
+        const { publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
+        const pem = publicKey.export({ type: 'spki', format: 'pem' })
+        return Response.json(envelope(Buffer.from(pem, 'utf8').toString('base64')))
+      }
+      if (url.pathname.endsWith('/sign_in')) {
+        taskSigned = true
+        return Response.json(envelope({ rewards: [{ reward_name: '积分+1' }] }))
+      }
+    }
+    throw new Error(`未预期的 lingxi 替身端点：${url.toString()}`)
+  }
+  try {
+    globalThis.fetch = fetchStub
+    creds.set(ref, { value: credential() })
+    await ctx.accountPool.addAccount({
+      id: accountId, provider: 'lingxi', nickname: 'Lingxi fixture',
+      credentialRef: ref, enabled: true, refreshable: false, createdAt: 1,
+    })
+
+    // ① 余额：单位必须是 points（算力点），且读的是只读 balance 端点。
+    const balances = await call('credits.balances', { provider: 'lingxi' })
+    assert.equal(balances.ok, true)
+    const balanceRow = balances.value.accounts.find(item => item.accountId === accountId)
+    assert.ok(balanceRow?.balance, '余额必须能查到')
+    assert.equal(balanceRow.balance.packages[0].unit, 'points', 'UI 据此选择「算力点」标签，单位错了卡片会显示错量纲')
+    assert.equal(Number.isFinite(balanceRow.balance.total), true)
+
+    // ② 一键签到：同一账号产出三条 outcome（灵犀→福利→任务），claimed 计「处」。
+    const claim = await call('credits.claimAll', { provider: 'lingxi' })
+    assert.equal(claim.ok, true)
+    const rows = claim.value.results.filter(item => item.accountId === accountId)
+    assert.equal(rows.length, 3, '三处签到必须产出三条 outcome（UI 流水按行展示，缺一条就是漏签一处）')
+    assert.equal(rows[0].outcome.kind, 'claimed', '灵犀：余额差值复核通过 ⇒ claimed')
+    assert.equal(rows[0].outcome.credit, 5, '灵犀的入账量来自余额差值（决定性复核）')
+    assert.equal(rows[1].outcome.kind, 'claimed', '福利中心：page_info 回读 signed ⇒ claimed')
+    assert.equal(rows[2].outcome.kind, 'claimed', '任务中心：user_stat 回读 has_signed ⇒ claimed')
+    assert.equal(claim.value.summary.claimed, 3, 'summary.claimed 计「处」——客户端成功文案按处计数')
+
+    // ③ 状态：福利+任务都签 ⇒ todayCheckedIn（灵犀无独立 status 端点，属预期）。
+    const status = await call('credits.status', { provider: 'lingxi' })
+    assert.equal(status.ok, true)
+    const statusRow = status.value.accounts.find(item => item.accountId === accountId)
+    assert.equal(statusRow.status.todayCheckedIn, true, '两处都签 ⇒ 渠道「今日完成」')
+
+    // ④ 幂等：再签一轮应是 already（灵犀靠余额差值、福利/任务靠状态回读）。
+    requests.length = 0
+    const again = await call('credits.claimAll', { provider: 'lingxi' })
+    assert.equal(again.ok, true)
+    const againRows = again.value.results.filter(item => item.accountId === accountId)
+    assert.equal(againRows.length, 3)
+    assert.equal(againRows.every(item => item.outcome.kind === 'already-claimed'), true,
+      '已签后重签不得谎报 claimed（result:ok 不等于入账）')
+
+    console.log('ok  lingxi credits: 单位 points、一键签到三条 outcome（处计数）、状态汇总、幂等重签')
   } finally {
     globalThis.fetch = originalFetch
     await ctx.accountPool.removeAccount(accountId)

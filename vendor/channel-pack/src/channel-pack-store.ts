@@ -362,12 +362,33 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   //（凭据还在，只是索引建不出来，用户只能重新授权）。
   // WB 是「凭据直填」渠道（无浏览器登录流），但账号池/恢复表逻辑同构。
   ['WORKBUDDY', 'workbuddy'],
+  // ⚠️ 第 16 个 provider（lingxi，2026-11-14）—— 同款坑第 **五** 次。
+  // WPS 三处签到（灵犀算力点 / 福利中心 / 任务中心）共用一个 `wps_sid`，
+  // 挂在 `lingxi` 这一个 provider 下（与网关中转池一致）。漏加 =
+  // `LINGXI_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失。
+  ['LINGXI', 'lingxi'],
+  // ⚠️ 第 17 个 provider（doubao，2026-11-14）—— 同款坑第 **六** 次。
+  // 豆包（DoubaoWork）是「cookie 直填」渠道（无浏览器登录流；理由见
+  // `doubao-auth.ts` 模块头），但账号池/恢复表逻辑同构。漏加 =
+  // `DOUBAO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新粘贴）。
+  ['DOUBAO', 'doubao'],
 ]
 
 /** 已实现渠道的统一判定，拒绝未知渠道且不依赖旧产品黑名单。 */
 export function isSupportedProvider(provider: unknown): provider is string {
   return typeof provider === 'string' && REF_PREFIX_TO_PROVIDER.some(([, id]) => id === provider)
 }
+
+/**
+ * 全部已实现渠道的 provider id（顺序与 {@link REF_PREFIX_TO_PROVIDER} 一致）。
+ *
+ * ⚠️ 供**测试**派生断言用：历史上多处测试把渠道数写死成 10/11，
+ * 每加一个 provider 就要改一遍，且漏改时误报成「装配坏了」而不是「测试过期」。
+ * 暴露这一份清单后，断言可以写「UI 卡片数 == 已挂载 provider 数」这类
+ * **关系式**，而不是易腐的具体数字。
+ */
+export const SUPPORTED_PROVIDERS: readonly string[] = REF_PREFIX_TO_PROVIDER.map(([, id]) => id)
 
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
 const ACCOUNT_REF_RE = new RegExp(
