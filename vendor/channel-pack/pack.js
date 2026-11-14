@@ -47252,6 +47252,11 @@ async function claimRaccoonLoginReward(product, credential, fetcher = fetch) {
   const points = grantedPopupPoints(envelope.data) ?? RACCOON_LOGIN_REWARD_POINTS;
   return { kind: "claimed", credit: points, streakDays: 0, isStreakDay: false };
 }
+async function hasRaccoonDailyGrantToday(product, credential, fetcher, nowMs = Date.now()) {
+  const status = await fetchRaccoonDailyCheckinStatus(product, credential, fetcher, nowMs);
+  if (status === null) return void 0;
+  return status.todayCheckedIn;
+}
 async function claimRaccoonDailyPoints(product, credential, fetcher = fetch) {
   const envelope = await postDesktopLoginGrant(product, credential, fetcher);
   if (!envelope.ok) {
@@ -47262,12 +47267,19 @@ async function claimRaccoonDailyPoints(product, credential, fetcher = fetch) {
     };
   }
   if (envelope.data?.granted !== true) {
-    if (credential.sessionSource === "desktop") {
+    const grantedToday = await hasRaccoonDailyGrantToday(product, credential, fetcher);
+    if (grantedToday === true) {
       return { kind: "already-claimed", message: "\u4ECA\u5929\u5DF2\u9886\u8FC7\u6BCF\u65E5\u79EF\u5206" };
+    }
+    if (grantedToday === void 0) {
+      return {
+        kind: "already-claimed",
+        message: "\u672C\u6B21\u672A\u53D1\u653E\uFF08\u672A\u80FD\u6838\u5BF9\u4ECA\u65E5\u8D26\u5355\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF09"
+      };
     }
     return {
       kind: "already-claimed",
-      message: credential.sessionSource === "web" ? "\u672C\u6B21\u672A\u53D1\u653E\uFF1A\u8BE5\u8D26\u53F7\u7684\u51ED\u636E\u662F\u7F51\u9875\u626B\u7801\u4F1A\u8BDD\uFF0C\u5546\u6C64\u7684\u6BCF\u65E5\u79EF\u5206\u53EA\u53D1\u7ED9\u684C\u9762\u7AEF\u4F1A\u8BDD \u2014\u2014 \u8BF7\u5728\u8D26\u53F7\u884C\u70B9\u4E00\u6B21\u300C\u684C\u9762\u7AEF\u6388\u6743\u300D\u5207\u6362\u4F1A\u8BDD\u6765\u6E90" : "\u672C\u6B21\u672A\u53D1\u653E\uFF1A\u8BE5\u51ED\u636E\u4E0D\u662F\u684C\u9762\u7AEF\u6388\u6743\u7801\u6362\u6765\u7684\u4F1A\u8BDD\uFF08\u591A\u534A\u662F\u5FAE\u4FE1\u626B\u7801\uFF09\uFF0C\u6BCF\u65E5\u79EF\u5206\u53EA\u53D1\u7ED9\u684C\u9762\u7AEF\u4F1A\u8BDD \u2014\u2014 \u8BF7\u5728\u8D26\u53F7\u884C\u70B9\u4E00\u6B21\u300C\u684C\u9762\u7AEF\u6388\u6743\u300D"
+      message: credential.sessionSource === "desktop" ? "\u672C\u6B21\u672A\u53D1\u653E\uFF1A\u8BE5\u4F1A\u8BDD\u867D\u662F\u684C\u9762\u7AEF\u6388\u6743\u6362\u6765\uFF0C\u670D\u52A1\u7AEF\u4ECD\u672A\u53D1\u653E\u6BCF\u65E5\u79EF\u5206 \u2014\u2014 \u8BF7\u5728\u8D26\u53F7\u884C\u91CD\u505A\u4E00\u6B21\u300C\u684C\u9762\u7AEF\u6388\u6743\u300D" : "\u672C\u6B21\u672A\u53D1\u653E\uFF1A\u8BE5\u51ED\u636E\u4E0D\u662F\u684C\u9762\u7AEF\u6388\u6743\u7801\u6362\u6765\u7684\u4F1A\u8BDD\uFF0C\u6BCF\u65E5\u79EF\u5206\u53EA\u53D1\u7ED9\u684C\u9762\u7AEF\u4F1A\u8BDD \u2014\u2014 \u8BF7\u5728\u8D26\u53F7\u884C\u70B9\u4E00\u6B21\u300C\u684C\u9762\u7AEF\u6388\u6743\u300D"
     };
   }
   const points = grantedPopupPoints(envelope.data) ?? RACCOON_DAILY_GRANT_POINTS;
