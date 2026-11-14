@@ -4831,6 +4831,19 @@ window.__ModuleLoader__.load({
       { id: 'doubao', name: '豆包工作', org: '字节', accent: '#3C6BFF', note: 'Cookie 导入（在豆包工作中登录后粘贴）', login: 'cookie' },
     ]
 
+    /**
+     * 渠道*目录页*的行：`signInOnly: true` 的渠道只参与签到/唤醒，**没有 LLM
+     * adapter**（不提供模型推理）。目录页按 `ctx.llm.listProviders()` 的能力给
+     * 卡片，把它们渲染出来只会是一张永远「未连接」的空卡（且有卡片无 adapter
+     * 会让 UI/挂载一致性断言失败），故此处剔除；但条目本身仍保留在
+     * `CHANNEL_PROVIDERS` 里 —— 签到与唤醒页用 `nameOf()` 取中文名。
+     *
+     * 必须定义在这一层（闭包顶层）而不是 ChannelsPage 里：Shell 的标签栏也要
+     * 用它算渠道数（`CHANNEL_DIRECTORY.length`）。曾把它留在 ChannelsPage 内部，
+     * 导致 Shell 渲染时 `ReferenceError`，整个设置页白屏（生产事故）。
+     */
+    const CHANNEL_DIRECTORY = CHANNEL_PROVIDERS.filter(row => row.signInOnly !== true)
+
     /** 与现有 RPC 的能力对应：余额、每日领取及独立签到状态分别判断。 */
     const CHANNEL_CREDITS = {
       lobsterai: { claim: true },
@@ -5565,11 +5578,7 @@ window.__ModuleLoader__.load({
         showToast({ title: t('chan.error').replace('{reason}', reason).slice(0, 120), body: channel.name, tone: 'warn' })
       }, [t])
 
-      // `signInOnly: true` 的渠道只参与签到/唤醒，**没有 LLM adapter**（不提供模型推理）。
-      // 渠道页按 `ctx.llm.listProviders()` 的能力给卡片，把它们渲染出来只会是一张
-      // 永远「未连接」的空卡（且有卡片无 adapter 会让 UI/挂载一致性断言失败），
-      // 故此处剔除；但条目本身仍保留在本清单里 —— 签到与唤醒页用 `nameOf()` 取中文名。
-      const CHANNEL_DIRECTORY = CHANNEL_PROVIDERS.filter(row => row.signInOnly !== true)
+      // `CHANNEL_DIRECTORY`（剔除 signInOnly）定义在闭包顶层，Shell 的标签栏共用。
       const stateOf = channel => !available ? 'disconnected' : statuses?.[channel.id]?.closed === true ? 'closed'
         : (statuses?.[channel.id]?.accounts?.enabled ?? 0) > 0 ? 'connected' : 'disconnected'
       const connected = CHANNEL_DIRECTORY.filter(row => stateOf(row) === 'connected').length
