@@ -521,7 +521,9 @@ window.__ModuleLoader__.load({
         'chan.meta.accounts': '账号',
         'chan.meta.models': '模型',
         'chan.act.add': '添加账号',
-        'chan.cookie.prompt': '请粘贴豆包工作的 cookie（含 sessionid=...）。\n\n获取方法：在豆包工作里登录后，用任意 cookie 导出工具取 www.doubao.com 的 cookie。',
+        'chan.cookie.prompt': '粘贴豆包工作的 cookie（必须含 sessionid=...）。在豆包工作里登录后，用任意 cookie 导出工具取 www.doubao.com 的 cookie。',
+        'chan.cookie.confirm': '导入',
+        'chan.cookie.cancel': '取消',
         'chan.cookie.needCookie': '该渠道需要 cookie 导入（无浏览器登录流程）',
         'chan.zcode.provider': '登录渠道',
         'chan.zcode.bigmodel': 'bigmodel.cn',
@@ -1447,7 +1449,9 @@ window.__ModuleLoader__.load({
         'chan.meta.accounts': 'Accounts',
         'chan.meta.models': 'Models',
         'chan.act.add': 'Add account',
-        'chan.cookie.prompt': 'Paste the Doubao Work cookie (must contain sessionid=...).\n\nHow: sign in to Doubao Work, then export the www.doubao.com cookie with any cookie viewer.',
+        'chan.cookie.prompt': 'Paste the Doubao Work cookie (must contain sessionid=...). Sign in to Doubao Work, then export the www.doubao.com cookie with any cookie viewer.',
+        'chan.cookie.confirm': 'Import',
+        'chan.cookie.cancel': 'Cancel',
         'chan.cookie.needCookie': 'This channel imports a cookie (no browser sign-in flow)',
         'chan.zcode.provider': 'Sign-in route',
         'chan.zcode.bigmodel': 'bigmodel.cn',
@@ -4964,6 +4968,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('')
       const [notice, setNotice] = useState('')
       const [login, setLogin] = useState(null)
+      // cookie 型渠道（豆包）的内联凭据输入草稿：null = 收起，字符串 = 展开。
+      const [cookieDraft, setCookieDraft] = useState(null)
       const modelBatchPending = useRef(false)
       const [balanceError, setBalanceError] = useState('')
       const [balanceLoading, setBalanceLoading] = useState(false)
@@ -5106,24 +5112,16 @@ window.__ModuleLoader__.load({
       // 字节 passport 的扫码/短信链路没有实测样本，且本地 Cookies 库被运行中的
       // Chromium 独占加锁，故只能由用户粘贴 cookie。
       //
-      // 用 `window.prompt` 而不是在卡片里塞一个常驻输入框：凭据只需粘贴一次，
-      // 常驻 textarea 会让每个渠道卡片都多一块与"未连接"状态无关的干扰 UI。
-      // 若宿主屏蔽 prompt（返回 null），走下面的兜底提示，不静默失败。
-      const startCookieImport = async () => {
-        let raw
-        try {
-          raw = window.prompt(t('chan.cookie.prompt'), '')
-        } catch { raw = null }
-        if (raw === null) {
-          // 用户取消，或宿主屏蔽了 prompt —— 给出可执行替代方案而不是静默。
-          setNotice(`${t('chan.cookie.needCookie')} · node scripts/import-doubao-cookie.mjs --cookie "sessionid=..."`)
-          return
-        }
-        const cookie = String(raw).trim()
+      // ⚠️ 不用 `window.prompt`：**Electron 不实现 prompt()**（调用即抛错），
+      // 而 DSH 桌面端正是 Electron —— 用 prompt 会让这个按钮在桌面端静默失效。
+      // 故改为卡片内联输入框（`cookieDraft !== null` 即展开）。
+      const startCookieImport = async (raw) => {
+        const cookie = String(raw ?? '').trim()
         if (cookie === '') return
         setBusy('add'); setNotice('')
         try {
           await rpc('account.importCookie', { provider: channel.id, cookie }, 90_000)
+          setCookieDraft(null)
           onChanged()
           await loadAccounts()
           void loadCredits()
@@ -5137,8 +5135,8 @@ window.__ModuleLoader__.load({
       }
 
       const startLogin = async () => {
-        // cookie 型渠道走独立分支：没有 URL 可开，也没有后续轮询。
-        if (channel.login === 'cookie') return startCookieImport()
+        // cookie 型渠道：展开内联输入框，没有 URL 可开，也没有后续轮询。
+        if (channel.login === 'cookie') { setCookieDraft(value => value === null ? '' : null); return }
         if (loginAttempt.current && !loginAttempt.current.cancelled) return
         const attempt = { popup: null, cancelled: false, transport: channelTransport(rpc) }
         const current = () => !attempt.cancelled && sameChannelTransport(attempt.transport, channelTransport(rpc))
@@ -5409,6 +5407,28 @@ window.__ModuleLoader__.load({
             h('svg', { viewBox: '0 0 12 12', 'aria-hidden': 'true' }, h('path', { d: 'M3 1.5l6 4.5-6 4.5z' })),
             t('chan.fold.models'), models === undefined ? null : ` (${models.length})`)),
         notice !== '' ? h('p', { className: 'ofm_note' }, notice) : null,
+        // cookie 型渠道的内联凭据输入（豆包工作）。
+        // ⚠️ 必须是内联而非 window.prompt：Electron 不实现 prompt()。
+        cookieDraft !== null ? h('div', { className: 'ofm_chanacts', style: { flexDirection: 'column', alignItems: 'stretch', gap: 8 } },
+          h('p', { className: 'ofm_note' }, t('chan.cookie.prompt')),
+          h('textarea', {
+            className: 'ofm_input',
+            style: { minHeight: 64, fontFamily: 'monospace', fontSize: 12 },
+            placeholder: 'sessionid=...; ttwid=...',
+            value: cookieDraft,
+            disabled: busy !== '' || !rpc,
+            onChange: (event) => setCookieDraft(event.currentTarget.value),
+          }),
+          h('div', { className: 'ofm_chanacts', style: { gap: 8 } },
+            h('button', {
+              type: 'button', className: 'ofm_btn', disabled: busy !== '' || !rpc || cookieDraft.trim() === '',
+              'aria-busy': busy === 'add' ? 'true' : undefined,
+              onClick: () => { void startCookieImport(cookieDraft) },
+            }, busy === 'add' ? '…' : t('chan.cookie.confirm')),
+            h('button', {
+              type: 'button', className: 'ofm_btn ghost', disabled: busy !== '',
+              onClick: () => setCookieDraft(null),
+            }, t('chan.cookie.cancel')))) : null,
         balanceError !== '' ? h('p', { className: 'ofm_balanceerror', role: 'alert' },
           t('chan.credits.failed').replace('{reason}', balanceError))
           : balanceFailures > 0 ? h('p', { className: 'ofm_balanceerror', role: 'status' },
