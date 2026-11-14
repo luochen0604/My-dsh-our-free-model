@@ -521,6 +521,8 @@ window.__ModuleLoader__.load({
         'chan.meta.accounts': '账号',
         'chan.meta.models': '模型',
         'chan.act.add': '添加账号',
+        'chan.cookie.prompt': '请粘贴豆包工作的 cookie（含 sessionid=...）。\n\n获取方法：在豆包工作里登录后，用任意 cookie 导出工具取 www.doubao.com 的 cookie。',
+        'chan.cookie.needCookie': '该渠道需要 cookie 导入（无浏览器登录流程）',
         'chan.zcode.provider': '登录渠道',
         'chan.zcode.bigmodel': 'bigmodel.cn',
         'chan.zcode.zai': 'z.ai 国际版',
@@ -1445,6 +1447,8 @@ window.__ModuleLoader__.load({
         'chan.meta.accounts': 'Accounts',
         'chan.meta.models': 'Models',
         'chan.act.add': 'Add account',
+        'chan.cookie.prompt': 'Paste the Doubao Work cookie (must contain sessionid=...).\n\nHow: sign in to Doubao Work, then export the www.doubao.com cookie with any cookie viewer.',
+        'chan.cookie.needCookie': 'This channel imports a cookie (no browser sign-in flow)',
         'chan.zcode.provider': 'Sign-in route',
         'chan.zcode.bigmodel': 'bigmodel.cn',
         'chan.zcode.zai': 'z.ai international',
@@ -5098,7 +5102,43 @@ window.__ModuleLoader__.load({
         loginAttempt.current = null
         setBusy(value => value === 'add' ? '' : value)
       }, [rpc])
+      // ⚠️ 与其它渠道不同，cookie 型渠道（豆包工作）**没有浏览器登录流**：
+      // 字节 passport 的扫码/短信链路没有实测样本，且本地 Cookies 库被运行中的
+      // Chromium 独占加锁，故只能由用户粘贴 cookie。
+      //
+      // 用 `window.prompt` 而不是在卡片里塞一个常驻输入框：凭据只需粘贴一次，
+      // 常驻 textarea 会让每个渠道卡片都多一块与"未连接"状态无关的干扰 UI。
+      // 若宿主屏蔽 prompt（返回 null），走下面的兜底提示，不静默失败。
+      const startCookieImport = async () => {
+        let raw
+        try {
+          raw = window.prompt(t('chan.cookie.prompt'), '')
+        } catch { raw = null }
+        if (raw === null) {
+          // 用户取消，或宿主屏蔽了 prompt —— 给出可执行替代方案而不是静默。
+          setNotice(`${t('chan.cookie.needCookie')} · node scripts/import-doubao-cookie.mjs --cookie "sessionid=..."`)
+          return
+        }
+        const cookie = String(raw).trim()
+        if (cookie === '') return
+        setBusy('add'); setNotice('')
+        try {
+          await rpc('account.importCookie', { provider: channel.id, cookie }, 90_000)
+          onChanged()
+          await loadAccounts()
+          void loadCredits()
+          void loadBalances(true)
+          setOpen('accounts')
+        } catch (error) {
+          onError(channel, error)
+        } finally {
+          setBusy('')
+        }
+      }
+
       const startLogin = async () => {
+        // cookie 型渠道走独立分支：没有 URL 可开，也没有后续轮询。
+        if (channel.login === 'cookie') return startCookieImport()
         if (loginAttempt.current && !loginAttempt.current.cancelled) return
         const attempt = { popup: null, cancelled: false, transport: channelTransport(rpc) }
         const current = () => !attempt.cancelled && sameChannelTransport(attempt.transport, channelTransport(rpc))

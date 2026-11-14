@@ -1986,6 +1986,25 @@ if (provider === LOBSTERAI.id) {
           })
 
           return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } }
+        } else if (provider === DOUBAO.id) {
+          /**
+           * 豆包是 **cookie 直填**渠道，`account.create` 这条"建占位 + 返回 loginUrl"
+           * 的两段式链路对它不适用（没有可打开的登录页）。
+           *
+           * 这里**不返回 loginUrl**，而是回一个可读的结构化错误，指引前端改走
+           * `account.importCookie`。历史行为是落到下面的 `unknown provider` 兜底，
+           * 那句文案会让用户以为是"渠道没注册"，而真相是"该渠道不用这种加法"。
+           *
+           * ⚠️ 不在这里顺手创建占位账号：没有凭据的账号会让卡片一直显示"未连接"，
+           * 用户不知道要做什么。
+           */
+          return {
+            ok: false,
+            error: {
+              code: 'cookie-required',
+              message: '豆包工作需要 cookie 导入（没有浏览器登录流程）。请用「添加账号」粘贴 cookie，或运行 node scripts/import-doubao-cookie.mjs --cookie "sessionid=..."',
+            },
+          }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }

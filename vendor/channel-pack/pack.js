@@ -61198,6 +61198,14 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
             });
           });
           return { ok: true, value: { accountId: id, loginUrl: geminiStarted.loginUrl } };
+        } else if (provider === DOUBAO.id) {
+          return {
+            ok: false,
+            error: {
+              code: "cookie-required",
+              message: '\u8C46\u5305\u5DE5\u4F5C\u9700\u8981 cookie \u5BFC\u5165\uFF08\u6CA1\u6709\u6D4F\u89C8\u5668\u767B\u5F55\u6D41\u7A0B\uFF09\u3002\u8BF7\u7528\u300C\u6DFB\u52A0\u8D26\u53F7\u300D\u7C98\u8D34 cookie\uFF0C\u6216\u8FD0\u884C node scripts/import-doubao-cookie.mjs --cookie "sessionid=..."'
+            }
+          };
         } else {
           return { ok: false, error: { code: "bad-request", message: `unknown provider: ${provider}` } };
         }
