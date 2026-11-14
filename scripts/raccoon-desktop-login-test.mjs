@@ -45,23 +45,29 @@ export async function verifyRaccoonDesktopLogin({ ctx, call, creds }) {
   const params = parsed.searchParams
   assert.equal(params.get('login_source'), 'desktop')
   assert.equal(params.get('desktop_callback'), 'loopback')
-  // ⚠️ 回环路径的 appname 是 `商汤小浣熊`（webLogin.js 取 webLoginResources.zh.appName
-  // = enterpriseName('zh') = brand.name.zh），**不是**深链路径的 `办公小浣熊客户端`。
-  // 这条断言以前写死成深链的值，等于把 bug 钉进了测试里（2026-11-14 修正）。
+  // ⚠️ 回环路径的 appname 是 `商汤小浣熊客户端`（webLogin.js 里是模板字符串
+  // `${enterpriseName('zh')}客户端`，enterpriseName('zh') = brand.name.zh = 商汤小浣熊，
+  // 再加后缀「客户端」），**不是**深链路径的 `办公小浣熊客户端`。
+  // 这条断言以前写死成深链的值，等于把 bug 钉进了测试里。
+  // 2026-11-14 还差点漏掉「客户端」后缀——它被 mojibake 掩盖过，故这里连后缀一起钉死。
   assert.equal(
     params.get('appname'),
-    '商汤小浣熊',
-    '回环/兼容登录路径的 appname 是 brand.name.zh，不是深链路径的「办公小浣熊客户端」',
+    '商汤小浣熊客户端',
+    '回环/兼容登录路径的 appname = brand.name.zh + 客户端，不是深链路径的「办公小浣熊客户端」',
   )
   assert.equal(
     RACCOON_DESKTOP_APP_NAME,
-    '商汤小浣熊',
+    '商汤小浣熊客户端',
     '导出的常量必须与回环路径实际使用的一致',
   )
   assert.notEqual(
     RACCOON_DESKTOP_APP_NAME,
     RACCOON_DEEPLINK_APP_NAME,
     '两条官方路径的 appname 不同，不能混用',
+  )
+  assert.ok(
+    RACCOON_DESKTOP_APP_NAME.endsWith('客户端'),
+    '兼容路径的 appname 带「客户端」后缀（模板字符串 `${brand}客户端`），漏掉会拼出错值',
   )
   assert.equal(params.get('redirect'), 'http://127.0.0.1:53123/auth/callback')
   assert.match(params.get('redirect'), REDIRECT_RE, 'redirect 必须命中官方回环正则')

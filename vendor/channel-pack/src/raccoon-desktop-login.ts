@@ -113,14 +113,30 @@ export const RACCOON_DESKTOP_CALLBACK_PATH = '/auth/callback'
  * | 官方路径 | 代码位置 | `appname` |
  * |---|---|---|
  * | 自定义协议深链（默认「登录」按钮） | `main/account/desktopLogin.js` 的 `DESKTOP_AUTH_PARAMS` | `办公小浣熊客户端`（写死字面量） |
- * | 兼容登录 / 回环（「无法返回客户端？使用兼容登录」） | `main/client/account/webLogin.js` 的 `desktopLoginUrl()`，取 `webLoginResources.zh.appName` = `enterpriseName('zh')` = `raccoon.brand.name.zh` | **`商汤小浣熊`** |
+ * | 兼容登录 / 回环（「无法返回客户端？使用兼容登录」） | `main/client/account/webLogin.js` 的 `desktopLoginUrl()`，取 `webLoginResources.zh.appName` | **`商汤小浣熊客户端`** |
  *
- * ⚠️ 2026-11-14 踩过的坑：本插件走的是**回环**（`desktop_callback=loopback`），
- * 早期却照抄了深链路径的 `appname`（`办公小浣熊客户端`），等于拼出一条官方从不
- * 产生的组合。用户反馈「用客户端的兼容模式登录能领到积分」——兼容模式就是回环，
- * 而本插件用的正是回环，说明路径本身没错，错在这个参数。
+ * 兼容路径的值不是简单取品牌名，而是一个**模板字符串**：
+ *
+ * ```js
+ * // build/shared/client/web-login.js
+ * appName: `${enterpriseName('zh')}客户端`,
+ * ```
+ *
+ * 其中 `enterpriseName('zh')` = `raccoon.brand.name.zh` = `商汤小浣熊`，
+ * 拼上后缀 `客户端` ⇒ **`商汤小浣熊客户端`**。
+ *
+ * ⚠️ 2026-11-14 在这里连续踩了两次坑，都是因为读到的源码是 mojibake：
+ * 1. 先照抄了深链路径的 `办公小浣熊客户端` —— 等于拼出官方从不产生的组合；
+ * 2. 改的时候只取了品牌名 `商汤小浣熊`，**漏掉 `客户端` 后缀** —— 后缀正好被
+ *    乱码掩盖成 `瀹㈡埛绔?`（`客户端` 的 GBK bytes 被当 UTF-8 解）。
+ *
+ * 教训：读 asar 里的中文源码必须按正确编码解码后再抄字面量；模板字符串尤其危险，
+ * 因为后缀会藏在 `${…}` 之后。本次用 `TextDecoder('gb18030')` 复核才定死。
+ *
+ * 用户反馈「用客户端的兼容模式登录能领到积分」—— 兼容模式就是回环（本插件走的
+ * 正是回环），所以路径没错，错的就是这个参数。
  */
-export const RACCOON_DESKTOP_APP_NAME = '商汤小浣熊'
+export const RACCOON_DESKTOP_APP_NAME = '商汤小浣熊客户端'
 
 /** 深链路径的 `appname`（仅用于说明/对照，本插件不走这条路）。 */
 export const RACCOON_DEEPLINK_APP_NAME = '办公小浣熊客户端'

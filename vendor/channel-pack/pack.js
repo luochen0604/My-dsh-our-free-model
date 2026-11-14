@@ -48322,7 +48322,7 @@ function renderRaccoonLoginPage(product, qrCode) {
 import { createServer as createServer5 } from "node:http";
 import { randomBytes as randomBytes7 } from "node:crypto";
 var RACCOON_DESKTOP_CALLBACK_PATH = "/auth/callback";
-var RACCOON_DESKTOP_APP_NAME = "\u5546\u6C64\u5C0F\u6D63\u718A";
+var RACCOON_DESKTOP_APP_NAME = "\u5546\u6C64\u5C0F\u6D63\u718A\u5BA2\u6237\u7AEF";
 function buildRaccoonDesktopAuthorizeUrl(options) {
   const origin = options.siteOrigin ?? RACCOON.apiBase;
   const params = new URLSearchParams({
