@@ -23,7 +23,6 @@ import {
   applyCredentialRefs,
   readCredentialsDocument,
   rewriteCredentialsFile,
-  unquoteYamlSingle,
 } from './lib/credentials-document.mjs'
 
 const argv = process.argv.slice(2)
@@ -46,10 +45,8 @@ const redact = (value) => (typeof value === 'string' ? value.replace(/eyJ[A-Za-z
  * 共享模块只改点名 ref，其余段逐字节保留，落盘前做结构自检。
  */
 function readCredentialRefs(file) {
-  const doc = readCredentialsDocument(fs.readFileSync(file, 'utf8'))
-  const records = new Map()
-  for (const [name, raw] of doc.refs) records.set(name, unquoteYamlSingle(raw))
-  return records
+  // `doc.refs` 的值已经解过 YAML 引号（plain / 单引号 / 双引号都归一）。
+  return new Map(readCredentialsDocument(fs.readFileSync(file, 'utf8')).refs)
 }
 /** 只提交这一个 ref；其它行（含 records:）保持原样。 */
 function writeCredentialRef(file, name, raw) {

@@ -48,7 +48,6 @@ import {
   applyCredentialRefs,
   readCredentialsDocument,
   rewriteCredentialsFile,
-  unquoteYamlSingle,
 } from './lib/credentials-document.mjs'
 
 const DRY_RUN = process.argv.includes('--dry-run')
@@ -81,13 +80,13 @@ function parseCredentialYaml(text) {
   const doc = readCredentialsDocument(text)
   const records = {}
   const rawByName = {}
-  for (const [ref, raw] of doc.refs) {
-    const unquoted = unquoteYamlSingle(raw)
-    rawByName[ref] = unquoted
+  for (const [ref, value] of doc.refs) {
+    // `doc.refs` 的值已经解过 YAML 引号（plain / 单引号 / 双引号都归一）。
+    rawByName[ref] = value
     try {
-      records[ref] = JSON.parse(unquoted)
+      records[ref] = JSON.parse(value)
     } catch {
-      records[ref] = unquoted // 非 JSON 的纯文本凭据（如 API key）原样保留
+      records[ref] = value // 非 JSON 的纯文本凭据（如 API key）原样保留
     }
   }
   return { header: `${doc.header}refs:\n`, records, rawByName }

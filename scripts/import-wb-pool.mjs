@@ -163,12 +163,12 @@ function backup(file) {
 function parseCredentialYaml(text) {
   const doc = readCredentialsDocument(text)
   const records = {}
-  for (const [ref, raw] of doc.refs) {
-    const unquoted = raw.replaceAll("''", "'")
+  for (const [ref, value] of doc.refs) {
+    // `doc.refs` 的值已经解过 YAML 引号（plain / 单引号 / 双引号都归一）。
     try {
-      records[ref] = JSON.parse(unquoted)
+      records[ref] = JSON.parse(value)
     } catch {
-      records[ref] = unquoted // 非 JSON 的纯文本凭据（如 API key）原样保留
+      records[ref] = value // 非 JSON 的纯文本凭据（如 API key）原样保留
     }
   }
   return { header: `${doc.header}refs:\n`, records }

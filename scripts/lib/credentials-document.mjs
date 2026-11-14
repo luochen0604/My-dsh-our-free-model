@@ -31,11 +31,40 @@
  *
  * 1. **保留一切不认识的字节**：只替换调用方点名的那几个 `refs:` 条目，其余行
  *    （包括 `records:` 的每一个字节、注释、空行、行序、行尾）原样写回。
- * 2. **写出前自检**：新文本必须仍能被解析，且 `records:` 段与全部 `refs:` 键
- *    集合不得少于输入。任一项不满足就抛错、**不落盘**。
+ * 2. **写出前自检**：新文本必须仍能被解析，且段集合、可解析 ref 集合、
+ *    「认不出形状的行」三者都不得减少。任一项不满足就抛错、**不落盘**。
  * 3. `refs:` 值按 YAML 单引号规则转义（`'` → `''`），并且**不重新序列化已经
  *    是字符串的值** —— 二次编码正是 2026-11-13 的另一半事故（WB 凭据被
  *    `JSON.stringify` 两次，唤醒时报「凭据缺少 accessToken/uid」）。
+ *
+ * ## 第三个缺陷（真实事故，2026-11-14：模型页保存的 API Key 重启后全没了）
+ *
+ * 上面的解析器只认 **单引号** 写法 `  KEY: 'value'`，因为那是插件的
+ * `applyCredentialRefs()` 自己写出来的形状。但 `.credentials.yaml` 里还住着
+ * 另一半凭据：**用户在模型设置页保存的模型 API Key**（`DEEPSEEK_API_KEY`、
+ * `ZAI_CODING_CN_API_KEY` …）。这些是宿主
+ * `@deepseek-ai/dsh-credentials-local` 用 `yaml` 包的 `document.setIn()` +
+ * `toString()` 写进去的，输出是 **无引号 plain scalar**：
+ *
+ * ```yaml
+ * refs:
+ *   DEEPSEEK_API_KEY: sk-xxxxxxxx…
+ *   ZAI_CODING_CN_API_KEY: xxxxxxxx…SuffixSuffix
+ * ```
+ *
+ * 旧正则匹配不上 → 这些 ref **从解析结果里消失**，但文件里确实有。后果比
+ * 「看不见」严重得多：`assertNoCredentialLoss()`（本模块专门为「绝不丢凭据」
+ * 而设的写前自检）拿两份都没看见它们的解析结果相比，**判为无损失**
+ * —— 于是任何「按解析结果重建 refs 段」的写法都会把它们静默删掉，而自检
+ * 依然打印成功。2026-11-14 用户重启 DSH 后发现模型 API Key（DeepSeek、智谱）
+ * 全部消失，就是这条通道。
+ *
+ * 本模块现在的契约因此再多一条：
+ *
+ * 4. **ref 的引号形态不参与识别**：plain / 单引号 / 双引号三种 YAML 标量写法
+ *    都能读出键与值；改写未点名的 ref 时**逐字节保留原行**（引号形态不变）。
+ * 5. **`refs:` 段里认不出形状的行一律 fail closed**：未点名的行必须与输入
+ *    逐字节相同，否则拒绝落盘 —— 宁可报错，也不静默丢一枚凭据。
  *
  * 用法：
  *
@@ -54,8 +83,69 @@ const HEADER = /^(version: \d+\n)(refs|records):\n/
 /** 顶层段名（顶层 = 顶格，后面紧跟冒号）。 */
 const SECTION = /^([A-Za-z_][A-Za-z0-9_-]*):\s*$/
 
-/** `refs:` 段内的一条条目：两空格缩进 + POSIX 标识符 + 单引号字符串。 */
-const REF_LINE = /^  ([A-Za-z_][A-Za-z0-9_]*): '(.*)'\s*$/
+/** `refs:` 段内的一条条目：两空格缩进 + POSIX 标识符 + `:` + 任意 YAML 标量。 */
+const REF_LINE = /^  ([A-Za-z_][A-Za-z0-9_]*):(?:[ \t]+(.*))?$/
+
+/** 注释 / 空行：不携带键，原样保留即可。 */
+const IGNORABLE_LINE = /^\s*(?:#.*)?$/
+
+/**
+ * 把一条 `refs:` 条目的 YAML 标量还原成 JS 字符串。
+ *
+ * 支持宿主实际会写出的三种形态：plain（无引号）、单引号、双引号。
+ * 认不出形状时返回 `undefined`，由调用方 fail closed —— 猜错会写坏一枚凭据。
+ *
+ * @param {string} body `KEY:` 之后的部分（可能为空）。
+ * @returns {{ value: string, spelling: 'plain'|'single'|'double' } | undefined}
+ */
+export function parseRefScalar(body) {
+  const text = (body ?? '').replace(/\s+$/, '')
+  if (text === '') return { value: '', spelling: 'plain' }
+  if (text.startsWith("'")) {
+    // 单引号：唯一的转义是 '' → '
+    if (text.length < 2 || !text.endsWith("'")) return undefined
+    const inner = text.slice(1, -1)
+    if (/(?<!')'(?!')/.test(inner)) return undefined
+    return { value: inner.replaceAll("''", "'"), spelling: 'single' }
+  }
+  if (text.startsWith('"')) {
+    // 双引号：只承认 JSON 兼容的那部分转义；其余形状交给调用方 fail closed。
+    if (text.length < 2 || !text.endsWith('"')) return undefined
+    try {
+      const value = JSON.parse(text)
+      if (typeof value !== 'string') return undefined
+      return { value, spelling: 'double' }
+    } catch {
+      return undefined
+    }
+  }
+  // block scalar（`>` / `|`）、锚点、标签、flow 集合：值跨行或另有语义，本模块
+  // 没有能力安全重写。fail closed —— 猜错会写坏一枚读不懂的凭据。
+  if (/^[>|&*!{[]/.test(text)) return undefined
+  // plain scalar：值到行尾，` #` 之后是注释。
+  const comment = text.search(/[ \t]#/)
+  const value = (comment === -1 ? text : text.slice(0, comment)).replace(/\s+$/, '')
+  return { value, spelling: 'plain' }
+}
+
+/** 单引号标量的写法（本模块改写时用：宿主能读，且不需要猜转义）。 */
+export function quoteYamlSingle(value) {
+  return `'${String(value).replaceAll("'", "''")}'`
+}
+
+/** 反转义单引号标量（读回用）。 */
+export function unquoteYamlSingle(raw) {
+  return raw.replaceAll("''", "'")
+}
+
+/**
+ * 渲染一条 `refs:` 条目行。字符串值原样写成单引号标量；`!`、`#`、前导/尾随
+ * 空白等 YAML 会误解的形状一律靠单引号兜住，故不会与宿主写出 plain scalar
+ * 的形态冲突（那只是另一种合法写法，读回等价）。
+ */
+function renderRefLine(name, value) {
+  return `  ${name}: ${quoteYamlSingle(value)}`
+}
 
 /**
  * 解析整份文档，**按行**保留原始文本。
@@ -67,12 +157,17 @@ const REF_LINE = /^  ([A-Za-z_][A-Za-z0-9_]*): '(.*)'\s*$/
  *   firstSection: string,
  *   sections: Map<string, { start: number, end: number, lines: string[] }>,
  *   refs: Map<string, string>,
+ *   refLines: Map<string, { line: string, spelling: string }>,
+ *   unparsedRefLines: string[],
  * }}
  *   `header` 是 `version: N\n`；`firstSection` 是紧跟在版本行后的段名
- *   （当前文件是 `refs`，历史文件是 `records`）。`refs` 的 value 是**单引号内
- *   的原始文本**（未反转义），写出时原样复用。
+ *   （当前文件是 `refs`，历史文件是 `records`）。`refs` 的 value 是**解转义后
+ *   的 JS 字符串**（plain / 单引号 / 双引号三种写法都归一），`refLines` 另存
+ *   每条的原始行与标量写法，改写未点名的条目时逐字节复用。
  *   `sections` 的 `start`/`end` 是该段在 `text.split('\n')` 里的行号区间
  *   （含 `start`，不含 `end`），`lines[0]` 是段头本身。
+ *   `unparsedRefLines` 是 `refs:` 段里认不出形状的条目行：值读不出来，但
+ *   改写时必须原样保留 —— 重新渲染就会改掉别人的凭据。
  */
 export function readCredentialsDocument(text) {
   const match = text.match(HEADER)
@@ -99,39 +194,47 @@ export function readCredentialsDocument(text) {
   }
 
   const refs = new Map()
+  /** @type {Map<string, { line: string, spelling: string }>} 每条的原始行与标量写法 */
+  const refLines = new Map()
+  const unparsedRefLines = []
   const refsSection = sections.get('refs')
   if (refsSection !== undefined) {
     for (const line of refsSection.lines) {
       const ref = line.match(REF_LINE)
-      if (ref !== null) refs.set(ref[1], ref[2])
+      if (ref === null) {
+        if (!IGNORABLE_LINE.test(line)) unparsedRefLines.push(line)
+        continue
+      }
+      const scalar = parseRefScalar(ref[2])
+      if (scalar === undefined) {
+        // 认不出形状：计入 unparsed，改写时原样保留，绝不静默丢弃。
+        unparsedRefLines.push(line)
+        continue
+      }
+      refs.set(ref[1], scalar.value)
+      refLines.set(ref[1], { line, spelling: scalar.spelling })
     }
   }
 
-  return { text, header, firstSection, sections, refs }
-}
-
-/** YAML 单引号标量：内部 `'` 写成 `''`，其余原样。 */
-export function quoteYamlSingle(value) {
-  return `'${String(value).replaceAll("'", "''")}'`
-}
-
-/** 反转义单引号标量（读回用）。 */
-export function unquoteYamlSingle(raw) {
-  return raw.replaceAll("''", "'")
+  return { text, header, firstSection, sections, refs, refLines, unparsedRefLines }
 }
 
 /**
  * 把 `refs:` 值还原成 JS 值：能 JSON.parse 就用解析结果，否则当纯文本。
  *
+ * ⚠️ 入参是 `readCredentialsDocument().refs` 里的值，**已经解过 YAML 引号**
+ * （plain / 单引号 / 双引号三种写法都已归一），这里不再反转义 —— 再反转义
+ * 一次正是历史上的二次编码事故。
  * ⚠️ 只解**一层**。历史的双编码缺陷（值本身是一段 JSON 文本，又被
  * `JSON.stringify` 一次）需要调用方自己再解一层 —— 见
  * `scripts/repair-wb-credentials.mjs` 的 `unwrap()`。
  */
-export function parseRefValue(raw) {
+export function parseRefValue(value) {
+  const text = typeof value === 'string' ? value : String(value)
   try {
-    return JSON.parse(unquoteYamlSingle(raw))
+    return JSON.parse(text)
   } catch {
-    return unquoteYamlSingle(raw)
+    return text
   }
 }
 
@@ -181,12 +284,22 @@ export function applyCredentialRefs(text, updates, options = {}) {
         continue
       }
       const name = ref[1]
+      const scalar = parseRefScalar(ref[2])
+      if (scalar === undefined) {
+        // 认不出标量形状（例如跨行折叠、锚点、标签）：值读不出来，又没被点名改写
+        // —— 原样保留原行。绝不因为「解析不了」就把它删掉。
+        lines.push(line)
+        continue
+      }
       seen.add(name)
       if (remove.has(name)) continue
       if (pending.has(name)) {
         lines.push(`  ${name}: ${quoteYamlSingle(pending.get(name))}`)
         continue
       }
+      // ⚠️ 未点名的条目**逐字节复用原行**。宿主写进去的 plain scalar
+      // （`  DEEPSEEK_API_KEY: sk-...`）就在这里被保住 —— 2026-11-14 事故
+      // 正是重渲染时把它们改成了别的形状 / 直接漏掉。
       lines.push(line)
     }
     for (const [ref, raw] of pending) {
@@ -212,7 +325,16 @@ export function applyCredentialRefs(text, updates, options = {}) {
 }
 
 /**
- * 结构自检：新文本不得丢段、丢 ref。
+ * 结构自检：新文本不得丢段、丢 ref、丢任何一条 `refs:` 行。
+ *
+ * 三层判据互为兜底，因为它们各自有盲区：
+ *
+ * - **段**：`records:` 等段消失 —— 2026-11-13 掉登录事故的形态；
+ * - **能解析的 ref**：`refs` 里有、`refs` 里没有；
+ * - **认不出形状的行**（`unparsedRefLines`）：值读不出来，但只要原行变了
+ *   （被删、被重渲染、被合并），就说明有人改了一枚它没能力读的凭据。
+ *   这一层是 2026-11-14 事故的补丁：plain scalar 的 ref 当时在**前两层里
+ *   根本不存在**，自检于是判为「无损失」并放行了删除。
  *
  * @param {string} before 旧全文。
  * @param {string} after 新全文。
@@ -231,6 +353,18 @@ export function assertNoCredentialLoss(before, after, options = {}) {
   for (const ref of oldDoc.refs.keys()) {
     if (allowedRemoved.has(ref)) continue
     if (!newDoc.refs.has(ref)) throw new Error(`拒绝写入：ref "${ref}" 会消失`)
+  }
+  // 认不出形状的行：一条都不许变（既不许消失，也不许被重渲染）。
+  // 被显式 remove 的条目不在此列 —— 调用方已经确认过它们的键名。
+  const removableLines = new Set(
+    [...allowedRemoved].map((ref) => oldDoc.refLines.get(ref)?.line).filter((line) => line !== undefined),
+  )
+  const keptUnparsed = new Set(newDoc.unparsedRefLines)
+  for (const line of oldDoc.unparsedRefLines) {
+    if (removableLines.has(line)) continue
+    if (!keptUnparsed.has(line)) {
+      throw new Error('拒绝写入：refs: 段里有一行无法解析的凭据会改变或消失（宁可报错也不猜）')
+    }
   }
   // records: 段必须逐字节保留 —— 宿主登录会话就在这里。
   const oldRecords = oldDoc.sections.get('records')

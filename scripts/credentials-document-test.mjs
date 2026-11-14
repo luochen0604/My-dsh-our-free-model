@@ -108,23 +108,23 @@ check('新增一个 ref：顺序稳定且 records: 不变', () => {
 check('字符串值原样写入（不做二次编码）', () => {
   const payload = '{"uid":"u-1","accessToken":"x"}'
   const next = applyCredentialRefs(FIXTURE, { WORKBUDDY_ACCOUNT_AAAA1111: payload })
-  const raw = readCredentialsDocument(next).refs.get('WORKBUDDY_ACCOUNT_AAAA1111')
-  assert.equal(unquoteYamlSingle(raw), payload, '不得把已是 JSON 文本的值再编码一层')
-  assert.equal(parseRefValue(raw).uid, 'u-1')
+  const value = readCredentialsDocument(next).refs.get('WORKBUDDY_ACCOUNT_AAAA1111')
+  assert.equal(value, payload, '不得把已是 JSON 文本的值再编码一层')
+  assert.equal(parseRefValue(value).uid, 'u-1')
 })
 
 check('对象值被序列化一次', () => {
   const next = applyCredentialRefs(FIXTURE, { WORKBUDDY_ACCOUNT_AAAA1111: { uid: 'u-1', n: 2 } })
-  const raw = readCredentialsDocument(next).refs.get('WORKBUDDY_ACCOUNT_AAAA1111')
-  assert.deepEqual(parseRefValue(raw), { uid: 'u-1', n: 2 })
+  const value = readCredentialsDocument(next).refs.get('WORKBUDDY_ACCOUNT_AAAA1111')
+  assert.deepEqual(parseRefValue(value), { uid: 'u-1', n: 2 })
 })
 
 check("值里含单引号时按 YAML 规则转义并可读回", () => {
   const value = "{\"nickname\":\"O'Brien\"}"
   const next = applyCredentialRefs(FIXTURE, { WORKBUDDY_ACCOUNT_AAAA1111: value })
-  const raw = readCredentialsDocument(next).refs.get('WORKBUDDY_ACCOUNT_AAAA1111')
-  assert.equal(unquoteYamlSingle(raw), value, '单引号必须转义成两个单引号并能还原')
-  assert.equal(parseRefValue(raw).nickname, "O'Brien")
+  const read = readCredentialsDocument(next).refs.get('WORKBUDDY_ACCOUNT_AAAA1111')
+  assert.equal(read, value, '单引号必须转义成两个单引号并能还原')
+  assert.equal(parseRefValue(read).nickname, "O'Brien")
 })
 
 check('删除 ref 时其余内容与 records: 不变', () => {
@@ -223,6 +223,122 @@ check('两段共存时保持原段序（不把 refs 强行提到 records 前面�
     'WORKBUDDY_ACCOUNT_AAAA1111',
     'WORKBUDDY_ACCOUNT_BBBB2222',
   ])
+})
+
+// ── 2026-11-14 事故：模型页保存的 API Key（宿主写的 plain scalar）被静默删掉 ──
+//
+// 真实表现：用户在 DSH 模型设置页保存 DeepSeek / 智谱 API Key，重启后两个 key
+// 全没了。原因不在宿主：宿主把它写成**无引号 plain scalar**，而本模块的
+// `refs:` 解析只认单引号 → 那些 ref 根本没进 `refs` Map → 任何「按解析结果
+// 重建 refs 段」的写法都把它们漏掉，且 `assertNoCredentialLoss()` 因为看不见
+// 它们而判为无损失。下面几条把这条通道钉死。
+
+/** 与真实文件等价：宿主写的 API Key 是 plain scalar，插件凭据是单引号。 */
+const MIXED_FIXTURE = [
+  'version: 1',
+  'refs:',
+  '  DEEPSEEK_API_KEY: sk-test-fixture-deepseek-key-0000000000',
+  '  ZAI_CODING_CN_API_KEY: fixture000000000000000000000000000.zaiTestSuffix0000',
+  `  WORKBUDDY_ACCOUNT_AAAA1111: '{"uid":"u-1","accessToken":"a1"}'`,
+  'records:',
+  '  deepseek-account-platform/default:',
+  '    kind: grant',
+  '    payload:',
+  '      version: 1',
+  '      token: host-session-token',
+  '',
+].join('\n')
+/** `MIXED_FIXTURE` 的 records 段（与上面结构相同，单独取一份便于逐字节比对）。 */
+const RECORDS_BLOCK_MIXED = MIXED_FIXTURE.slice(MIXED_FIXTURE.indexOf('records:'))
+
+check('plain scalar 的 ref（模型 API Key）必须被解析出来', () => {
+  assert.deepEqual(listCredentialRefs(MIXED_FIXTURE), [
+    'DEEPSEEK_API_KEY',
+    'ZAI_CODING_CN_API_KEY',
+    'WORKBUDDY_ACCOUNT_AAAA1111',
+  ])
+})
+
+check('plain scalar 的值解析正确且不带引号残留', () => {
+  const doc = readCredentialsDocument(MIXED_FIXTURE)
+  assert.equal(doc.refs.get('DEEPSEEK_API_KEY'), 'sk-test-fixture-deepseek-key-0000000000')
+  assert.equal(doc.refs.get('ZAI_CODING_CN_API_KEY'), 'fixture000000000000000000000000000.zaiTestSuffix0000')
+  assert.equal(doc.refLines.get('DEEPSEEK_API_KEY').spelling, 'plain')
+})
+
+check('改别的 ref 时，plain scalar 的 API Key 逐字节保留', () => {
+  const next = applyCredentialRefs(MIXED_FIXTURE, {
+    WORKBUDDY_ACCOUNT_AAAA1111: '{"uid":"u-1","accessToken":"rotated"}',
+  })
+  assert.ok(next.includes('rotated'), '新值必须写入')
+  assert.ok(
+    next.includes('  DEEPSEEK_API_KEY: sk-test-fixture-deepseek-key-0000000000\n'),
+    'plain scalar 的引号形态与字节都必须原样保留',
+  )
+  assert.ok(
+    next.includes('  ZAI_CODING_CN_API_KEY: fixture000000000000000000000000000.zaiTestSuffix0000\n'),
+    '第二枚 API Key 同样不得改动',
+  )
+  assert.deepEqual(listCredentialRefs(next), listCredentialRefs(MIXED_FIXTURE), 'ref 集合不得变化')
+  assert.equal(next.slice(next.indexOf('records:')), RECORDS_BLOCK_MIXED, 'records: 段必须逐字节不变')
+})
+
+check('自检必须拦下「删掉 plain scalar 的 ref」', () => {
+  // 这正是 2026-11-14 的破坏形态：按解析结果重建 refs 段，漏掉看不见的 key。
+  const broken = MIXED_FIXTURE.replace(/^  (?:DEEPSEEK|ZAI_CODING_CN)_API_KEY:.*\n/gm, '')
+  assert.throws(() => assertNoCredentialLoss(MIXED_FIXTURE, broken), /API_KEY/)
+})
+
+check('三种 YAML 引号写法都能读，且未改动的原样保留', () => {
+  const text = [
+    'version: 1',
+    'refs:',
+    '  PLAIN_KEY: plain-value',
+    "  SINGLE_KEY: 'single-value'",
+    '  DOUBLE_KEY: "double-value"',
+    'records:',
+    '  deepseek-account-platform/default:',
+    '    kind: grant',
+    '    payload:',
+    '      token: t',
+    '',
+  ].join('\n')
+  const doc = readCredentialsDocument(text)
+  assert.deepEqual([...doc.refs.entries()], [
+    ['PLAIN_KEY', 'plain-value'],
+    ['SINGLE_KEY', 'single-value'],
+    ['DOUBLE_KEY', 'double-value'],
+  ])
+  const next = applyCredentialRefs(text, { PLAIN_KEY: 'changed' })
+  assert.ok(next.includes("  SINGLE_KEY: 'single-value'\n"), '未点名的单引号条目原样保留')
+  assert.ok(next.includes('  DOUBLE_KEY: "double-value"\n'), '未点名的双引号条目原样保留')
+  assert.ok(next.includes("  PLAIN_KEY: 'changed'\n"), '被点名的条目按本模块的规范写法重写')
+})
+
+check('认不出形状的 refs 行既不被删也不被重渲染', () => {
+  const text = [
+    'version: 1',
+    'refs:',
+    '  ODD_KEY: >-',
+    '    folded value',
+    "  WORKBUDDY_ACCOUNT_AAAA1111: '{\"uid\":\"u-1\"}'",
+    'records:',
+    '  deepseek-account-platform/default:',
+    '    kind: grant',
+    '    payload:',
+    '      token: t',
+    '',
+  ].join('\n')
+  const doc = readCredentialsDocument(text)
+  assert.equal(doc.refs.has('ODD_KEY'), false, '看不懂的值不该被猜成某个字符串')
+  assert.ok(doc.unparsedRefLines.length > 0, '看不懂的行必须被记录，不能当作不存在')
+  const next = applyCredentialRefs(text, { WORKBUDDY_ACCOUNT_AAAA1111: '{"uid":"u-1","x":1}' })
+  assert.ok(next.includes('  ODD_KEY: >-\n    folded value\n'), '看不懂的行必须逐字节保留')
+  // 若有人试图把它们抹掉，自检必须拒绝。
+  assert.throws(
+    () => assertNoCredentialLoss(text, next.replace('  ODD_KEY: >-\n    folded value\n', '')),
+    /无法解析/,
+  )
 })
 
 if (failures > 0) {

@@ -69,7 +69,21 @@ const body = [
   '',
 ].join('\n')
 
-const FIXTURE = `${header}${body}${RECORDS_BLOCK}`
+/**
+ * 用户经 DSH 模型设置页保存的模型 API Key。
+ *
+ * ⚠️ 宿主 `@deepseek-ai/dsh-credentials-local` 用 `yaml` 包的 `document.setIn()`
+ * + `toString()` 写它们，落盘形态是**无引号 plain scalar** —— 与插件自己写的
+ * 单引号形态不同。2026-11-14 用户重启 DSH 后这些 Key 全丢，就是脚本侧的改写
+ * 只认单引号、把它们当「不存在」而重建 refs 段造成的。夹具必须保持宿主那种
+ * 真实写法，否则这条回归门挡不住同样的失败。
+ */
+const HOST_API_KEY_LINES = [
+  '  DEEPSEEK_API_KEY: sk-test-fixture-deepseek-key-0000000000',
+  '  ZAI_CODING_CN_API_KEY: fixture000000000000000000000000000.zaiTestSuffix0000',
+]
+
+const FIXTURE = `${header}${HOST_API_KEY_LINES.join('\n')}\n${body}${RECORDS_BLOCK}`
 
 const CRED_REL = '.credentials.yaml'
 const STATE_REL = path.join('channel-pack', 'state.json')
@@ -109,6 +123,19 @@ function assertRecordsIntact(file) {
   assert.equal(text.slice(index), RECORDS_BLOCK, 'records: 段必须逐字节不变')
 }
 
+/**
+ * 断言模型设置页保存的 API Key 还在，且**写法逐字节未变**。
+ *
+ * 这条比「contains 一下」严格：宿主认 plain scalar，脚本把它重渲成别的形态
+ * （或漏掉）都算回归。
+ */
+function assertHostApiKeysIntact(file) {
+  const text = fs.readFileSync(file, 'utf8')
+  for (const line of HOST_API_KEY_LINES) {
+    assert.ok(text.includes(`${line}\n`), `模型 API Key 行必须逐字节保留：${line.split(':')[0]}`)
+  }
+}
+
 // ── repair-wb-credentials.mjs ─────────────────────────────────────────────
 
 check('repair-wb-credentials 干跑不写盘且不动 records:', () => {
@@ -133,6 +160,22 @@ check('repair-wb-credentials 实跑保留 records: 段', () => {
     const second = runScript('repair-wb-credentials.mjs', [], home)
     assert.equal(second.status, 0, `第二次运行失败:\n${second.output}`)
     assertRecordsIntact(path.join(home, CRED_REL))
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+check('repair-wb-credentials 不动模型 API Key（2026-11-14 事故）', () => {
+  const home = makeHome()
+  try {
+    const file = path.join(home, CRED_REL)
+    const run = runScript('repair-wb-credentials.mjs', [], home)
+    assert.equal(run.status, 0, `脚本失败:\n${run.output}`)
+    assertHostApiKeysIntact(file)
+    // 幂等路径同样不得动它们
+    const second = runScript('repair-wb-credentials.mjs', [], home)
+    assert.equal(second.status, 0, `第二次运行失败:\n${second.output}`)
+    assertHostApiKeysIntact(file)
   } finally {
     fs.rmSync(home, { recursive: true, force: true })
   }
@@ -194,6 +237,7 @@ check('import-wb-pool 实跑保留 records: 段', () => {
     const run = runScript('import-wb-pool.mjs', [], home)
     assert.equal(run.status, 0, `脚本失败:\n${run.output}`)
     assertRecordsIntact(path.join(home, CRED_REL))
+    assertHostApiKeysIntact(path.join(home, CRED_REL))
   } finally {
     fs.rmSync(home, { recursive: true, force: true })
   }
