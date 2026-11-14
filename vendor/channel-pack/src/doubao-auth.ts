@@ -51,6 +51,17 @@ import {
   fetchDoubaoCreditBalance,
   probeDoubaoCredential,
 } from './doubao-credits.js'
+import {
+  cookiesToHeader,
+  identityFromCookies,
+  readCookiesFromDoubaoClient,
+} from './doubao-client-bridge.js'
+import { createHash } from 'node:crypto'
+
+/** SHA-256（hex）。把 cookie 归一成稳定的去重键（拿不到 uid 时用）。 */
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input).digest('hex')
+}
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -216,6 +227,76 @@ export class DoubaoAuth extends Service {
       ref,
       refreshable: false,
     }
+  }
+
+  // ── 从客户端一键导入 ───────────────────────────────────────────────────
+
+  /**
+   * 从运行中的豆包工作客户端读取登录 cookie 并导入。
+   *
+   * ## 去重（用户明确要求：已有的不重复导入）
+   *
+   * 判定顺序：
+   * 1. `uid_tt` / `sid_tt` 等身份 cookie → 与已有账号凭据里的 `uid` 比对；
+   * 2. 拿不到 uid 时退化为**cookie 内容哈希**比对（同样不会重复）。
+   *
+   * 命中已有账号时**不新建**，而是把它「刷新」一次（探活 + 更新 cookie），
+   * 这样客户端重新登录后点一次即可把新 cookie 同步到原账号。
+   *
+   * @param options.accountIds 该 provider 现有账号 id（用于匹配 credentialRef）
+   */
+  async importFromClient(options: {
+    /** 该 provider 已有的账号（id + credentialRef），用于去重。 */
+    accounts: readonly { id: string; credentialRef: string }[]
+    /** 进度回调。 */
+    onProgress?: (message: string) => void
+    /** 客户端路径覆盖。 */
+    exePath?: string
+  }): Promise<{ accountId?: string; credentialRef: string; cookie: string; uid: string; deduped: boolean }> {
+    const read = await readCookiesFromDoubaoClient({
+      ...options.exePath === undefined ? {} : { exePath: options.exePath },
+      ...options.onProgress === undefined ? {} : { onProgress: options.onProgress },
+    })
+    const cookie = cookiesToHeader(read.cookies)
+    if (!cookie.includes('sessionid=')) {
+      throw new Error('客户端未登录：cookie 里没有 sessionid。请先在豆包工作里登录，再点一次导入。')
+    }
+    const identity = identityFromCookies(read.cookies)
+    const uid = identity?.value ?? ''
+    // 拿不到 uid 时的退化去重键：整串 cookie 的稳定哈希。
+    const fingerprint = uid.length > 0 ? `uid:${uid}` : `cookie:${sha256Hex(cookie)}`
+
+    // 扫已有账号，找同一个身份。
+    for (const account of options.accounts) {
+      const existing = await this.readCredential(account.credentialRef)
+      if (existing === undefined) continue
+      const existingKey = existing.uid.length > 0
+        ? `uid:${existing.uid}`
+        : `cookie:${sha256Hex(existing.cookie)}`
+      if (existingKey !== fingerprint) continue
+
+      // 命中：只更新 cookie（客户端可能重新登录过），不新建账号。
+      const next: DoubaoCredential = {
+        ...existing,
+        cookie,
+        uid: uid.length > 0 ? uid : existing.uid,
+        lastVerifiedAt: Date.now(),
+        desktop: true,
+      }
+      // 探活失败则不改写（避免把可用凭据换成坏凭据）。
+      const alive = await probeDoubaoCredential(next, this.product, this.fetchImpl)
+      if (alive === false) {
+        throw new Error('从客户端读到的 cookie 已失效（服务端 401/403）。请在客户端重新登录后重试。')
+      }
+      await this.ctx.credentials.set(credentialRef(account.credentialRef), JSON.stringify(next))
+      return { accountId: account.id, credentialRef: account.credentialRef, cookie, uid, deduped: true }
+    }
+
+    // 新账号。
+    const dedupeSuffix = (uid.length > 0 ? uid : sha256Hex(cookie)).replace(/[^0-9A-Za-z]/g, '').slice(0, 8).toUpperCase()
+    const refName = `DOUBAO_ACCOUNT_${dedupeSuffix}`
+    const result = await this.importCookie(cookie, { refName, desktop: true })
+    return { credentialRef: String(result.ref), cookie, uid, deduped: false }
   }
 
   // ── 刷新（探活式） ──────────────────────────────────────────────────────

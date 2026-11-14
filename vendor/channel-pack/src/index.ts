@@ -11,6 +11,7 @@ import { registerRaccoonLlm } from './raccoon-adapter.js'
 import { DoubaoAuth } from './doubao-auth.js'
 import { registerDoubaoLlm } from './doubao-adapter.js'
 import { DOUBAO } from './doubao-product.js'
+import { fetchDoubaoModels } from './doubao-credits.js'
 import type { DoubaoCredential } from './doubao.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
@@ -949,6 +950,26 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
     },
     accountPool: pool,
     product: DOUBAO,
+    // 远端「模型」（实为 bot）目录：拿到就用，拿不到适配器回退兜底表。
+    // ⚠️ 豆包 bot 目录的响应形状未实测，`fetchDoubaoModels` 走候选键防御式解析。
+    fetchRemoteModels: async () => {
+      const available = await pool.getAvailableAccount(DOUBAO.id, '')
+      let credential: DoubaoCredential | undefined
+      if (available) {
+        credential = available.credential as unknown as DoubaoCredential
+      } else {
+        const resolved = await ctx.credentials.resolve(credentialRef(DOUBAO.defaultCredentialRef))
+        if (resolved) {
+          try {
+            credential = JSON.parse(resolved.value) as DoubaoCredential
+          } catch {
+            credential = undefined
+          }
+        }
+      }
+      if (credential === undefined) return []
+      return fetchDoubaoModels(credential, DOUBAO)
+    },
   })
 
   // ===== MiniMax Code（中国版）服务 =====

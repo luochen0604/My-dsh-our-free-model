@@ -76,6 +76,14 @@ export interface DoubaoAdapterOptions {
   product?: DoubaoProduct
   /** fetch 实现覆盖（测试用）。 */
   fetchImpl?: typeof fetch
+  /**
+   * 拉取远端「模型」（= bot）目录。
+   *
+   * 失败或未登录时应返回空数组，适配器回退兜底表。
+   * ⚠️ 豆包的模型目录响应形状**未实测**（见 `fetchDoubaoModels` 注释），
+   * 故这里只做「拿到就用」的增强，不把目录缺失当错误。
+   */
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
 }
 
 /**
@@ -173,7 +181,34 @@ export class DoubaoAdapter extends LlmAdapter {
 
   /** 供 Channel Pack「显示列表」用的完整模型清单（不受黑名单影响）。 */
   listAllModels(): readonly { id: string; name: string }[] {
+    const remote = this.remoteModels
+    if (remote !== undefined && remote.length > 0) return remote
     return this.product.fallbackModels.map((model) => ({ id: model.id, name: model.name }))
+  }
+
+  /**
+   * 当前可用模型（远端优先，失败回退兜底表）。
+   *
+   * ⚠️ 不做缓存失效：豆包的 bot 目录变化不频繁，且拉取需要一次带 cookie 的
+   * 网络请求。首次 `listModels` 时拉一次，之后用进程内缓存。
+   */
+  private remoteModels: Array<{ id: string; name: string }> | undefined
+
+  private async loadModels(): Promise<Array<{ id: string; name: string }>> {
+    if (this.remoteModels !== undefined) return this.remoteModels
+    if (this.options.fetchRemoteModels !== undefined) {
+      try {
+        const remote = await this.options.fetchRemoteModels()
+        if (Array.isArray(remote) && remote.length > 0) {
+          this.remoteModels = remote
+          return remote
+        }
+      } catch {
+        // 目录拉不到不是错误：回退兜底表即可。
+      }
+    }
+    this.remoteModels = this.product.fallbackModels.map((model) => ({ id: model.id, name: model.name }))
+    return this.remoteModels
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
@@ -182,15 +217,17 @@ export class DoubaoAdapter extends LlmAdapter {
     if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
 
     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+    const all = await this.loadModels()
     const listed = disabled === undefined || disabled.size === 0
-      ? this.product.fallbackModels
-      : this.product.fallbackModels.filter((model) => !disabled.has(model.id))
+      ? all
+      : all.filter((model) => !disabled.has(model.id))
 
     return listed.map((model) => ({
       provider: this.product.id,
       id: model.id,
       name: model.name,
-      inputModalities: this.inputModalitiesFor(model),
+      // 远端目录不带能力标记，按兜底表里同 id 的条目判断；未知按纯文本。
+      inputModalities: this.inputModalitiesFor(this.fallbackIndex.get(model.id)),
     }))
   }
 

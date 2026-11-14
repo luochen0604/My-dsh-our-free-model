@@ -33,6 +33,8 @@ import {
   ALICE_CLAIM_PATH,
   ALICE_CREDIT_TIP_PATH,
   ALICE_CREDIT_USAGE_PATH,
+  BOT_LIST_LEGACY_PATH,
+  BOT_LIST_PATH,
   DOUBAO,
   type DoubaoProduct,
 } from './doubao-product.js'
@@ -409,8 +411,55 @@ export async function probeDoubaoCredential(
   }
 }
 
-/** 领取任务奖励（观察端点，暂未接入 UI；保留给后续扩展）。 */
-export async function claimDoubaoCampaignReward(
+/**
+ * 拉取豆包的「模型」（实际是 bot）目录。
+ *
+ * ## 为什么把 bot 当模型
+ *
+ * 豆包的对话入口是 `/samantha/chat/completion`，请求体里带 `bot_id` ——
+ * 换 bot 就是换模型/技能。故「模型列表」= bot 列表。
+ *
+ * ⚠️ **响应体形状未实测**（需要真实登录 cookie；无鉴权请求只会得到
+ * `710012001 登录已过期`）。故解析走「候选键 + 安全降级」：
+ * 找不到就返回空数组，由适配器回退兜底表，**绝不编造型号**。
+ *
+ * @returns 空数组表示"拿不到"（未登录 / 形状不符 / 网络异常），不是"没有模型"。
+ */
+export async function fetchDoubaoModels(
+  credential: DoubaoCredential,
+  product: DoubaoProduct = DOUBAO,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Array<{ id: string; name: string }>> {
+  const out: Array<{ id: string; name: string }> = []
+  const seen = new Set<string>()
+  for (const path of [BOT_LIST_PATH, BOT_LIST_LEGACY_PATH]) {
+    let result: PostResult
+    try {
+      result = await post(credential, path, {}, product, fetchImpl)
+    } catch {
+      continue
+    }
+    if (!result.ok || !businessOk(result.payload)) continue
+
+    const data = unwrapData(result.payload)
+    if (data === null || typeof data !== 'object') continue
+
+    const rows = pick(data, ['bot_list', 'bots', 'list', 'items', 'data'])
+    if (!Array.isArray(rows)) continue
+    for (const row of rows) {
+      const id = pick(row, ['bot_id', 'botId', 'id'])
+      const name = pick(row, ['bot_name', 'botName', 'name', 'title'])
+      const idText = typeof id === 'string' ? id : (typeof id === 'number' ? String(id) : '')
+      if (idText.length === 0 || seen.has(idText)) continue
+      seen.add(idText)
+      out.push({ id: idText, name: typeof name === 'string' && name.length > 0 ? name : idText })
+    }
+    if (out.length > 0) return out
+  }
+  return out
+}
+
+/** 领取任务奖励（观察端点，暂未接入 UI；保留给后续扩展）。 */export async function claimDoubaoCampaignReward(
   credential: DoubaoCredential,
   input: { taskId: string; campaignGroupCode: string; campaignItemCode: string },
   product: DoubaoProduct = DOUBAO,

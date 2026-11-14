@@ -43,6 +43,16 @@ export const ALICE_CREDIT_TIP_PATH = '/commerce/benefit_supply/credit/get_credit
 
 /** 会话列表（观察：`/samantha/conversation/list`）。 */
 export const SAMANTHA_CONVERSATION_LIST_PATH = '/samantha/conversation/list'
+
+/**
+ * bot（= 模型）目录。
+ *
+ * ⚠️ **实测 200，但无鉴权时只返回 `710012001 登录已过期`** ——
+ * 说明路由存在、形状未知。故 `fetchDoubaoModels` 用候选键防御式解析。
+ */
+export const BOT_LIST_PATH = '/alice/bot/get_bot_list_v2'
+/** bot 目录（旧版，作为备用）。 */
+export const BOT_LIST_LEGACY_PATH = '/alice/bot/get_bot_list'
 /** 线程创建（观察：`/samantha/thread/create_or_get`）。 */
 export const SAMANTHA_THREAD_PATH = '/samantha/thread/create_or_get'
 

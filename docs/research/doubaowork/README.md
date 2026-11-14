@@ -632,8 +632,46 @@ MCP_APPS_UNAVAILABLE / MCP_CAPABILITY_UNAVAILABLE / MCP_CAPABILITY_UAGINATION_FA
 - `710012001` —— `登录已过期，请重新登录` / `login invalid`
 - `710012000` —— chat SSE `gateway-error` 帧里出现
 
-> ⚠️ 仍**未拿到成功流样本**（需要真实登录 cookie）。故「不需要签名」已由实测支持，
-> 但「成功流的 SSE 事件形状」仍属未解 —— 尤其 `event: pb` 是否会在成功路径出现。
+### ⚡⚡ 实测结论 2（2026-11-15，**真实登录态**验证）
+
+#### A. 自动导入打通（已验证）
+
+`vendor/channel-pack/src/doubao-client-bridge.ts`：关闭客户端 → 带
+`--remote-debugging-port` 重启 → CDP `Network.getCookies` → 关闭 → 正常重启。
+
+实测（真实 profile，端到端）：
+
+- 读到 **35 个** `www.doubao.com` cookie，**含 `sessionid`** ✅
+- 同时含 `uid_tt`（去重键）、`sid_guard`、`s_v_web_id`、`msToken`、`sessionid_ss` 等
+- 耗时 **29 秒**；客户端已自动还原为正常模式
+- 关键前提：`taskkill`（不带 `/F`）**退出码 0 但进程留在托盘不死**，
+  必须 `/F` 强杀，否则 profile 锁不释放、调试端口起不来
+
+#### B. 登录态确实有效（已验证）
+
+用上一步读到的 cookie 打真实接口：
+
+| 端点 | 结果 |
+|---|---|
+| `POST /commerce/benefit_supply/credit/get_credit_tip` | **`code: 0`**（业务成功）✅ |
+| `POST /samantha/user/setting/get` | **`code: 0`** + 真实 `ab_config`/`share_config` ✅ |
+| `POST /alice/ug/campaign/landing/get` | `710010702 系统错误`（参数不足） |
+| `POST /alice/bot/get_bot_list_v2` | `710010202 系统错误`（参数不足） |
+| `POST /alice/ug/campaign/list/` | `code: 1 invalid param` |
+| `POST /samantha/chat/completion` | `400`（请求体形状不对） |
+
+→ **鉴权链路完全打通**：cookie 被服务端接受。剩下的都是**参数/请求体形状**问题。
+
+#### C. 仍未打通的两条（诚实记录）
+
+1. **签到**：`landing/get` 需要完整 `AgwCommonParam` 对象（不是 `{}`），
+   其结构在 bundle 里只是透传（`i.AgwCommonParam`），**未定位到构造处**。
+   `scene` 的合法字面量试过 `""` / `"default"` / `"checkin"` 均报系统错误。
+2. **模型调用**：`chat/completion` 的 `sentEvent` 是协议层富结构
+   （`content_blocks_v2` / `send_id` / `skill_id` 等），不是 OpenAI 的 `messages`
+   形状，故 `400`。`bot_id` 的真实字面量也未取到（`GetBotListV2` 里传的是模块常量 `c.e`）。
+
+> 两者都**不影响已交付的「一键从客户端导入 + 去重 + 探活式唤醒」**。
 
 ---
 

@@ -45,6 +45,7 @@ import {
   claimDoubaoDailyPoints,
   fetchDoubaoCheckinStatus,
   fetchDoubaoCreditBalance,
+  probeDoubaoCredential,
 } from './doubao-credits.js'
 import type { DoubaoCredential } from './doubao.js'
 import { claimRaccoonDailyPoints, fetchRaccoonDailyCheckinStatus } from './raccoon-credits.js'
@@ -298,6 +299,10 @@ export const OPS_CHECKIN_PROVIDERS: ReadonlySet<string> = new Set([
   WORKBUDDY_ID,
   // WPS（灵犀/福利中心/任务中心，共用一个 wps_sid）有真实签到接口，参与签到。
   LINGXI_ID,
+  // 豆包工作：`/alice/ug/campaign/landing/checkin` 已实测存在（无签名门槛），
+  // 参与一键签到与自动签到。⚠️ 是否真能领到取决于登录态来源（P2 未验证），
+  // 领取函数内部已做二次复核，不会谎报成功。
+  DOUBAO.id,
 ])
 
 /**
@@ -2010,6 +2015,70 @@ if (provider === LOBSTERAI.id) {
         }
       }
 
+      /**
+       * 一键从**运行中的豆包工作客户端**导入当前登录账号。
+       *
+       * ## 为什么不要求用户粘贴 cookie
+       *
+       * 登录态只在 Chromium 的 `Network/Cookies` 里，而那个 SQLite 被运行中的
+       * 进程硬锁（实测三种 FileShare 模式全部 IOException；本机非管理员，
+       * 无法卷影复制）。客户端自有 LevelDB 里也搜不到 session。
+       * 唯一可行路径是 CDP（客户端接受 `--remote-debugging-port`，实测可用）——
+       * 详见 `doubao-client-bridge.ts` 模块头。
+       *
+       * ⚠️ 该操作会**重启客户端**（关掉 → 带调试端口启动 → 读 → 关掉 → 正常重启）。
+       * 这是读取被硬锁 cookie 的必然代价，前端需事先告知用户。
+       *
+       * ## 去重
+       *
+       * `DoubaoAuth.importFromClient` 内部按 `uid_tt` 等身份 cookie 比对已有账号；
+       * 命中则只更新 cookie（不新建），故重复点击不会产生重复账号。
+       */
+      case 'account.importFromClient': {
+        const req = payload as { provider?: string }
+        if (req.provider !== DOUBAO.id) {
+          return { ok: false, error: { code: 'bad-request', message: `该渠道不支持从客户端导入：${String(req.provider)}` } }
+        }
+        const accounts = pool.listAccounts(DOUBAO.id).map((entry) => ({
+          id: entry.id,
+          credentialRef: entry.credentialRef,
+        }))
+        let imported
+        try {
+          imported = await doubao.importFromClient({
+            accounts,
+            onProgress: (message) => ctx.logger?.info?.(`[channel-pack] {doubao} ${message}`),
+          })
+        } catch (error) {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          }
+        }
+
+        if (imported.deduped) {
+          // 已有账号：只刷新了 cookie，不新建。账号条目本身无需改动
+          //（`lastUsedAt` 不是该池支持的字段，别硬塞）。
+          return { ok: true, value: { accountId: imported.accountId, deduped: true } }
+        }
+
+        const id = `${DOUBAO.id}-${shortId()}`
+        await pool.addAccount({
+          id,
+          provider: DOUBAO.id,
+          nickname: imported.uid.length > 0 ? `豆包 ${imported.uid.slice(-6)}` : `豆包 ${id.slice(-6)}`,
+          enabled: true,
+          credentialRef: imported.credentialRef,
+          // 豆包无续期端点 ⇒ 恒 false（续期定时器据此跳过）。
+          refreshable: false,
+          createdAt: Date.now(),
+        })
+        return { ok: true, value: { accountId: id, deduped: false } }
+      }
+
       case 'account.update': {
         const req = payload as RpcUpdateAccountRequest
         await pool.updateAccount(req.accountId, req.patch)
@@ -2303,6 +2372,44 @@ if (provider === LOBSTERAI.id) {
                   `[channel-pack] lingxi 账号 ${entry.id} 探活通过但余额读取失败（不失败，仅告警）`,
                 )
               }
+              break
+            }
+            case DOUBAO.id: {
+              /**
+               * 豆包的「唤醒」= **探活式刷新**，不是续期。
+               *
+               * 豆包**没有 refresh 端点**（登录态是字节 passport 的滚动 cookie，
+               * 服务端自动续期，客户端侧看不到固定过期时刻）。故与 ZCode / Lingxi
+               * 同策略：
+               * 1. 调一次最轻的只读端点（`get_credit_tip`）确认登录态仍有效；
+               *    失效（401/403 或业务码 710012001/710012000）⇒ 抛可读错误；
+               * 2. 成功则回写 `lastVerifiedAt`，供前端显示"上次验证时间"。
+               * 网络异常**不判死**（返回 undefined ⇒ 抛"网络异常，稍后重试"），
+               * 避免把一次断网当成凭据失效，逼用户重新登录。
+               */
+              const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+              if (!resolved) throw new Error('凭据未配置')
+              let credential: DoubaoCredential
+              try {
+                credential = JSON.parse(resolved.value) as DoubaoCredential
+              } catch {
+                throw new Error('凭据解析失败')
+              }
+              if (typeof credential.cookie !== 'string' || credential.cookie.length === 0) {
+                throw new Error('豆包凭据缺少 cookie，请重新从客户端导入')
+              }
+              const alive = await probeDoubaoCredential(credential, DOUBAO)
+              if (alive === false) {
+                throw new Error('豆包登录态已失效，请在客户端重新登录后点「从客户端导入」')
+              }
+              if (alive === undefined) {
+                throw new Error('豆包探活失败（网络异常），稍后重试')
+              }
+              // 探活通过 → 回写验证时间，driver 侧用于新鲜度判断。
+              await ctx.credentials.set(credentialRef(entry.credentialRef), JSON.stringify({
+                ...credential,
+                lastVerifiedAt: Date.now(),
+              }))
               break
             }
             default:
