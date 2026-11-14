@@ -107,8 +107,23 @@ import { listenOnRandomPort } from './raccoon-login-page.js'
 /** 回调路径（官方页面的 `N()` 正则写死了这一条，不能改）。 */
 export const RACCOON_DESKTOP_CALLBACK_PATH = '/auth/callback'
 
-/** 官方桌面端登录页的固定参数（主进程 `desktopLogin.js` 的 `DESKTOP_AUTH_PARAMS`）。 */
-export const RACCOON_DESKTOP_APP_NAME = '办公小浣熊客户端'
+/**
+ * `/authorize` 的 `appname` —— 两条官方登录路径**用的是不同的值**，不能混用！
+ *
+ * | 官方路径 | 代码位置 | `appname` |
+ * |---|---|---|
+ * | 自定义协议深链（默认「登录」按钮） | `main/account/desktopLogin.js` 的 `DESKTOP_AUTH_PARAMS` | `办公小浣熊客户端`（写死字面量） |
+ * | 兼容登录 / 回环（「无法返回客户端？使用兼容登录」） | `main/client/account/webLogin.js` 的 `desktopLoginUrl()`，取 `webLoginResources.zh.appName` = `enterpriseName('zh')` = `raccoon.brand.name.zh` | **`商汤小浣熊`** |
+ *
+ * ⚠️ 2026-11-14 踩过的坑：本插件走的是**回环**（`desktop_callback=loopback`），
+ * 早期却照抄了深链路径的 `appname`（`办公小浣熊客户端`），等于拼出一条官方从不
+ * 产生的组合。用户反馈「用客户端的兼容模式登录能领到积分」——兼容模式就是回环，
+ * 而本插件用的正是回环，说明路径本身没错，错在这个参数。
+ */
+export const RACCOON_DESKTOP_APP_NAME = '商汤小浣熊'
+
+/** 深链路径的 `appname`（仅用于说明/对照，本插件不走这条路）。 */
+export const RACCOON_DEEPLINK_APP_NAME = '办公小浣熊客户端'
 
 /** 组装 `/authorize` 页的完整 URL（导出给单测逐参数钉死官方校验规则）。 */
 export function buildRaccoonDesktopAuthorizeUrl(options: {

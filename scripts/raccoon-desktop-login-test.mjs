@@ -23,7 +23,13 @@ export async function verifyRaccoonDesktopLogin({ ctx, call, creds }) {
   const sourceRoot = new URL('../vendor/channel-pack/src/', import.meta.url).href
   const url = new URL('raccoon-desktop-login.ts', sourceRoot).href
   const mod = await import(url)
-  const { buildRaccoonDesktopAuthorizeUrl, startRaccoonDesktopLogin, RACCOON_DESKTOP_CALLBACK_PATH } = mod
+  const {
+    buildRaccoonDesktopAuthorizeUrl,
+    startRaccoonDesktopLogin,
+    RACCOON_DESKTOP_CALLBACK_PATH,
+    RACCOON_DESKTOP_APP_NAME,
+    RACCOON_DEEPLINK_APP_NAME,
+  } = mod
   assert.equal(RACCOON_DESKTOP_CALLBACK_PATH, '/auth/callback', '回调路径由官方正则写死')
 
   // ① 官方校验规则的复刻（与逆向到的 `N()` / `C()` 逐条对应）
@@ -39,7 +45,24 @@ export async function verifyRaccoonDesktopLogin({ ctx, call, creds }) {
   const params = parsed.searchParams
   assert.equal(params.get('login_source'), 'desktop')
   assert.equal(params.get('desktop_callback'), 'loopback')
-  assert.equal(params.get('appname'), '办公小浣熊客户端', '官方桌面端的固定 appname')
+  // ⚠️ 回环路径的 appname 是 `商汤小浣熊`（webLogin.js 取 webLoginResources.zh.appName
+  // = enterpriseName('zh') = brand.name.zh），**不是**深链路径的 `办公小浣熊客户端`。
+  // 这条断言以前写死成深链的值，等于把 bug 钉进了测试里（2026-11-14 修正）。
+  assert.equal(
+    params.get('appname'),
+    '商汤小浣熊',
+    '回环/兼容登录路径的 appname 是 brand.name.zh，不是深链路径的「办公小浣熊客户端」',
+  )
+  assert.equal(
+    RACCOON_DESKTOP_APP_NAME,
+    '商汤小浣熊',
+    '导出的常量必须与回环路径实际使用的一致',
+  )
+  assert.notEqual(
+    RACCOON_DESKTOP_APP_NAME,
+    RACCOON_DEEPLINK_APP_NAME,
+    '两条官方路径的 appname 不同，不能混用',
+  )
   assert.equal(params.get('redirect'), 'http://127.0.0.1:53123/auth/callback')
   assert.match(params.get('redirect'), REDIRECT_RE, 'redirect 必须命中官方回环正则')
   assert.equal(params.get('state'), state)
