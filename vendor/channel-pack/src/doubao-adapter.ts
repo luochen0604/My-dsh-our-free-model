@@ -55,6 +55,8 @@ import {
   doubaoHeaders,
   isDoubaoAuthError,
   isDoubaoRateLimitError,
+  isDoubaoSlideChallenge,
+  describeDoubaoFailure,
   isDoubaoQuotaError,
   isDoubaoUsable,
   splitSseBlocks,
@@ -416,10 +418,13 @@ export class DoubaoAdapter extends LlmAdapter {
         if (isDoubaoAuthError(response.status, text)) {
           throw new LlmError(`doubao: auth failed (HTTP ${response.status})`, 'AUTH')
         }
+        if (isDoubaoSlideChallenge(text)) {
+          throw new LlmError(`doubao: ${describeDoubaoFailure(text)}`, 'PROVIDER')
+        }
         if (isDoubaoQuotaError(response.status, text)) {
           throw new LlmError(`doubao: quota/limit (HTTP ${response.status})`, 'QUOTA_EXCEEDED')
         }
-        throw new LlmError(`doubao: HTTP ${response.status}: ${text.slice(0, 300)}`, 'PROVIDER')
+        throw new LlmError(`doubao: ${describeDoubaoFailure(text)}`, 'PROVIDER')
       }
       if (response.body === null) {
         throw new LlmError('doubao: empty response body', 'PROVIDER')
@@ -521,11 +526,18 @@ export class DoubaoAdapter extends LlmAdapter {
             continue
           }
           if (parsed.kind === 'error') {
+            /**
+             * 错误文案必须**可读**：服务端 `extra.decision` 是一层转义 JSON，
+             * 原样抛出会让用户看到大段乱码（实际反馈过）。
+             * 同时把「风控滑块」与「真限流」区分开 —— 前者重试无用。
+             */
+            const readable = describeDoubaoFailure(frame.data)
             throw new LlmError(
-              `doubao: ${parsed.message}`,
+              `doubao: ${readable}`,
               isDoubaoAuthError(200, frame.data) ? 'AUTH'
-                : isDoubaoRateLimitError(200, frame.data) ? 'QUOTA_EXCEEDED'
-                  : 'PROVIDER',
+                : isDoubaoSlideChallenge(frame.data) ? 'PROVIDER'
+                  : isDoubaoRateLimitError(200, frame.data) ? 'QUOTA_EXCEEDED'
+                    : 'PROVIDER',
             )
           }
           if (parsed.kind === 'done') {

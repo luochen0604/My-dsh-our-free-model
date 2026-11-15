@@ -479,6 +479,51 @@ export function isDoubaoRateLimitError(status: number, body: string): boolean {
   return /rate limited|too many requests|限流|请求过于频繁/i.test(text)
 }
 
+/**
+ * 是否是**风控滑块挑战**（`subtype: "slide"`）。
+ *
+ * ## 与限流的区别（重要）
+ *
+ * 两者共用 `710022004 rate limited` 这个外层码，但成因不同：
+ *
+ * - **slide（风控）**：短时间大量请求后触发，响应里带
+ *   `extra.decision`，其内部 JSON 含 `"type":"verify","subtype":"slide"`。
+ *   表现为「换个浏览器/等一会儿就好」。**重试无用**，需要人工过滑块。
+ * - **真限流**：并发/配额层面的 429。
+ *
+ * 分开判断才能给出对用户有用的提示（「稍等几分钟」vs「过滑块验证」）。
+ */
+export function isDoubaoSlideChallenge(body: string): boolean {
+  const text = String(body ?? '')
+  return /"subtype"\s*:\s*"slide"|subtype[^,}]{0,10}slide/i.test(text)
+}
+
+/**
+ * 把豆包的错误载荷转成**可读**的中文提示。
+ *
+ * 服务端返回的 `extra.decision` 是一层被转义的 JSON，直接抛给用户会看到
+ * 一大段乱码（用户实际反馈过）。这里只提取人话部分。
+ */
+export function describeDoubaoFailure(body: string): string {
+  const text = String(body ?? '')
+  if (isDoubaoSlideChallenge(text)) {
+    return '豆包触发了人机验证（滑块）。请打开豆包工作客户端完成一次验证，或等待几分钟后再试。'
+  }
+  // ⚠️ 用 0 而不是 429：这里只做**文本**判定，传入 429 会让任何调用都命中
+  // `status === 429` 分支（真实缺陷：把「系统错误」误报成「请求过于频繁」）。
+  if (isDoubaoRateLimitError(0, text)) {
+    return '豆包提示请求过于频繁，请稍等片刻再试。'
+  }
+  const code = /"error_code"\s*:\s*(\d+)/.exec(text)?.[1]
+    ?? /"code"\s*:\s*(\d+)/.exec(text)?.[1]
+  const message = /"error_msg"\s*:\s*"([^"]{1,120})"/.exec(text)?.[1]
+    ?? /"message"\s*:\s*"([^"]{1,120})"/.exec(text)?.[1]
+  if (code !== undefined || message !== undefined) {
+    return `豆包返回错误 ${code ?? ''}${message === undefined ? '' : `：${message}`}`.trim()
+  }
+  return text.slice(0, 200)
+}
+
 export function isDoubaoAuthError(status: number, body: string): boolean {
   if (status === 401 || status === 403) return true
   const text = String(body ?? '')
