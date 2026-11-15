@@ -132,7 +132,27 @@ export class DoubaoAuth extends Service {
 
   // ── 凭据解析 ───────────────────────────────────────────────────────────
 
-  /** 把存储值解析成凭据；损坏时返回 `undefined` 而不是抛错。 */
+  /**
+   * 把存储值解析成凭据；损坏时返回 `undefined` 而不是抛错。
+   *
+   * ## ⚠️ 必须保留 `deviceId`（2026-11-15 实测修正）
+   *
+   * 这里是把「落盘的 JSON」还原成 `DoubaoCredential` 的**唯一**入口，
+   * 而它此前只映射了五个字段，**把 `deviceId` 丢了**：
+   *
+   * - `importCookie()` / `importFromClient()` 明明把设备号写进了凭据；
+   * - 但任何一次 `readCredential()` 之后设备号就消失；
+   * - 适配器于是拿不到 `credential.deviceId`，公共 query 里
+   *   `device_id` / `fp=verify_<id>` / `tea_uuid` 三项全部缺席，
+   *   `agent_task_param.local_device_id` 也跟着消失。
+   *
+   * 服务端看到的就成了一条「没有任何设备标识」的请求——实测这类请求更容易被
+   * 语义风控拦下（`subtype: semantic_reasoning`）。
+   *
+   * 缺省时**不臆造**字段（保持 `undefined` 而不是空串）：空串会让
+   * `doubaoCommonParams()` 的 `device === ''` 判断仍然跳过，
+   * 但会在序列化里留下一个假值，误导以后读代码的人。
+   */
   private parse(raw: string | undefined): DoubaoCredential | undefined {
     if (typeof raw !== 'string' || raw.length === 0) return undefined
     try {
@@ -144,6 +164,9 @@ export class DoubaoAuth extends Service {
         nickname: typeof parsed.nickname === 'string' ? parsed.nickname : '',
         lastVerifiedAt: typeof parsed.lastVerifiedAt === 'number' ? parsed.lastVerifiedAt : 0,
         desktop: parsed.desktop === true,
+        ...typeof parsed.deviceId === 'string' && parsed.deviceId.length > 0
+          ? { deviceId: parsed.deviceId }
+          : {},
       }
     } catch {
       return undefined

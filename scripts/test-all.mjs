@@ -75,6 +75,9 @@ const suites = [
   ['turn-accounting', 'turn-accounting-test.mjs', []],
   ['chan-relay', 'chan-relay-test.mjs', []],
   ['channel-pack', 'channel-pack-test.mjs', []],
+  // 豆包（DoubaoWork）SSE 协议层单测：帧切分 / 事件分类 / 错误分级 / 设备号解析。
+  // 独立于 channel-pack-test：那套要挂整个 pack，本套只测 doubao.ts 的纯函数。
+  ['doubao-protocol', 'doubao-protocol-suite.mjs', []],
   ['channel-pack-gate', 'channel-pack-gate-test.mjs', []],
   // 凭据文档的读写：`records:` 段是 DSH 宿主自己的登录会话，插件脚本改
   // `refs:` 时绝不能碰它（真实事故 2026-11-13：频繁掉登录）。

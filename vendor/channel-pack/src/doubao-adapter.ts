@@ -56,10 +56,13 @@ import {
   isDoubaoAuthError,
   isDoubaoRateLimitError,
   isDoubaoSlideChallenge,
+  isDoubaoSemanticRisk,
   describeDoubaoFailure,
   isDoubaoQuotaError,
   isDoubaoUsable,
   splitSseBlocks,
+  parseDoubaoSseFrame,
+  type DoubaoSseOutcome,
   withCommonParams,
   DOUBAO_MESSAGE_FROM_DESKTOP,
   DOUBAO_BLOCK_TYPE_TEXT,
@@ -103,63 +106,28 @@ export interface DoubaoAdapterOptions {
  */
 interface DoubaoRemoteModel extends DoubaoFallbackModel {}
 
-/** 一帧 SSE 的解析结果。 */
-export type DoubaoEventOutcome =
-  | { kind: 'text'; text: string }
-  | { kind: 'done' }
-  | { kind: 'error'; message: string }
+/**
+ * 一帧 SSE 的解析结果。
+ *
+ * @deprecated 语义解析已统一收敛到 `doubao.ts` 的 `parseDoubaoSseFrame`。
+ * 保留此别名只为兼容既有导入路径；新代码请直接用 `DoubaoSseOutcome`。
+ */
+export type DoubaoEventOutcome = DoubaoSseOutcome
 
 /**
  * 解析一帧 `/chat/completion` 的 SSE。
  *
- * @param event `event:` 行的事件名
- * @param raw `data:` 行的 JSON
+ * @deprecated 请改用 `doubao.ts` 的 `parseDoubaoSseFrame` —— 它按实测事件名
+ * （`CHUNK_DELTA` / `STREAM_CHUNK` / `SSE_ACK` / `SSE_REPLY_END` / `STREAM_ERROR`）
+ * 做完整分类，并正确处理思考块与反问块。本函数只保留旧的三分支形状，
+ * 会漏掉会话 ack、思考过程与反问（真实缺陷：反问时调用方挂到超时）。
  */
 export function parseDoubaoEvent(event: string | undefined, raw: string): DoubaoEventOutcome | undefined {
-  let payload: unknown
-  try {
-    payload = JSON.parse(raw)
-  } catch {
-    return undefined
-  }
-  if (payload === null || typeof payload !== 'object') return undefined
-  const record = payload as Record<string, unknown>
-
-  // 错误帧：事件名带 ERROR，或带非 0 code。
-  if (typeof event === 'string' && /ERROR/i.test(event)) {
-    const code = record['code'] ?? record['status_code']
-    const message = record['message'] ?? record['msg'] ?? raw.slice(0, 200)
-    return { kind: 'error', message: `business error ${String(code ?? '?')}: ${String(message)}` }
-  }
-  if (event === 'SSE_REPLY_END') return { kind: 'done' }
-  if (event !== 'STREAM_CHUNK') return undefined
-
-  /**
-   * 文本增量：`patch_op[].patch_value.content_block[].content.text_block.text`。
-   *
-   * 其它 patch（如耗时块）也带 `content_block`，但没有 `text_block.text`，
-   * 故按字段存在性过滤 —— 不靠 `patch_type` 猜。
-   */
-  let text = ''
-  const ops = record['patch_op']
-  if (!Array.isArray(ops)) return undefined
-  for (const op of ops) {
-    if (op === null || typeof op !== 'object') continue
-    const value = (op as Record<string, unknown>)['patch_value']
-    if (value === null || typeof value !== 'object') continue
-    const blocks = (value as Record<string, unknown>)['content_block']
-    if (!Array.isArray(blocks)) continue
-    for (const block of blocks) {
-      if (block === null || typeof block !== 'object') continue
-      const content = (block as Record<string, unknown>)['content']
-      if (content === null || typeof content !== 'object') continue
-      const textBlock = (content as Record<string, unknown>)['text_block']
-      if (textBlock === null || typeof textBlock !== 'object') continue
-      const piece = (textBlock as Record<string, unknown>)['text']
-      if (typeof piece === 'string') text += piece
-    }
-  }
-  return text.length === 0 ? undefined : { kind: 'text', text }
+  const frame = { event: typeof event === 'string' ? event : '', data: raw }
+  const outcome = parseDoubaoSseFrame(frame)
+  if (outcome === undefined) return undefined
+  if (outcome.kind === 'end') return { kind: 'end', endType: outcome.endType, brief: outcome.brief }
+  return outcome
 }
 
 /** 豆包适配器。 */
@@ -170,12 +138,56 @@ export class DoubaoAdapter extends LlmAdapter {
   /** 设置页命名空间（沿用 channel-pack 的 legacy 兼容取值）。 */
   private readonly settingsNamespace: string
 
+  /**
+   * 会话复用缓存：DSH 会话键 → 豆包侧 `conversation_id`。
+   *
+   * ## 为什么必须复用（而不是每轮都开新会话）
+   *
+   * 豆包这个端点的请求体**只带当前这一轮的输入**（`messages` 里只有一条
+   * `content_block`），历史上下文完全靠服务端的 `conversation_id` 承载。
+   * 每轮都发 `need_create_conversation: true` + 空 `conversation_id`，
+   * 等于每轮都从零开始：模型看不到前文，多轮对话直接失效。
+   *
+   * 参考实现（`dsh-connect-doubaowork` 的 `shim.js`）用的是
+   * 「显式 metadata 优先，否则按『模型 + 首条消息』哈希」的键；这里用
+   * DSH 提供的 `options.sessionId`（宿主盖章的会话标识）作为键，
+   * 它比消息哈希稳定：同一会话里首条消息变化（压缩、编辑）不会散成多条豆包会话。
+   *
+   * 键缺省时（一次性调用 / 测试）退化为**不复用**，保持原语义。
+   *
+   * ⚠️ 有界：只保留最近 `MAX_REMEMBERED_CONVERSATIONS` 条，避免长驻进程
+   * 无限增长（与 shim.js 的 `MAX_CONVERSATIONS` 同思路）。
+   */
+  private readonly conversations = new Map<string, { conversationId: string; sectionId: string }>()
+
   constructor(private readonly options: DoubaoAdapterOptions) {
     super()
     this.product = options.product ?? DOUBAO
     this.fetchImpl = options.fetchImpl ?? fetch
     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]))
     this.settingsNamespace = settingsNamespaceFor(options.ctx, this.product.id)
+  }
+
+  /** 会话缓存容量上限。 */
+  private static readonly MAX_REMEMBERED_CONVERSATIONS = 512
+
+  /** 取某 DSH 会话对应的豆包会话（无则 undefined）。 */
+  private resumeFor(sessionKey: string | undefined): { conversationId: string; sectionId: string } | undefined {
+    if (sessionKey === undefined || sessionKey.length === 0) return undefined
+    return this.conversations.get(sessionKey)
+  }
+
+  /** 记住某 DSH 会话对应的豆包会话（LRU 式淘汰最旧）。 */
+  private rememberConversation(sessionKey: string | undefined, conversationId: string, sectionId: string): void {
+    if (sessionKey === undefined || sessionKey.length === 0 || conversationId.length === 0) return
+    // 先删再插 —— Map 保序，这样最旧的总在头部。
+    this.conversations.delete(sessionKey)
+    this.conversations.set(sessionKey, { conversationId, sectionId })
+    while (this.conversations.size > DoubaoAdapter.MAX_REMEMBERED_CONVERSATIONS) {
+      const oldest = this.conversations.keys().next().value
+      if (oldest === undefined) break
+      this.conversations.delete(oldest)
+    }
   }
 
   /**
@@ -369,12 +381,24 @@ export class DoubaoAdapter extends LlmAdapter {
      *   故不必照抄抓包里的 workspace/权限等环境字段。
      */
     const modelItemKey = resolveDoubaoModelItemKey(options.model)
+
+    /**
+     * 会话复用：同一 DSH 会话的第二轮起接着原豆包会话走。
+     *
+     * `sessionKey` 用宿主的 `sessionId`（见 `conversations` 字段注释）。
+     * 拿不到就退化为单轮语义，行为与改动前一致。
+     */
+    const sessionKey = typeof options.sessionId === 'string' ? options.sessionId : undefined
+    const resume = this.resumeFor(sessionKey)
+    const conversationId = resume?.conversationId ?? ''
+
     const body = JSON.stringify({
       client_meta: {
         local_conversation_id: `local_${Date.now()}`,
-        conversation_id: '',
+        // 有会话就带上，服务端据此续上下文；空串 = 开新会话。
+        conversation_id: conversationId,
         bot_id: this.product.botId,
-        last_section_id: '',
+        last_section_id: resume?.sectionId ?? '',
         last_message_index: null,
         /**
          * ⚠️ 客户端真实发的是**三条本地权限声明**（不是空数组）。
@@ -388,7 +412,8 @@ export class DoubaoAdapter extends LlmAdapter {
           { permission_name: 'ACCESS_BACKGROUND_LOCATION', status: 2 },
         ],
       },
-      messages: toWireMessages(options),
+      // 续会话时只发本轮输入（历史在服务端）；新会话时把历史压平成一段。
+      messages: toWireMessages(options, conversationId !== '' ),
       option: {
         // 客户端会把这批布尔/字符串默认值**全部显式发出**（共 42 个键），
         // 缺一大半会让请求看起来不像真客户端。这里补齐关键默认值。
@@ -413,7 +438,8 @@ export class DoubaoAdapter extends LlmAdapter {
         scene_type: 0,
         unique_key: randomUuid(),
         start_seq: 0,
-        need_create_conversation: true,
+        // 有会话就不新建；否则服务端每次都会开一条新记录。
+        need_create_conversation: conversationId === '',
         conversation_init_option: { project_id: '', need_ack_conversation: true },
         conversation_init_ext: {
           /**
@@ -484,25 +510,68 @@ export class DoubaoAdapter extends LlmAdapter {
         throw new LlmError(`doubao: unexpected content-type "${contentType}": ${text.slice(0, 300)}`, 'PROVIDER')
       }
 
-      yield* this.consumeStream(response.body, options.signal ?? controller.signal)
+      yield* this.consumeStream(
+        response.body,
+        options.signal ?? controller.signal,
+        resume,
+        (nextConversationId, nextSectionId) => {
+          this.rememberConversation(sessionKey, nextConversationId, nextSectionId)
+        },
+      )
     } finally {
       options.signal?.removeEventListener('abort', onAbort)
     }
   }
 
-  /** 消费 SSE 流并产出 `StreamChunk`。 */
+  /**
+   * 消费 SSE 流并产出 `StreamChunk`。
+   *
+   * ## 与旧实现的差异（2026-11-15 按参考实现 + 实测帧重写）
+   *
+   * | 能力 | 旧实现 | 现在 |
+   * |---|---|---|
+   * | `CHUNK_DELTA` 纯文本增量 | 不处理 | 优先消费，并抑制 `STREAM_CHUNK` 全文 |
+   * | 思考过程 `block_type=10040` | 丢弃 | 产出 `reasoning` 块 |
+   * | `SSE_ACK` 会话 id | 忽略 | **回填会话缓存，下一轮复用** |
+   * | 反问 `block_type=10082` | 丢弃 → 挂到超时 | 转成正文 + **立即收尾** |
+   * | `SSE_REPLY_END.brief` | 忽略 | 无正文时的兜底全文 |
+   *
+   * @returns 本轮的会话 id（`SSE_ACK` 下发的 `conversation_id`；没有则为 `''`）
+   */
   private async *consumeStream(
     body: ReadableStream<Uint8Array>,
     signal: AbortSignal,
+    resume: { conversationId: string; sectionId: string } | undefined,
+    onConversation: (conversationId: string, sectionId: string) => void,
   ): AsyncIterable<StreamChunk> {
     const reader = body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
-    let index = 0
-    let started = false
+    /** 下一个可用的块序号（reasoning 与 text 共用，避免撞号）。 */
+    let nextIndex = 0
+    let textIndex = 0
+    let reasoningIndex = 0
+    let sawText = false
+    let sawReasoning = false
     let sawDone = false
-    let droppedFrames = 0
+    let sawChunkDelta = false
+    let sawClarify = false
+    let finishedBrief = ''
+    let clarifiedQuestions: string[] = []
+    let conversationId = resume?.conversationId ?? ''
+    let sectionId = resume?.sectionId ?? ''
     let firstFrameAt = 0
+    let lastFrameAt = 0
+
+    /** 收尾：把还开着的块关掉（先 reasoning 后 text，与开启顺序相反）。 */
+    const closeBlocks = function* closeBlocks(): Generator<StreamChunk> {
+      if (sawReasoning) {
+        yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: '' } }
+      }
+      if (sawText) {
+        yield { type: 'block-end', index: textIndex, block: { type: 'text', text: '' } }
+      }
+    }
 
     try {
       while (true) {
@@ -511,7 +580,10 @@ export class DoubaoAdapter extends LlmAdapter {
         if (done) break
         const now = Date.now()
         if (firstFrameAt === 0) firstFrameAt = now
-        else if (now - firstFrameAt > DOUBAO_CHUNK_TIMEOUT_MS) {
+        lastFrameAt = now
+        // 首帧用更宽的首 token 超时；之后按 chunk 间隔判活。
+        const budget = sawText || sawReasoning ? DOUBAO_CHUNK_TIMEOUT_MS : DOUBAO_FIRST_TOKEN_TIMEOUT_MS
+        if (now - firstFrameAt > budget) {
           throw new LlmError('doubao: stream chunk timeout', 'TIMEOUT')
         }
 
@@ -520,96 +592,136 @@ export class DoubaoAdapter extends LlmAdapter {
         buffer = rest
 
         for (const frame of frames) {
-          if (frame.event === DOUBAO_SSE.done) {
-            sawDone = true
-            continue
-          }
-          if (frame.event === DOUBAO_SSE.err) {
-            throw new LlmError(`doubao: server error: ${frame.data.slice(0, 300)}`, 'PROVIDER')
-          }
-          /**
-           * ## 真实帧结构（2026-11-15 CDP 抓到 `/chat/completion` 的完整成功流）
-           *
-           * 帧是标准 SSE：`id: 0` + `event: <名称>` + `data: <JSON>`。
-           *
-           * | event | 含义 |
-           * |---|---|
-           * | `SSE_HEARTBEAT` | 心跳，忽略 |
-           * | `STREAM_TIMEOUT_CONTROL` | 超时控制参数，忽略 |
-           * | `SSE_ACK` | 会话/段落 id 下发，忽略 |
-           * | `FULL_MSG_NOTIFY` | 用户消息回显，忽略 |
-           * | `STREAM_MSG_NOTIFY` | 元数据块（耗时等），忽略 |
-           * | **`STREAM_CHUNK`** | **文本增量**（见下） |
-           * | `SSE_REPLY_END` | 结束（`msg_finish_attr.brief` 是完整文本）|
-           * | `SSE_REPLY_ERROR` 等 | 业务错误 |
-           *
-           * `STREAM_CHUNK` 的文本在：
-           * ```jsonc
-           * { "patch_op": [ { "patch_object": 1, "patch_type": 1,
-           *                   "patch_value": { "content_block": [ { "content": {
-           *                     "text_block": { "text": "增量" } } } ] } } ] }
-           * ```
-           */
-          if (frame.event === 'SSE_REPLY_END') {
-            sawDone = true
-            continue
-          }
-          if (frame.event === 'SSE_HEARTBEAT' || frame.event === 'STREAM_TIMEOUT_CONTROL'
-            || frame.event === 'SSE_ACK' || frame.event === 'FULL_MSG_NOTIFY'
-            || frame.event === 'STREAM_MSG_NOTIFY') {
-            continue
-          }
-          if (frame.event === 'gateway-error') {
-            throw new LlmError(
-              `doubao: gateway error: ${frame.data.slice(0, 300)}`,
-              isDoubaoAuthError(200, frame.data) ? 'AUTH' : 'PROVIDER',
-            )
-          }
-          if (frame.data.length === 0) continue
+          // `CHUNK_DELTA` 一旦出现，`STREAM_CHUNK` 的正文就变成全量快照，
+          // 必须停止重复消费它——见 `collectStreamChunk` 的说明。
+          if (frame.event === DOUBAO_SSE.chunkDelta) sawChunkDelta = true
 
-          const parsed = parseDoubaoEvent(frame.event, frame.data)
-          if (parsed === undefined) {
-            droppedFrames += 1
-            continue
-          }
+          const parsed = parseDoubaoSseFrame(frame, sawChunkDelta)
+          if (parsed === undefined) continue
+
           if (parsed.kind === 'error') {
             /**
              * 错误文案必须**可读**：服务端 `extra.decision` 是一层转义 JSON，
              * 原样抛出会让用户看到大段乱码（实际反馈过）。
-             * 同时把「风控滑块」与「真限流」区分开 —— 前者重试无用。
+             *
+             * ⚠️ 分类顺序（语义风控 → 滑块 → 限流）与 `describeDoubaoFailure`
+             * 保持一致：三者共用 `710022004 rate limited`，把限流判在前面
+             * 会把「重试无用」的风控误报成「稍等再试」。
              */
             const readable = describeDoubaoFailure(frame.data)
             throw new LlmError(
               `doubao: ${readable}`,
               isDoubaoAuthError(200, frame.data) ? 'AUTH'
-                : isDoubaoSlideChallenge(frame.data) ? 'PROVIDER'
-                  : isDoubaoRateLimitError(200, frame.data) ? 'QUOTA_EXCEEDED'
-                    : 'PROVIDER',
+                : isDoubaoSemanticRisk(frame.data) ? 'PROVIDER'
+                  : isDoubaoSlideChallenge(frame.data) ? 'PROVIDER'
+                    : isDoubaoRateLimitError(200, frame.data) ? 'QUOTA_EXCEEDED'
+                      : 'PROVIDER',
             )
           }
-          if (parsed.kind === 'done') {
+
+          if (parsed.kind === 'end') {
             sawDone = true
+            if (parsed.brief.length > 0) finishedBrief = parsed.brief
             continue
           }
-          const text = parsed.text
-          if (text.length === 0) continue
-          if (!started) {
-            started = true
-            yield { type: 'block-start', index, blockType: 'text' }
+
+          if (parsed.kind === 'conversation') {
+            // 会话 id 是本轮唯一的"可复用句柄"：下一轮带上它，
+            // 豆包侧就能接着原会话走（历史在服务端，不用重发）。
+            //
+            // ⚠️ 必须**当场登记**，不能等流结束再登记：
+            // 流可能在中途抛错（风控/超时），而 ack 早已到达——
+            // 那时服务端已经建好了会话，我们若没记住，下一轮就会重复新建，
+            // 在豆包客户端里留下一条孤立记录。
+            if (parsed.conversationId.length > 0) {
+              conversationId = parsed.conversationId
+              onConversation(conversationId, parsed.sectionId)
+            }
+            if (parsed.sectionId.length > 0) sectionId = parsed.sectionId
+            continue
           }
-          yield { type: 'text-delta', index, text }
+
+          if (parsed.kind === 'clarify') {
+            /**
+             * 工作模式反问：豆包已暂停执行等用户回答，**不发结束帧**。
+             *
+             * 服务端此后只发心跳，可达数十分钟。若我们不主动收尾，
+             * 调用方会一直挂到超时，且用户根本看不到问题。
+             *
+             * 处理：把问题作为正文流出去（`❓` 前缀让它在界面上一眼可辨），
+             * 然后标记 `sawClarify` 让外层立即结束本轮。
+             * 用户的回答走**下一轮请求**（复用同一 `conversation_id`），
+             * 豆包 agent 拿到补充信息后继续原任务。
+             */
+            if (sawClarify) continue
+            sawClarify = true
+            clarifiedQuestions = parsed.questions
+            const formatted = parsed.questions.map((title) => `❓ ${title}`).join('\n\n')
+            if (!sawText) {
+              sawText = true
+              yield { type: 'block-start', index: textIndex, blockType: 'text' }
+            }
+            yield { type: 'text-delta', index: textIndex, text: formatted }
+            continue
+          }
+
+          if (parsed.kind === 'reasoning') {
+            if (!sawReasoning) {
+              sawReasoning = true
+              /**
+               * ⚠️ index 必须从同一个递增计数器分配，不能写死。
+               *
+               * 绝大多数模型先出思考块再出正文（此时 reasoning=0、text=1，
+               * 正好是 UI 期望的顺序）；但也有模型**先出正文再补思考**。
+               * 若把 reasoning 的 index 固定成 `textIndex`，在后者情况下会与
+               * 已经发出的正文块**撞同一个 index**，assembler 会把两段内容
+               * 拼进同一个块，界面表现为思考与正文串台。
+               */
+              reasoningIndex = nextIndex
+              nextIndex += 1
+              yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
+            }
+            yield { type: 'reasoning-delta', index: reasoningIndex, text: parsed.text }
+            continue
+          }
+
+          // parsed.kind === 'text'
+          if (parsed.text.length === 0) continue
+          if (!sawText) {
+            sawText = true
+            textIndex = nextIndex
+            nextIndex += 1
+            yield { type: 'block-start', index: textIndex, blockType: 'text' }
+          }
+          yield { type: 'text-delta', index: textIndex, text: parsed.text }
         }
+
+        // 反问已收到：立刻停读上游，不再等那个永远不会来的结束帧。
+        if (sawClarify) break
       }
 
-      if (!started) {
+      /**
+       * 兜底：没有任何正文时，用 `SSE_REPLY_END.msg_finish_attr.brief`。
+       *
+       * 实测：某些分支（直接命中缓存 / 极短回答）正文块为空，
+       * 完整答案只在 `brief` 里。不看它就会误报「stream finished without text」。
+       */
+      if (!sawText && finishedBrief.length > 0 && !sawClarify) {
+        sawText = true
+        yield { type: 'block-start', index: textIndex, blockType: 'text' }
+        yield { type: 'text-delta', index: textIndex, text: finishedBrief }
+      }
+
+      if (!sawText && !sawReasoning) {
         throw new LlmError(
           sawDone
             ? 'doubao: stream finished without any text content'
-            : 'doubao: stream ended without text and without "done"',
+            : 'doubao: stream ended without text and without a completion frame',
           'PROVIDER',
         )
       }
-      yield { type: 'block-end', index, block: { type: 'text', text: '' } }
+
+      yield* closeBlocks()
     } finally {
       try {
         await reader.cancel()
@@ -617,10 +729,12 @@ export class DoubaoAdapter extends LlmAdapter {
         // 取消失败不影响已产出的内容。
       }
     }
-    if (droppedFrames > 0) {
-      // 不抛错：已产出内容对用户仍然有效。记录数目便于诊断形状漂移。
-      void droppedFrames
-    }
+
+    // 生成器无法把值 return 给 `yield*` 的调用方，故会话登记走上面的
+    // `onConversation` 回调（在 ack 帧处即时触发）。
+    void lastFrameAt
+    void clarifiedQuestions
+    void sectionId
   }
 }
 
@@ -645,11 +759,19 @@ export class DoubaoAdapter extends LlmAdapter {
  * 与 OpenAI 方言的差异：文本在 `content_block[].content.text_block.text`，
  * `block_type` 固定 `10000`，且**没有 `role`**（历史由会话承载）。
  *
- * 豆包这个端点一次只发**当前这轮输入**（历史靠 `conversation_id` 续），
- * 故这里取最后一条 user 消息；system 提示豆包无对应字段（走 skill 机制），
- * 暂不注入。
+ * ## 续会话 vs 新会话（2026-11-15 补齐）
+ *
+ * 豆包这个端点一次只发**当前这轮输入**，历史靠 `conversation_id` 续：
+ *
+ * - `continuing = true`（已有会话）：**只发本轮 user 文本**。
+ *   把历史再发一遍反而会和服务端历史重复，模型看到两套前文。
+ * - `continuing = false`（首轮）：DSH 可能带着压缩后的历史，而豆包侧还没有
+ *   任何上下文。此时把历史压平成一段（`用户：… / 助手：…`）一起发出，
+ *   否则首轮就丢上下文——这正是参考实现 `flattenHistory` 的作用。
+ *
+ * system 提示豆包无对应字段（走 skill 机制），暂不注入。
  */
-function toWireMessages(options: GenerateOptions): unknown[] {
+function toWireMessages(options: GenerateOptions, continuing: boolean): unknown[] {
   let input = ''
   for (let i = options.messages.length - 1; i >= 0; i -= 1) {
     const message = options.messages[i] as unknown as Record<string, unknown>
@@ -659,6 +781,23 @@ function toWireMessages(options: GenerateOptions): unknown[] {
     }
   }
   if (input.length === 0 && options.system !== undefined) input = options.system
+
+  // 首轮把历史压平：豆包侧没有会话上下文，不压平就等于丢掉全部前文。
+  if (!continuing && input.length > 0) {
+    const lastIndex = options.messages.length - 1
+    let prefix = ''
+    for (let i = 0; i < options.messages.length; i += 1) {
+      if (i === lastIndex) break
+      const message = options.messages[i] as unknown as Record<string, unknown>
+      const text = contentToText(message['content']).trim()
+      if (text.length === 0) continue
+      const role = String(message['role'] ?? 'unknown')
+      const label = role === 'user' ? '用户' : role === 'assistant' ? '助手' : role
+      prefix += `${label}：${text}\n`
+    }
+    if (prefix.length > 0) input = `${prefix}用户：${input}`
+  }
+
   return [{
     local_message_id: randomUuid(),
     content_block: [{

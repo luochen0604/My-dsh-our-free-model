@@ -356,8 +356,29 @@ export function extractDeviceIdFromCookie(cookie: string): string | undefined {
     if (typeof direct === 'string' && direct.length > 0) return direct
     const extra = payload['session_extra']
     if (extra !== null && typeof extra === 'object') {
-      const nested = (extra as Record<string, unknown>)['device_id']
-      if (typeof nested === 'string' && nested.length > 0) return nested
+      const nested = extra as Record<string, unknown>
+      const device = nested['device_id']
+      if (typeof device === 'string' && device.length > 0) return device
+      /**
+       * ## 2026-11-15 实测：真实 JWT 里的字段叫 `web_device_id`，不是 `device_id`
+       *
+       * 用真实登录态解 `LARK_SUITE_ACCESS_TOKEN`，`session_extra` 的键是：
+       * `user_type` / `is_anonymous` / **`web_device_id`** / `terminal_typ` / `os_typ`
+       * / `need_auth` / `valid_for_app_id` / `locale` / `dpop_thumbprint`
+       * / `idp_session_index` / `tenant_create_source` / `tenant_biz_type`
+       * —— **没有 `device_id`**。
+       *
+       * 而适配器把 `credential.deviceId` 直接塞进公共 query 的 `device_id` /
+       * `fp=verify_<id>` / `tea_uuid` 三处。此前只找 `device_id`，于是这三个参数
+       * **永远缺席**，请求在服务端看来是一台没有设备标识的无名客户端 ——
+       * 这正是风控最容易判异常的形状（实测被判 `subtype: semantic_reasoning`）。
+       *
+       * 优先仍取 `device_id`（若字节将来补上真正的桌面设备号），
+       * 缺失时回退 `web_device_id`：它是同一会话里唯一存在的设备标识，
+       * 比"不发"更接近真客户端。
+       */
+      const webDevice = nested['web_device_id']
+      if (typeof webDevice === 'string' && webDevice.length > 0) return webDevice
     }
     return undefined
   } catch {
@@ -420,17 +441,297 @@ export function splitSseBlocks(buffer: string): { frames: DoubaoSseFrame[]; rest
   return { frames, rest }
 }
 
-/** 已知的 SSE 事件名。 */
+/**
+ * 已知的 SSE 事件名。
+ *
+ * ## ⚠️ 2026-11-15 实测校正：这不再是"静态猜测的四种分支"
+ *
+ * 旧注释按 `ai-views` 静态代码猜 `pb` / `json` / `done` / `err` 四个事件名，
+ * 但用真实登录态抓 `/chat/completion` 的**实际**流，事件名完全是另一套：
+ *
+ * | event | 出现时机 | 含义 |
+ * |---|---|---|
+ * | `SSE_HEARTBEAT` | 空闲时每 15s | 心跳，忽略 |
+ * | `STREAM_TIMEOUT_CONTROL` | 流开始 | 超时参数，忽略 |
+ * | `SSE_ACK` | 流开始 | **下发 `ack_client_meta.conversation_id`** |
+ * | `FULL_MSG_NOTIFY` | 流开始 | 用户消息回显，忽略 |
+ * | `STREAM_MSG_NOTIFY` | 过程中 | 元数据（耗时等），忽略 |
+ * | **`STREAM_CHUNK`** | 正文 | **内容增量**（见 `parseDoubaoSseFrame`） |
+ * | **`CHUNK_DELTA`** | 正文 | 纯文本增量 `{text}`，**优先于 STREAM_CHUNK** |
+ * | `SSE_REPLY_END` | 结束 | `end_type` + `msg_finish_attr.brief` |
+ * | `STREAM_ERROR` | 失败 | 业务错误（风控/限流都走这里） |
+ *
+ * 保留 `pb` / `json` / `done` / `err` 是因为旧分支确实存在于其它 samantha
+ * 端点；但**对话流不用它们**。误把它们当主路径会写出一个永远收不到正文的解析器。
+ */
 export const DOUBAO_SSE = Object.freeze({
-  /** protobuf 事件 —— 需要 message schema 才能解。 */
+  /** protobuf 事件（其它 samantha 端点用；对话流实测不用）。 */
   pb: 'pb',
-  /** JSON 事件 —— 可直接 `JSON.parse`。 */
+  /** JSON 事件（同上）。 */
   json: 'json',
-  /** 流结束。 */
+  /** 流结束（旧分支）。 */
   done: 'done',
-  /** 服务端错误。 */
+  /** 服务端错误（旧分支）。 */
   err: 'err',
+  // ── 对话流真正在用的（2026-11-15 实测）──
+  /** 正文增量（纯文本 `{text}`），优先于 STREAM_CHUNK。 */
+  chunkDelta: 'CHUNK_DELTA',
+  /** 结构化增量（`patch_op[].patch_value.content_block[]`）。 */
+  streamChunk: 'STREAM_CHUNK',
+  /** 会话 ack：`ack_client_meta.conversation_id` / `section_id`。 */
+  ack: 'SSE_ACK',
+  /** 结束帧：`end_type` + `msg_finish_attr.brief`。 */
+  replyEnd: 'SSE_REPLY_END',
+  /** 业务错误帧（风控/限流/系统错误都走这里）。 */
+  streamError: 'STREAM_ERROR',
+  /** 心跳。 */
+  heartbeat: 'SSE_HEARTBEAT',
+  /** 超时控制参数。 */
+  timeoutControl: 'STREAM_TIMEOUT_CONTROL',
+  /** 用户消息回显。 */
+  fullMsgNotify: 'FULL_MSG_NOTIFY',
+  /** 元数据通知。 */
+  streamMsgNotify: 'STREAM_MSG_NOTIFY',
 })
+
+/**
+ * `content_block[].block_type` 的取值（实测）。
+ *
+ * | block_type | 含义 |
+ * |---|---|
+ * | `10000` | 正文文本块（`content.text_block.text`） |
+ * | `10040` | **思考过程**（`content.thinking_block.streaming_title`） |
+ * | `10082` | **工作模式反问**（`content.interaction_ask_block.questions[].title`） |
+ */
+export const DOUBAO_BLOCK = Object.freeze({
+  /** 正文文本块。 */
+  text: 10000,
+  /** 思考过程块（reasoning）。 */
+  thinking: 10040,
+  /** 工作模式反问块（豆包暂停执行、等用户补充信息）。 */
+  interactionAsk: 10082,
+})
+
+/**
+ * 一帧对话流的**语义**解析结果。
+ *
+ * 与 `parseSseBlock`（只切 `event:` / `data:` 字段）不同，这里按实测的
+ * 事件语义把一帧分类到调用方能直接消费的形态。`payload` 保留原始 `data`
+ * 字符串，便于错误分类函数（`describeDoubaoFailure` 等）继续做正则判定。
+ */
+export type DoubaoSseOutcome =
+  /** 正文增量。 */
+  | { kind: 'text'; text: string }
+  /** 思考过程（标题式文案）。 */
+  | { kind: 'reasoning'; text: string }
+  /** 会话 ack：拿到 `conversation_id` 后可复用会话续上下文。 */
+  | { kind: 'conversation'; conversationId: string; sectionId: string }
+  /** 工作模式反问：豆包暂停等回答，调用方须**立即收尾**（否则挂到超时）。 */
+  | { kind: 'clarify'; questions: string[] }
+  /** 正常结束。 */
+  | { kind: 'end'; endType: number; brief: string }
+  /** 业务错误。 */
+  | { kind: 'error'; code: number; message: string; payload: string }
+
+/** 安全 `JSON.parse`。 */
+function parseJsonOrUndefined(raw: string): unknown {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+}
+
+/** 读对象上的字符串字段。 */
+function stringField(source: unknown, key: string): string {
+  if (source === null || typeof source !== 'object') return ''
+  const value = (source as Record<string, unknown>)[key]
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * 从 `STREAM_CHUNK` 的 `patch_op` 里抽取文本 / 思考 / 反问。
+ *
+ * 结构（实测）：
+ *
+ * ```jsonc
+ * { "patch_op": [ { "patch_value": { "content_block": [
+ *     { "block_type": 10000, "content": { "text_block": { "text": "增量" } } } ] } } ] }
+ * ```
+ *
+ * ⚠️ `patch_value.content_block` 里可能同时出现多种块，因此**逐个按
+ * `block_type` 分派**，不靠 `patch_type` 猜（耗时块也带 `content_block`，
+ * 但没有 `text_block.text`，按字段存在性过滤即可）。
+ */
+function collectStreamChunk(
+  payload: unknown,
+  seenChunkDelta: boolean,
+  sink: {
+    text: (value: string) => void
+    reasoning: (value: string) => void
+    clarify: (value: string[]) => void
+  },
+): void {
+  if (payload === null || typeof payload !== 'object') return
+  const ops = (payload as Record<string, unknown>)['patch_op']
+  if (!Array.isArray(ops)) return
+  for (const op of ops) {
+    if (op === null || typeof op !== 'object') continue
+    const value = (op as Record<string, unknown>)['patch_value']
+    if (value === null || typeof value !== 'object') continue
+    const blocks = (value as Record<string, unknown>)['content_block']
+    if (!Array.isArray(blocks)) continue
+    for (const block of blocks) {
+      if (block === null || typeof block !== 'object') continue
+      const record = block as Record<string, unknown>
+      const blockType = record['block_type']
+      const content = record['content']
+      if (content === null || typeof content !== 'object') continue
+      const contentRecord = content as Record<string, unknown>
+
+      if (blockType === DOUBAO_BLOCK.text) {
+        /**
+         * ⚠️ 有 `CHUNK_DELTA` 时**不再**用这里的全文，否则同一段话会被发两遍。
+         * 实测：服务端 `support_chunk_delta: true` 时会同时下发两者，
+         * `CHUNK_DELTA` 是增量、`STREAM_CHUNK` 的 `text_block.text` 是**全量快照**。
+         */
+        if (seenChunkDelta) continue
+        const textBlock = contentRecord['text_block']
+        const text = stringField(textBlock, 'text')
+        if (text.length > 0) sink.text(text)
+        continue
+      }
+
+      if (blockType === DOUBAO_BLOCK.thinking) {
+        const thinking = contentRecord['thinking_block']
+        if (thinking === null || typeof thinking !== 'object') continue
+        // 流式期是 `streaming_title`，收尾是 `finish_title`。
+        const title = stringField(thinking, 'streaming_title') || stringField(thinking, 'finish_title')
+        if (title.length > 0) sink.reasoning(title)
+        continue
+      }
+
+      if (blockType === DOUBAO_BLOCK.interactionAsk) {
+        /**
+         * 工作模式反问块。**问题正文在 `questions[].title`**，
+         * 正文文本块里只有一句引导语（「我需要更多信息…」），
+         * 光收文本会让用户看不到真正的问题。
+         *
+         * ⚠️ 此时服务端**不发 `SSE_REPLY_END`**，而是长连用心跳等回答（可达数十分钟）。
+         * 所以必须在这里回调，让适配器主动断开——否则调用方一直挂到超时，
+         * 且界面上永远看不到问题。
+         */
+        const ask = contentRecord['interaction_ask_block']
+        if (ask === null || typeof ask !== 'object') continue
+        const questions = (ask as Record<string, unknown>)['questions']
+        if (!Array.isArray(questions)) continue
+        const titles: string[] = []
+        for (const question of questions) {
+          const title = stringField(question, 'title')
+          if (title.length > 0) titles.push(title)
+        }
+        if (titles.length > 0) sink.clarify(titles)
+      }
+    }
+  }
+}
+
+/**
+ * 把一帧 SSE 解析成可消费的语义结果。
+ *
+ * @param frame `parseSseBlock` / `splitSseBlocks` 切出的帧
+ * @param seenChunkDelta 本流里是否**已经**收到过 `CHUNK_DELTA`。
+ *   为 `true` 时忽略 `STREAM_CHUNK` 的正文全文（避免重复播放）。
+ * @returns `undefined` = 该帧无内容（心跳/元数据/空 data），调用方跳过即可。
+ */
+export function parseDoubaoSseFrame(
+  frame: DoubaoSseFrame,
+  seenChunkDelta = false,
+): DoubaoSseOutcome | undefined {
+  const event = frame.event
+  const payload = frame.data
+
+  if (event === DOUBAO_SSE.heartbeat || event === DOUBAO_SSE.timeoutControl
+    || event === DOUBAO_SSE.fullMsgNotify || event === DOUBAO_SSE.streamMsgNotify
+    || event === DOUBAO_SSE.pb || event === DOUBAO_SSE.json) {
+    return undefined
+  }
+  if (event === DOUBAO_SSE.done) return { kind: 'end', endType: 0, brief: '' }
+  if (event === DOUBAO_SSE.err) {
+    return { kind: 'error', code: 0, message: payload.slice(0, 300), payload }
+  }
+
+  if (payload.length === 0) return undefined
+
+  if (event === DOUBAO_SSE.chunkDelta) {
+    const data = parseJsonOrUndefined(payload)
+    const text = stringField(data, 'text')
+    return text.length === 0 ? undefined : { kind: 'text', text }
+  }
+
+  if (event === DOUBAO_SSE.streamChunk) {
+    const data = parseJsonOrUndefined(payload)
+    let text = ''
+    let reasoning = ''
+    let clarify: string[] = []
+    collectStreamChunk(data, seenChunkDelta, {
+      text: (value) => { text += value },
+      reasoning: (value) => { reasoning += value },
+      clarify: (value) => { clarify = value },
+    })
+    // 一帧里三种块的优先级：反问 > 正文 > 思考。
+    // 反问必须最先回，否则用户只看到引导语就去等收尾了。
+    if (clarify.length > 0) return { kind: 'clarify', questions: clarify }
+    if (text.length > 0) return { kind: 'text', text }
+    if (reasoning.length > 0) return { kind: 'reasoning', text: reasoning }
+    return undefined
+  }
+
+  if (event === DOUBAO_SSE.ack) {
+    const data = parseJsonOrUndefined(payload)
+    if (data === null || typeof data !== 'object') return undefined
+    const meta = (data as Record<string, unknown>)['ack_client_meta']
+    if (meta === null || typeof meta !== 'object') return undefined
+    return {
+      kind: 'conversation',
+      conversationId: stringField(meta, 'conversation_id'),
+      sectionId: stringField(meta, 'section_id'),
+    }
+  }
+
+  if (event === DOUBAO_SSE.replyEnd) {
+    const data = parseJsonOrUndefined(payload)
+    const endType = data !== null && typeof data === 'object'
+      ? Number((data as Record<string, unknown>)['end_type'] ?? 0)
+      : 0
+    const attr = data !== null && typeof data === 'object'
+      ? (data as Record<string, unknown>)['msg_finish_attr']
+      : undefined
+    return {
+      kind: 'end',
+      endType: Number.isFinite(endType) ? endType : 0,
+      brief: stringField(attr, 'brief'),
+    }
+  }
+
+  if (event === DOUBAO_SSE.streamError || /ERROR/i.test(event) || /gateway-error/i.test(event)) {
+    const data = parseJsonOrUndefined(payload)
+    const code = data !== null && typeof data === 'object'
+      ? Number((data as Record<string, unknown>)['error_code'] ?? 0)
+      : 0
+    const message = data !== null && typeof data === 'object'
+      ? (stringField(data, 'error_msg') || stringField(data, 'message'))
+      : ''
+    return {
+      kind: 'error',
+      code: Number.isFinite(code) ? code : 0,
+      message: message.length > 0 ? message : payload.slice(0, 300),
+      payload,
+    }
+  }
+
+  return undefined
+}
 
 /**
  * 凭据失效/需要重新登录的错误特征。
@@ -463,11 +764,57 @@ export const DOUBAO_LOGIN_INVALID_CODES: readonly number[] = Object.freeze([
 ])
 
 /**
- * 限流 / 额度耗尽的业务码（实测）。
+ * 风控 / 限流共用的外层业务码（实测）。
  *
- * `710022004` —— `rate limited`（请求过于频繁）。
+ * `710022004` —— 服务器把整类拒绝都标成 `rate limited`。
+ *
+ * ## ⚠️ 2026-11-15 实测：`710022004` **不等于**限流
+ *
+ * 用真实登录态 POST `/chat/completion` 得到（HTTP 200 + SSE）：
+ *
+ * ```text
+ * event: STREAM_ERROR
+ * data: {"error_code":710022004,"error_msg":"rate limited","extra":{
+ *   "decision":"{\"code\":\"10000\",\"from\":\"shark_admin\",\"type\":\"verify\",
+ *    \"region\":\"cn\",\"subtype\":\"semantic_reasoning\",
+ *    \"verify_scene\":\"doubao_message_web\"}","ack":"1"}}
+ * event: SSE_REPLY_END
+ * data: {"end_type":3}
+ * ```
+ *
+ * `verify_scene: doubao_message_web` + `subtype: semantic_reasoning` 说明这是
+ * **语义风控**：服务端判定这次请求不是官方客户端发出的。同一份 cookie 打只读端点
+ *（`credit/get_credit_tip`、`user/setting/get`、`subscription/overview`）全部 `code: 0`，
+ * 证明凭据未过期、也不是并发限流。
+ *
+ * 于是同一个码至少有三种成因，处理方式**完全互斥**：
+ *
+ * | `extra.decision.subtype` | 真实含义 | 正确处置 |
+ * |---|---|---|
+ * | `semantic_reasoning` | 语义风控 | 重试无用，换/重新导入设备指纹 |
+ * | `slide` | 滑块挑战 | 需人工过验证 |
+ * | （无 decision） | 真限流 | 退避重试 |
+ *
+ * 所以下面这个常量只表示「属于风控/限流这一大类」，**不能直接当作"限流"**。
  */
 export const DOUBAO_RATE_LIMIT_CODES: readonly number[] = Object.freeze([710022004])
+
+/**
+ * 是否是**语义风控**（`subtype: "semantic_reasoning"`）。
+ *
+ * ## 为什么必须单独识别
+ *
+ * 它和真限流共用 `710022004 rate limited`，但对用户给出的建议**相反**：
+ * 限流是「等一下再来」，语义风控是「等一下也没用」——重试只会继续撞墙，
+ * 正确动作是让请求看起来像官方客户端（重新从客户端导入含设备指纹的登录态）。
+ *
+ * 判据取自 `extra.decision` 内层 JSON 的 `subtype`；外层只有 `rate limited`
+ * 一句话可读，照抄成提示会让人白等（真实用户反馈过「等了几分钟还是不行」）。
+ */
+export function isDoubaoSemanticRisk(body: string): boolean {
+  const text = String(body ?? '')
+  return /"subtype"\s*:\s*"semantic[^"]*"|subtype[^,}]{0,10}semantic/i.test(text)
+}
 
 /** 是否是限流/额度类错误。 */
 export function isDoubaoRateLimitError(status: number, body: string): boolean {
@@ -503,9 +850,22 @@ export function isDoubaoSlideChallenge(body: string): boolean {
  *
  * 服务端返回的 `extra.decision` 是一层被转义的 JSON，直接抛给用户会看到
  * 一大段乱码（用户实际反馈过）。这里只提取人话部分。
+ *
+ * ## ⚠️ 分支顺序即正确性（2026-11-15 实测校正）
+ *
+ * 必须先判语义风控，再判滑块，最后才判限流。原因：三者共用
+ * `710022004 rate limited`，而 `isDoubaoRateLimitError` 的匹配包含
+ * `rate limited` 字样，**任何顺序把限流放前面都会吞掉前两种**。
+ * 旧实现正是这样：现实测命中的 `semantic_reasoning` 被报成
+ * 「请求过于频繁，请稍等片刻再试」，把用户指向了无效动作。
  */
 export function describeDoubaoFailure(body: string): string {
   const text = String(body ?? '')
+  if (isDoubaoSemanticRisk(text)) {
+    return '豆包语义风控拦截了这次请求：本机这套 cookie / 设备指纹被判定为非官方客户端'
+      + '（服务端标记 subtype=semantic_reasoning）。重试无效——请打开豆包工作客户端正常对话一次后'
+      + '重新从客户端导入登录态（会带上设备指纹），或稍后换一个网络环境再试。'
+  }
   if (isDoubaoSlideChallenge(text)) {
     return '豆包触发了人机验证（滑块）。请打开豆包工作客户端完成一次验证，或等待几分钟后再试。'
   }

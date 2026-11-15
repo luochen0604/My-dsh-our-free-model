@@ -42093,6 +42093,7 @@ var DOUBAO = {
 
 // vendor/channel-pack/src/doubao.ts
 var DOUBAO_REQUEST_TIMEOUT_MS = 3e4;
+var DOUBAO_FIRST_TOKEN_TIMEOUT_MS = 12e4;
 var DOUBAO_CHUNK_TIMEOUT_MS = 12e4;
 function isDoubaoStale(credential, maxAgeMs = 6 * 60 * 60 * 1e3) {
   return Date.now() - credential.lastVerifiedAt > maxAgeMs;
@@ -42200,8 +42201,11 @@ function extractDeviceIdFromCookie(cookie) {
     if (typeof direct === "string" && direct.length > 0) return direct;
     const extra = payload["session_extra"];
     if (extra !== null && typeof extra === "object") {
-      const nested = extra["device_id"];
-      if (typeof nested === "string" && nested.length > 0) return nested;
+      const nested = extra;
+      const device = nested["device_id"];
+      if (typeof device === "string" && device.length > 0) return device;
+      const webDevice = nested["web_device_id"];
+      if (typeof webDevice === "string" && webDevice.length > 0) return webDevice;
     }
     return void 0;
   } catch {
@@ -42237,15 +42241,171 @@ function splitSseBlocks(buffer) {
   return { frames, rest };
 }
 var DOUBAO_SSE = Object.freeze({
-  /** protobuf 事件 —— 需要 message schema 才能解。 */
+  /** protobuf 事件（其它 samantha 端点用；对话流实测不用）。 */
   pb: "pb",
-  /** JSON 事件 —— 可直接 `JSON.parse`。 */
+  /** JSON 事件（同上）。 */
   json: "json",
-  /** 流结束。 */
+  /** 流结束（旧分支）。 */
   done: "done",
-  /** 服务端错误。 */
-  err: "err"
+  /** 服务端错误（旧分支）。 */
+  err: "err",
+  // ── 对话流真正在用的（2026-11-15 实测）──
+  /** 正文增量（纯文本 `{text}`），优先于 STREAM_CHUNK。 */
+  chunkDelta: "CHUNK_DELTA",
+  /** 结构化增量（`patch_op[].patch_value.content_block[]`）。 */
+  streamChunk: "STREAM_CHUNK",
+  /** 会话 ack：`ack_client_meta.conversation_id` / `section_id`。 */
+  ack: "SSE_ACK",
+  /** 结束帧：`end_type` + `msg_finish_attr.brief`。 */
+  replyEnd: "SSE_REPLY_END",
+  /** 业务错误帧（风控/限流/系统错误都走这里）。 */
+  streamError: "STREAM_ERROR",
+  /** 心跳。 */
+  heartbeat: "SSE_HEARTBEAT",
+  /** 超时控制参数。 */
+  timeoutControl: "STREAM_TIMEOUT_CONTROL",
+  /** 用户消息回显。 */
+  fullMsgNotify: "FULL_MSG_NOTIFY",
+  /** 元数据通知。 */
+  streamMsgNotify: "STREAM_MSG_NOTIFY"
 });
+var DOUBAO_BLOCK = Object.freeze({
+  /** 正文文本块。 */
+  text: 1e4,
+  /** 思考过程块（reasoning）。 */
+  thinking: 10040,
+  /** 工作模式反问块（豆包暂停执行、等用户补充信息）。 */
+  interactionAsk: 10082
+});
+function parseJsonOrUndefined(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return void 0;
+  }
+}
+function stringField(source, key) {
+  if (source === null || typeof source !== "object") return "";
+  const value = source[key];
+  return typeof value === "string" ? value : "";
+}
+function collectStreamChunk(payload, seenChunkDelta, sink) {
+  if (payload === null || typeof payload !== "object") return;
+  const ops = payload["patch_op"];
+  if (!Array.isArray(ops)) return;
+  for (const op of ops) {
+    if (op === null || typeof op !== "object") continue;
+    const value = op["patch_value"];
+    if (value === null || typeof value !== "object") continue;
+    const blocks = value["content_block"];
+    if (!Array.isArray(blocks)) continue;
+    for (const block of blocks) {
+      if (block === null || typeof block !== "object") continue;
+      const record = block;
+      const blockType = record["block_type"];
+      const content = record["content"];
+      if (content === null || typeof content !== "object") continue;
+      const contentRecord = content;
+      if (blockType === DOUBAO_BLOCK.text) {
+        if (seenChunkDelta) continue;
+        const textBlock = contentRecord["text_block"];
+        const text = stringField(textBlock, "text");
+        if (text.length > 0) sink.text(text);
+        continue;
+      }
+      if (blockType === DOUBAO_BLOCK.thinking) {
+        const thinking = contentRecord["thinking_block"];
+        if (thinking === null || typeof thinking !== "object") continue;
+        const title = stringField(thinking, "streaming_title") || stringField(thinking, "finish_title");
+        if (title.length > 0) sink.reasoning(title);
+        continue;
+      }
+      if (blockType === DOUBAO_BLOCK.interactionAsk) {
+        const ask = contentRecord["interaction_ask_block"];
+        if (ask === null || typeof ask !== "object") continue;
+        const questions = ask["questions"];
+        if (!Array.isArray(questions)) continue;
+        const titles = [];
+        for (const question of questions) {
+          const title = stringField(question, "title");
+          if (title.length > 0) titles.push(title);
+        }
+        if (titles.length > 0) sink.clarify(titles);
+      }
+    }
+  }
+}
+function parseDoubaoSseFrame(frame, seenChunkDelta = false) {
+  const event = frame.event;
+  const payload = frame.data;
+  if (event === DOUBAO_SSE.heartbeat || event === DOUBAO_SSE.timeoutControl || event === DOUBAO_SSE.fullMsgNotify || event === DOUBAO_SSE.streamMsgNotify || event === DOUBAO_SSE.pb || event === DOUBAO_SSE.json) {
+    return void 0;
+  }
+  if (event === DOUBAO_SSE.done) return { kind: "end", endType: 0, brief: "" };
+  if (event === DOUBAO_SSE.err) {
+    return { kind: "error", code: 0, message: payload.slice(0, 300), payload };
+  }
+  if (payload.length === 0) return void 0;
+  if (event === DOUBAO_SSE.chunkDelta) {
+    const data = parseJsonOrUndefined(payload);
+    const text = stringField(data, "text");
+    return text.length === 0 ? void 0 : { kind: "text", text };
+  }
+  if (event === DOUBAO_SSE.streamChunk) {
+    const data = parseJsonOrUndefined(payload);
+    let text = "";
+    let reasoning = "";
+    let clarify = [];
+    collectStreamChunk(data, seenChunkDelta, {
+      text: (value) => {
+        text += value;
+      },
+      reasoning: (value) => {
+        reasoning += value;
+      },
+      clarify: (value) => {
+        clarify = value;
+      }
+    });
+    if (clarify.length > 0) return { kind: "clarify", questions: clarify };
+    if (text.length > 0) return { kind: "text", text };
+    if (reasoning.length > 0) return { kind: "reasoning", text: reasoning };
+    return void 0;
+  }
+  if (event === DOUBAO_SSE.ack) {
+    const data = parseJsonOrUndefined(payload);
+    if (data === null || typeof data !== "object") return void 0;
+    const meta = data["ack_client_meta"];
+    if (meta === null || typeof meta !== "object") return void 0;
+    return {
+      kind: "conversation",
+      conversationId: stringField(meta, "conversation_id"),
+      sectionId: stringField(meta, "section_id")
+    };
+  }
+  if (event === DOUBAO_SSE.replyEnd) {
+    const data = parseJsonOrUndefined(payload);
+    const endType = data !== null && typeof data === "object" ? Number(data["end_type"] ?? 0) : 0;
+    const attr = data !== null && typeof data === "object" ? data["msg_finish_attr"] : void 0;
+    return {
+      kind: "end",
+      endType: Number.isFinite(endType) ? endType : 0,
+      brief: stringField(attr, "brief")
+    };
+  }
+  if (event === DOUBAO_SSE.streamError || /ERROR/i.test(event) || /gateway-error/i.test(event)) {
+    const data = parseJsonOrUndefined(payload);
+    const code = data !== null && typeof data === "object" ? Number(data["error_code"] ?? 0) : 0;
+    const message = data !== null && typeof data === "object" ? stringField(data, "error_msg") || stringField(data, "message") : "";
+    return {
+      kind: "error",
+      code: Number.isFinite(code) ? code : 0,
+      message: message.length > 0 ? message : payload.slice(0, 300),
+      payload
+    };
+  }
+  return void 0;
+}
 var DOUBAO_LOGIN_INVALID_CODES = Object.freeze([
   // 实测：登录已过期
   710012001,
@@ -42253,6 +42413,10 @@ var DOUBAO_LOGIN_INVALID_CODES = Object.freeze([
   710012e3
 ]);
 var DOUBAO_RATE_LIMIT_CODES = Object.freeze([710022004]);
+function isDoubaoSemanticRisk(body) {
+  const text = String(body ?? "");
+  return /"subtype"\s*:\s*"semantic[^"]*"|subtype[^,}]{0,10}semantic/i.test(text);
+}
 function isDoubaoRateLimitError(status, body) {
   if (status === 429) return true;
   const text = String(body ?? "");
@@ -42267,6 +42431,9 @@ function isDoubaoSlideChallenge(body) {
 }
 function describeDoubaoFailure(body) {
   const text = String(body ?? "");
+  if (isDoubaoSemanticRisk(text)) {
+    return "\u8C46\u5305\u8BED\u4E49\u98CE\u63A7\u62E6\u622A\u4E86\u8FD9\u6B21\u8BF7\u6C42\uFF1A\u672C\u673A\u8FD9\u5957 cookie / \u8BBE\u5907\u6307\u7EB9\u88AB\u5224\u5B9A\u4E3A\u975E\u5B98\u65B9\u5BA2\u6237\u7AEF\uFF08\u670D\u52A1\u7AEF\u6807\u8BB0 subtype=semantic_reasoning\uFF09\u3002\u91CD\u8BD5\u65E0\u6548\u2014\u2014\u8BF7\u6253\u5F00\u8C46\u5305\u5DE5\u4F5C\u5BA2\u6237\u7AEF\u6B63\u5E38\u5BF9\u8BDD\u4E00\u6B21\u540E\u91CD\u65B0\u4ECE\u5BA2\u6237\u7AEF\u5BFC\u5165\u767B\u5F55\u6001\uFF08\u4F1A\u5E26\u4E0A\u8BBE\u5907\u6307\u7EB9\uFF09\uFF0C\u6216\u7A0D\u540E\u6362\u4E00\u4E2A\u7F51\u7EDC\u73AF\u5883\u518D\u8BD5\u3002";
+  }
   if (isDoubaoSlideChallenge(text)) {
     return "\u8C46\u5305\u89E6\u53D1\u4E86\u4EBA\u673A\u9A8C\u8BC1\uFF08\u6ED1\u5757\uFF09\u3002\u8BF7\u6253\u5F00\u8C46\u5305\u5DE5\u4F5C\u5BA2\u6237\u7AEF\u5B8C\u6210\u4E00\u6B21\u9A8C\u8BC1\uFF0C\u6216\u7B49\u5F85\u51E0\u5206\u949F\u540E\u518D\u8BD5\u3002";
   }
@@ -42952,7 +43119,27 @@ var DoubaoAuth = class extends Service {
     return this.options.fetcher ?? fetch;
   }
   // ── 凭据解析 ───────────────────────────────────────────────────────────
-  /** 把存储值解析成凭据；损坏时返回 `undefined` 而不是抛错。 */
+  /**
+   * 把存储值解析成凭据；损坏时返回 `undefined` 而不是抛错。
+   *
+   * ## ⚠️ 必须保留 `deviceId`（2026-11-15 实测修正）
+   *
+   * 这里是把「落盘的 JSON」还原成 `DoubaoCredential` 的**唯一**入口，
+   * 而它此前只映射了五个字段，**把 `deviceId` 丢了**：
+   *
+   * - `importCookie()` / `importFromClient()` 明明把设备号写进了凭据；
+   * - 但任何一次 `readCredential()` 之后设备号就消失；
+   * - 适配器于是拿不到 `credential.deviceId`，公共 query 里
+   *   `device_id` / `fp=verify_<id>` / `tea_uuid` 三项全部缺席，
+   *   `agent_task_param.local_device_id` 也跟着消失。
+   *
+   * 服务端看到的就成了一条「没有任何设备标识」的请求——实测这类请求更容易被
+   * 语义风控拦下（`subtype: semantic_reasoning`）。
+   *
+   * 缺省时**不臆造**字段（保持 `undefined` 而不是空串）：空串会让
+   * `doubaoCommonParams()` 的 `device === ''` 判断仍然跳过，
+   * 但会在序列化里留下一个假值，误导以后读代码的人。
+   */
   parse(raw) {
     if (typeof raw !== "string" || raw.length === 0) return void 0;
     try {
@@ -42963,7 +43150,8 @@ var DoubaoAuth = class extends Service {
         uid: typeof parsed.uid === "string" ? parsed.uid : "",
         nickname: typeof parsed.nickname === "string" ? parsed.nickname : "",
         lastVerifiedAt: typeof parsed.lastVerifiedAt === "number" ? parsed.lastVerifiedAt : 0,
-        desktop: parsed.desktop === true
+        desktop: parsed.desktop === true,
+        ...typeof parsed.deviceId === "string" && parsed.deviceId.length > 0 ? { deviceId: parsed.deviceId } : {}
       };
     } catch {
       return void 0;
@@ -43186,44 +43374,7 @@ function normalizeCookieInput(raw) {
 // vendor/channel-pack/src/doubao-adapter.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { LlmAdapter as LlmAdapter7, LlmError as LlmError12 } from "@deepseek-ai/dsh-llm";
-function parseDoubaoEvent(event, raw) {
-  let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    return void 0;
-  }
-  if (payload === null || typeof payload !== "object") return void 0;
-  const record = payload;
-  if (typeof event === "string" && /ERROR/i.test(event)) {
-    const code = record["code"] ?? record["status_code"];
-    const message = record["message"] ?? record["msg"] ?? raw.slice(0, 200);
-    return { kind: "error", message: `business error ${String(code ?? "?")}: ${String(message)}` };
-  }
-  if (event === "SSE_REPLY_END") return { kind: "done" };
-  if (event !== "STREAM_CHUNK") return void 0;
-  let text = "";
-  const ops = record["patch_op"];
-  if (!Array.isArray(ops)) return void 0;
-  for (const op of ops) {
-    if (op === null || typeof op !== "object") continue;
-    const value = op["patch_value"];
-    if (value === null || typeof value !== "object") continue;
-    const blocks = value["content_block"];
-    if (!Array.isArray(blocks)) continue;
-    for (const block of blocks) {
-      if (block === null || typeof block !== "object") continue;
-      const content = block["content"];
-      if (content === null || typeof content !== "object") continue;
-      const textBlock = content["text_block"];
-      if (textBlock === null || typeof textBlock !== "object") continue;
-      const piece = textBlock["text"];
-      if (typeof piece === "string") text += piece;
-    }
-  }
-  return text.length === 0 ? void 0 : { kind: "text", text };
-}
-var DoubaoAdapter = class extends LlmAdapter7 {
+var DoubaoAdapter = class _DoubaoAdapter extends LlmAdapter7 {
   constructor(options) {
     super();
     this.options = options;
@@ -43237,6 +43388,45 @@ var DoubaoAdapter = class extends LlmAdapter7 {
   fallbackIndex;
   /** 设置页命名空间（沿用 channel-pack 的 legacy 兼容取值）。 */
   settingsNamespace;
+  /**
+   * 会话复用缓存：DSH 会话键 → 豆包侧 `conversation_id`。
+   *
+   * ## 为什么必须复用（而不是每轮都开新会话）
+   *
+   * 豆包这个端点的请求体**只带当前这一轮的输入**（`messages` 里只有一条
+   * `content_block`），历史上下文完全靠服务端的 `conversation_id` 承载。
+   * 每轮都发 `need_create_conversation: true` + 空 `conversation_id`，
+   * 等于每轮都从零开始：模型看不到前文，多轮对话直接失效。
+   *
+   * 参考实现（`dsh-connect-doubaowork` 的 `shim.js`）用的是
+   * 「显式 metadata 优先，否则按『模型 + 首条消息』哈希」的键；这里用
+   * DSH 提供的 `options.sessionId`（宿主盖章的会话标识）作为键，
+   * 它比消息哈希稳定：同一会话里首条消息变化（压缩、编辑）不会散成多条豆包会话。
+   *
+   * 键缺省时（一次性调用 / 测试）退化为**不复用**，保持原语义。
+   *
+   * ⚠️ 有界：只保留最近 `MAX_REMEMBERED_CONVERSATIONS` 条，避免长驻进程
+   * 无限增长（与 shim.js 的 `MAX_CONVERSATIONS` 同思路）。
+   */
+  conversations = /* @__PURE__ */ new Map();
+  /** 会话缓存容量上限。 */
+  static MAX_REMEMBERED_CONVERSATIONS = 512;
+  /** 取某 DSH 会话对应的豆包会话（无则 undefined）。 */
+  resumeFor(sessionKey) {
+    if (sessionKey === void 0 || sessionKey.length === 0) return void 0;
+    return this.conversations.get(sessionKey);
+  }
+  /** 记住某 DSH 会话对应的豆包会话（LRU 式淘汰最旧）。 */
+  rememberConversation(sessionKey, conversationId, sectionId) {
+    if (sessionKey === void 0 || sessionKey.length === 0 || conversationId.length === 0) return;
+    this.conversations.delete(sessionKey);
+    this.conversations.set(sessionKey, { conversationId, sectionId });
+    while (this.conversations.size > _DoubaoAdapter.MAX_REMEMBERED_CONVERSATIONS) {
+      const oldest = this.conversations.keys().next().value;
+      if (oldest === void 0) break;
+      this.conversations.delete(oldest);
+    }
+  }
   /**
    * 描述本适配器拥有的 provider 路由。
    *
@@ -43356,12 +43546,16 @@ var DoubaoAdapter = class extends LlmAdapter7 {
       throw new LlmError12("doubao: no usable credential; log in first", "MISSING_CREDENTIAL");
     }
     const modelItemKey = resolveDoubaoModelItemKey(options.model);
+    const sessionKey = typeof options.sessionId === "string" ? options.sessionId : void 0;
+    const resume = this.resumeFor(sessionKey);
+    const conversationId = resume?.conversationId ?? "";
     const body = JSON.stringify({
       client_meta: {
         local_conversation_id: `local_${Date.now()}`,
-        conversation_id: "",
+        // 有会话就带上，服务端据此续上下文；空串 = 开新会话。
+        conversation_id: conversationId,
         bot_id: this.product.botId,
-        last_section_id: "",
+        last_section_id: resume?.sectionId ?? "",
         last_message_index: null,
         /**
          * ⚠️ 客户端真实发的是**三条本地权限声明**（不是空数组）。
@@ -43375,7 +43569,8 @@ var DoubaoAdapter = class extends LlmAdapter7 {
           { permission_name: "ACCESS_BACKGROUND_LOCATION", status: 2 }
         ]
       },
-      messages: toWireMessages(options),
+      // 续会话时只发本轮输入（历史在服务端）；新会话时把历史压平成一段。
+      messages: toWireMessages(options, conversationId !== ""),
       option: {
         // 客户端会把这批布尔/字符串默认值**全部显式发出**（共 42 个键），
         // 缺一大半会让请求看起来不像真客户端。这里补齐关键默认值。
@@ -43400,7 +43595,8 @@ var DoubaoAdapter = class extends LlmAdapter7 {
         scene_type: 0,
         unique_key: randomUuid(),
         start_seq: 0,
-        need_create_conversation: true,
+        // 有会话就不新建；否则服务端每次都会开一条新记录。
+        need_create_conversation: conversationId === "",
         conversation_init_option: { project_id: "", need_ack_conversation: true },
         conversation_init_ext: {
           /**
@@ -43465,21 +43661,59 @@ var DoubaoAdapter = class extends LlmAdapter7 {
         const text = await response.text().catch(() => "");
         throw new LlmError12(`doubao: unexpected content-type "${contentType}": ${text.slice(0, 300)}`, "PROVIDER");
       }
-      yield* this.consumeStream(response.body, options.signal ?? controller.signal);
+      yield* this.consumeStream(
+        response.body,
+        options.signal ?? controller.signal,
+        resume,
+        (nextConversationId, nextSectionId) => {
+          this.rememberConversation(sessionKey, nextConversationId, nextSectionId);
+        }
+      );
     } finally {
       options.signal?.removeEventListener("abort", onAbort);
     }
   }
-  /** 消费 SSE 流并产出 `StreamChunk`。 */
-  async *consumeStream(body, signal) {
+  /**
+   * 消费 SSE 流并产出 `StreamChunk`。
+   *
+   * ## 与旧实现的差异（2026-11-15 按参考实现 + 实测帧重写）
+   *
+   * | 能力 | 旧实现 | 现在 |
+   * |---|---|---|
+   * | `CHUNK_DELTA` 纯文本增量 | 不处理 | 优先消费，并抑制 `STREAM_CHUNK` 全文 |
+   * | 思考过程 `block_type=10040` | 丢弃 | 产出 `reasoning` 块 |
+   * | `SSE_ACK` 会话 id | 忽略 | **回填会话缓存，下一轮复用** |
+   * | 反问 `block_type=10082` | 丢弃 → 挂到超时 | 转成正文 + **立即收尾** |
+   * | `SSE_REPLY_END.brief` | 忽略 | 无正文时的兜底全文 |
+   *
+   * @returns 本轮的会话 id（`SSE_ACK` 下发的 `conversation_id`；没有则为 `''`）
+   */
+  async *consumeStream(body, signal, resume, onConversation) {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let index = 0;
-    let started = false;
+    let nextIndex = 0;
+    let textIndex = 0;
+    let reasoningIndex = 0;
+    let sawText = false;
+    let sawReasoning = false;
     let sawDone = false;
-    let droppedFrames = 0;
+    let sawChunkDelta = false;
+    let sawClarify = false;
+    let finishedBrief = "";
+    let clarifiedQuestions = [];
+    let conversationId = resume?.conversationId ?? "";
+    let sectionId = resume?.sectionId ?? "";
     let firstFrameAt = 0;
+    let lastFrameAt = 0;
+    const closeBlocks = function* closeBlocks2() {
+      if (sawReasoning) {
+        yield { type: "block-end", index: reasoningIndex, block: { type: "reasoning", text: "" } };
+      }
+      if (sawText) {
+        yield { type: "block-end", index: textIndex, block: { type: "text", text: "" } };
+      }
+    };
     try {
       while (true) {
         if (signal.aborted) break;
@@ -43487,78 +43721,95 @@ var DoubaoAdapter = class extends LlmAdapter7 {
         if (done) break;
         const now = Date.now();
         if (firstFrameAt === 0) firstFrameAt = now;
-        else if (now - firstFrameAt > DOUBAO_CHUNK_TIMEOUT_MS) {
+        lastFrameAt = now;
+        const budget = sawText || sawReasoning ? DOUBAO_CHUNK_TIMEOUT_MS : DOUBAO_FIRST_TOKEN_TIMEOUT_MS;
+        if (now - firstFrameAt > budget) {
           throw new LlmError12("doubao: stream chunk timeout", "TIMEOUT");
         }
         buffer += decoder.decode(value, { stream: true });
         const { frames, rest } = splitSseBlocks(buffer);
         buffer = rest;
         for (const frame of frames) {
-          if (frame.event === DOUBAO_SSE.done) {
-            sawDone = true;
-            continue;
-          }
-          if (frame.event === DOUBAO_SSE.err) {
-            throw new LlmError12(`doubao: server error: ${frame.data.slice(0, 300)}`, "PROVIDER");
-          }
-          if (frame.event === "SSE_REPLY_END") {
-            sawDone = true;
-            continue;
-          }
-          if (frame.event === "SSE_HEARTBEAT" || frame.event === "STREAM_TIMEOUT_CONTROL" || frame.event === "SSE_ACK" || frame.event === "FULL_MSG_NOTIFY" || frame.event === "STREAM_MSG_NOTIFY") {
-            continue;
-          }
-          if (frame.event === "gateway-error") {
-            throw new LlmError12(
-              `doubao: gateway error: ${frame.data.slice(0, 300)}`,
-              isDoubaoAuthError(200, frame.data) ? "AUTH" : "PROVIDER"
-            );
-          }
-          if (frame.data.length === 0) continue;
-          const parsed = parseDoubaoEvent(frame.event, frame.data);
-          if (parsed === void 0) {
-            droppedFrames += 1;
-            continue;
-          }
+          if (frame.event === DOUBAO_SSE.chunkDelta) sawChunkDelta = true;
+          const parsed = parseDoubaoSseFrame(frame, sawChunkDelta);
+          if (parsed === void 0) continue;
           if (parsed.kind === "error") {
             const readable = describeDoubaoFailure(frame.data);
             throw new LlmError12(
               `doubao: ${readable}`,
-              isDoubaoAuthError(200, frame.data) ? "AUTH" : isDoubaoSlideChallenge(frame.data) ? "PROVIDER" : isDoubaoRateLimitError(200, frame.data) ? "QUOTA_EXCEEDED" : "PROVIDER"
+              isDoubaoAuthError(200, frame.data) ? "AUTH" : isDoubaoSemanticRisk(frame.data) ? "PROVIDER" : isDoubaoSlideChallenge(frame.data) ? "PROVIDER" : isDoubaoRateLimitError(200, frame.data) ? "QUOTA_EXCEEDED" : "PROVIDER"
             );
           }
-          if (parsed.kind === "done") {
+          if (parsed.kind === "end") {
             sawDone = true;
+            if (parsed.brief.length > 0) finishedBrief = parsed.brief;
             continue;
           }
-          const text = parsed.text;
-          if (text.length === 0) continue;
-          if (!started) {
-            started = true;
-            yield { type: "block-start", index, blockType: "text" };
+          if (parsed.kind === "conversation") {
+            if (parsed.conversationId.length > 0) {
+              conversationId = parsed.conversationId;
+              onConversation(conversationId, parsed.sectionId);
+            }
+            if (parsed.sectionId.length > 0) sectionId = parsed.sectionId;
+            continue;
           }
-          yield { type: "text-delta", index, text };
+          if (parsed.kind === "clarify") {
+            if (sawClarify) continue;
+            sawClarify = true;
+            clarifiedQuestions = parsed.questions;
+            const formatted = parsed.questions.map((title) => `\u2753 ${title}`).join("\n\n");
+            if (!sawText) {
+              sawText = true;
+              yield { type: "block-start", index: textIndex, blockType: "text" };
+            }
+            yield { type: "text-delta", index: textIndex, text: formatted };
+            continue;
+          }
+          if (parsed.kind === "reasoning") {
+            if (!sawReasoning) {
+              sawReasoning = true;
+              reasoningIndex = nextIndex;
+              nextIndex += 1;
+              yield { type: "block-start", index: reasoningIndex, blockType: "reasoning" };
+            }
+            yield { type: "reasoning-delta", index: reasoningIndex, text: parsed.text };
+            continue;
+          }
+          if (parsed.text.length === 0) continue;
+          if (!sawText) {
+            sawText = true;
+            textIndex = nextIndex;
+            nextIndex += 1;
+            yield { type: "block-start", index: textIndex, blockType: "text" };
+          }
+          yield { type: "text-delta", index: textIndex, text: parsed.text };
         }
+        if (sawClarify) break;
       }
-      if (!started) {
+      if (!sawText && finishedBrief.length > 0 && !sawClarify) {
+        sawText = true;
+        yield { type: "block-start", index: textIndex, blockType: "text" };
+        yield { type: "text-delta", index: textIndex, text: finishedBrief };
+      }
+      if (!sawText && !sawReasoning) {
         throw new LlmError12(
-          sawDone ? "doubao: stream finished without any text content" : 'doubao: stream ended without text and without "done"',
+          sawDone ? "doubao: stream finished without any text content" : "doubao: stream ended without text and without a completion frame",
           "PROVIDER"
         );
       }
-      yield { type: "block-end", index, block: { type: "text", text: "" } };
+      yield* closeBlocks();
     } finally {
       try {
         await reader.cancel();
       } catch {
       }
     }
-    if (droppedFrames > 0) {
-      void droppedFrames;
-    }
+    void lastFrameAt;
+    void clarifiedQuestions;
+    void sectionId;
   }
 };
-function toWireMessages(options) {
+function toWireMessages(options, continuing) {
   let input = "";
   for (let i = options.messages.length - 1; i >= 0; i -= 1) {
     const message = options.messages[i];
@@ -43568,6 +43819,21 @@ function toWireMessages(options) {
     }
   }
   if (input.length === 0 && options.system !== void 0) input = options.system;
+  if (!continuing && input.length > 0) {
+    const lastIndex = options.messages.length - 1;
+    let prefix = "";
+    for (let i = 0; i < options.messages.length; i += 1) {
+      if (i === lastIndex) break;
+      const message = options.messages[i];
+      const text = contentToText5(message["content"]).trim();
+      if (text.length === 0) continue;
+      const role = String(message["role"] ?? "unknown");
+      const label = role === "user" ? "\u7528\u6237" : role === "assistant" ? "\u52A9\u624B" : role;
+      prefix += `${label}\uFF1A${text}
+`;
+    }
+    if (prefix.length > 0) input = `${prefix}\u7528\u6237\uFF1A${input}`;
+  }
   return [{
     local_message_id: randomUuid(),
     content_block: [{
