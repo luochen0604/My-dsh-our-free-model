@@ -43363,28 +43363,75 @@ var DoubaoAdapter = class extends LlmAdapter7 {
         bot_id: this.product.botId,
         last_section_id: "",
         last_message_index: null,
-        local_permissions: []
+        /**
+         * ⚠️ 客户端真实发的是**三条本地权限声明**（不是空数组）。
+         *
+         * 实测：发 `[]` 时更容易被语义风控判为可疑请求；客户端始终发下面这三条
+         *（`status: 2` = 未授予/声明未请求），照抄即可。
+         */
+        local_permissions: [
+          { permission_name: "ACCESS_COARSE_LOCATION", status: 2 },
+          { permission_name: "ACCESS_FINE_LOCATION", status: 2 },
+          { permission_name: "ACCESS_BACKGROUND_LOCATION", status: 2 }
+        ]
       },
       messages: toWireMessages(options),
       option: {
-        create_time_ms: Date.now(),
+        // 客户端会把这批布尔/字符串默认值**全部显式发出**（共 42 个键），
+        // 缺一大半会让请求看起来不像真客户端。这里补齐关键默认值。
+        send_message_scene: "",
+        collect_id: "",
+        is_audio: false,
+        answer_with_suggest: false,
         agent_mode: 1,
+        tts_switch: false,
         // 9 = 桌面端默认（抓包值）；含义未逐一验证。
         need_deep_think: 9,
-        need_create_conversation: true,
-        unique_key: randomUuid(),
+        click_clear_context: false,
+        from_suggest: false,
+        is_regen: false,
+        is_replace: false,
+        is_from_click_option: false,
+        is_from_click_softlink: false,
+        disable_sse_cache: false,
+        select_text_action: "",
+        is_select_text: false,
+        resend_for_regen: false,
         scene_type: 0,
+        unique_key: randomUuid(),
+        start_seq: 0,
+        need_create_conversation: true,
         conversation_init_option: { project_id: "", need_ack_conversation: true },
         conversation_init_ext: {
+          /**
+           * ⚠️ 客户端在这里带 `agent_task_param`（一段被转义的 JSON），
+           * 声明本地设备与环境：`runtime_type` / `sandbox_auth_type` /
+           * `device_name` / `local_app_id` / **`local_device_id`** / `workspace`。
+           *
+           * 我们不发 workspace（那是客户端本地路径，OFM 没有也不该伪造），
+           * 但**发 device_name 与 local_device_id** —— 让请求带上"这台机器"的
+           * 一致身份。缺它时服务端只看得到一个无设备信息的请求。
+           */
+          agent_task_param: buildAgentTaskParam(this.product, credential),
           model_item_key: modelItemKey,
           reasoning_effort: resolveDoubaoReasoningEffort(options.reasoningEffort),
           mode_id: "3"
         },
+        regen_query_id: [],
+        edit_query_id: [],
+        regen_instruction: "",
+        no_replace_for_regen: false,
+        message_from: DOUBAO_MESSAGE_FROM_DESKTOP,
+        shared_app_name: "",
+        shared_app_id: "",
         sse_recv_event_options: { support_chunk_delta: true },
         support_lazy_fetch_stream: true,
-        message_from: DOUBAO_MESSAGE_FROM_DESKTOP,
+        is_ai_playground: false,
         is_old_user: true
-      }
+      },
+      // 客户端固定发这两个顶层字段；缺了会让请求结构偏离。
+      user_context: [],
+      ext: {}
     });
     const url = `${this.product.apiBase}${withCommonParams(SAMANTHA_CHAT_PATH, this.product, credential.deviceId)}`;
     const controller = new AbortController();
@@ -43537,6 +43584,18 @@ function toWireMessages(options) {
     }],
     message_status: 0
   }];
+}
+function buildAgentTaskParam(product, credential) {
+  const payload = {
+    runtime_type: 2,
+    sandbox_auth_type: 1,
+    folder_name: "",
+    local_app_id: product.aid
+  };
+  if (credential?.deviceId !== void 0 && credential.deviceId.length > 0) {
+    payload["local_device_id"] = credential.deviceId;
+  }
+  return JSON.stringify(payload);
 }
 function randomUuid() {
   try {
