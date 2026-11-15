@@ -713,6 +713,7 @@ window.__ModuleLoader__.load({
         'gw.freeLaneNote': '免费车道（Our Free Model）自己的转发端口在「免费模型」页的「本地转发」分区。',
         'chan.credits.left': '剩余积分',
         'chan.credits.tokens': '剩余 Token',
+        'chan.credits.percent': '剩余额度',
         'chan.credits.dollars': '剩余余额（USD）',
         'chan.credits.quota': '剩余配额',
         'chan.credits.loaded': '已查询 {count} 个账号',
@@ -1642,6 +1643,7 @@ window.__ModuleLoader__.load({
         'gw.freeLaneNote': 'The free lane (Our Free Model) has its own forward port under "Local forward" on the Free models page.',
         'chan.credits.left': 'Credits left',
         'chan.credits.tokens': 'Tokens left',
+        'chan.credits.percent': 'Quota left',
         'chan.credits.dollars': 'Balance left (USD)',
         'chan.credits.quota': 'Quota left',
         'chan.credits.loaded': '{count} accounts queried',
@@ -4874,12 +4876,20 @@ window.__ModuleLoader__.load({
       // claim 一轮对每账号产出三条 outcome（灵犀/福利/任务），成功通知用
       // 「处」计数而不是账号数（见 claim() 里的 lingxi 分支文案）。
       lingxi: { claim: true, status: true, unit: 'points' },
-      // 豆包工作：积分单位是「积分」（与契约缺省一致，故不传 unit）。
-      // `status: true` ⇒ 显示独立签到状态。
-      // ⚠️ **不置 `desktop: true`**：豆包是否有「只认桌面端会话」的门槛**尚未验证**
-      // （Raccoon 已被证实有）。若实测 `granted:false` 且今日无记录，再补这个开关
-      // 并实现 account.desktopLogin —— 不要预先加上，那会给用户一个无用的按钮。
-      doubao: { claim: true, status: true },
+      // 豆包工作：**额度**（产品里叫「额度」，不叫「积分」）。
+      //
+      // 2026-11-15 带真实登录态实测：
+      // - `POST /alice/commerce/sale/subscription/overview/`
+      //   body `{product_line:"membership"}` → `code:0`，返回
+      //   `incentive_quota_entitlements[]`（活动赠送额度）与
+      //   `current_subscription.display`（「免费体验」）。
+      // - ⚠️ **服务端只给百分比**（`total_used_percent`），没有绝对额度值；
+      //   界面上「可用额度 400 / 已用 0/200」由客户端本地算。
+      //   故这里 `unit: 'percent'`，余额按百分比如实显示，不编造绝对数。
+      // - 签到（`/alice/ug/campaign/landing/*`）仍返回 `710010702 系统错误`：
+      //   缺完整 `AgwCommonParam`，其构造处不在客户端 bundle 里（宿主注入）。
+      //   故**不置 `claim`/`status`** —— 不给用户一个必然失败的按钮。
+      doubao: { unit: 'percent' },
       gemini: { unit: 'quota', quota: true },
     }
 
@@ -4991,7 +5001,9 @@ window.__ModuleLoader__.load({
       }
       const balanceLabel = creditCapability?.unit === 'tokens' ? t('chan.credits.tokens')
         : creditCapability?.unit === 'dollars' ? t('chan.credits.dollars')
-          : creditCapability?.quota ? t('chan.credits.quota') : t('chan.credits.left')
+          // 豆包工作：接口只给百分比（无绝对额度值），故如实标成百分比口径。
+          : creditCapability?.unit === 'percent' ? t('chan.credits.percent')
+            : creditCapability?.quota ? t('chan.credits.quota') : t('chan.credits.left')
 
       const accountsCount = status?.accounts?.total ?? 0
       const enabledCount = status?.accounts?.enabled ?? 0

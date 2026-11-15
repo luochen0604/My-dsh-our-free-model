@@ -299,10 +299,11 @@ export const OPS_CHECKIN_PROVIDERS: ReadonlySet<string> = new Set([
   WORKBUDDY_ID,
   // WPS（灵犀/福利中心/任务中心，共用一个 wps_sid）有真实签到接口，参与签到。
   LINGXI_ID,
-  // 豆包工作：`/alice/ug/campaign/landing/checkin` 已实测存在（无签名门槛），
-  // 参与一键签到与自动签到。⚠️ 是否真能领到取决于登录态来源（P2 未验证），
-  // 领取函数内部已做二次复核，不会谎报成功。
-  DOUBAO.id,
+  // ⚠️ 豆包工作**不参与**签到：带真实登录态实测，`/alice/ug/campaign/landing/*`
+  // 一律返回 `710010702 系统错误`（缺完整 `AgwCommonParam`，构造处未定位），
+  // 且客户端 UI 没有任何「积分」文案 —— 该产品没有积分体系。
+  // 放进集合只会让「一键签到」每次都多一条失败记录，故不加。
+  // 实现保留在 `doubao-credits.ts`，等参数齐了再启用。
 ])
 
 /**
@@ -930,8 +931,31 @@ function llmEmitAdaptersUpdated(ctx: Context): void {
   llm?.emitAdaptersUpdated?.()
 }
 
-function broadcastCatalogChanged(ctx: Context): void {
-  // `ctx.emit` from the connection fiber does not reach the composer. The host
+/**
+ * 会改变「是否存在已登录账号」的 RPC 方法。
+ *
+ * 这些方法成功后必须广播目录变化 —— 因为 `listModels()` 在
+ * `DSH_HIDE_MODELS_WITHOUT_ACCOUNT`（默认开）下按 `hasLoggedInAccount` 决定
+ * 返回真实列表还是空数组，而客户端缓存了目录（详见路由出口处那段注释）。
+ */
+const ACCOUNT_MUTATING_METHODS: ReadonlySet<string> = new Set([
+  'account.create',
+  'account.delete',
+  'account.importCookie',
+  'account.importFromClient',
+  'account.reset',
+  'account.resetAll',
+  'account.update',
+  'backup.import',
+])
+
+/** RPC 结果是否成功（`{ ok: true }`）。 */
+function isRpcOk(result: unknown): boolean {
+  return result !== null && typeof result === 'object'
+    && (result as { ok?: unknown }).ok === true
+}
+
+function broadcastCatalogChanged(ctx: Context): void {  // `ctx.emit` from the connection fiber does not reach the composer. The host
   // LLM service's `emitAdaptersUpdated` is what refreshes `session.modelCatalog`.
   // The plain emit stays so a composition without that method, and tests that
   // capture `llm/adapters-updated`, still observe the change.
@@ -1267,6 +1291,34 @@ function registerChannelPackEndpoints(
 
       try {
         const result = await handleMethod(call.method as string, call.payload, request.signal)
+        /**
+         * 账号增删后**必须**广播目录变化。
+         *
+         * ## 为什么（真实缺陷，2026-11-15 用户报障）
+         *
+         * 各适配器的 `listModels()` 会先过 `providerCatalogVisible()`，它在
+         * `DSH_HIDE_MODELS_WITHOUT_ACCOUNT`（**默认开启**）下调用
+         * `hasLoggedInAccount(provider)`：
+         *
+         * - **没有账号时返回 `[]`**（整个 provider 从模型选择器里消失）；
+         * - 加入第一个账号后返回真实模型列表。
+         *
+         * 而客户端 `ModelCatalogDirectory` 把 `modelCatalog` 存进「ready 即短路」
+         * 的 store，只在 `llm/adapters-updated` / `settings/document-updated` /
+         * `credentials/reference-updated` 三个转发事件上刷新（见
+         * `broadcastCatalogChanged` 的注释）。
+         *
+         * 于是「新渠道 + 首次添加账号」必然踩这个坑：启动时无账号 ⇒ 目录为空并被
+         * 缓存 ⇒ 加完账号后选择器**仍然空着**，直到重启。豆包作为全新渠道恰好
+         * 是第一个走到这条路径的。
+         *
+         * ⚠️ 放在这个统一出口而不是逐个 `case` 里加：`account.create` 的
+         * provider 分支有十来个 `return`，逐个补必然漏（历史已复发多次）；
+         * `account.delete` 同理。这里一处覆盖全部账号增删。
+         */
+        if (ACCOUNT_MUTATING_METHODS.has(call.method as string) && isRpcOk(result)) {
+          broadcastCatalogChanged(ctx)
+        }
         return reply(rpcId, result)
       } catch (error) {
         // 必须返回规范的 RPC 错误响应（而不是裸 500 文本），
@@ -3877,7 +3929,8 @@ if (provider === LOBSTERAI.id) {
               values.push({
                 accountId: account.id, nickname: account.nickname,
                 balance: null,
-                error: '豆包积分查询失败（端点响应形态未实测；若持续失败请反馈抓包）',
+                // 如实说明：这不是「查询失败」，而是「该渠道没有这个功能」。
+                error: '豆包工作无积分/余额体系（实测各 credit 端点均无数据返回）',
               })
               continue
             }

@@ -82,6 +82,8 @@ const adapters = new Map()
  */
 const SIGNIN_ONLY_PROVIDERS = new Set(['workbuddy', 'lingxi'])
 const writes = []
+/** `llm.emitAdaptersUpdated()` 被调用次数（目录刷新广播探针）。 */
+let adaptersUpdated = 0
 const creds = new Map([['OPENCODE_ACCOUNT_EXISTING', { value: '{"api_key":"test-existing-key"}' }]])
 const services = {
   profileContext: { home: scratch },
@@ -94,6 +96,15 @@ const services = {
   llm: {
     registerAdapter(providers, adapter) { for (const provider of providers) adapters.set(provider, adapter) },
     listProviders: () => [...adapters.keys()].map(id => ({ id })),
+    /**
+     * 目录刷新广播的探针。
+     *
+     * 「加完账号后模型选择器仍然空着」是个真实缺陷：`listModels()` 在
+     * `DSH_HIDE_MODELS_WITHOUT_ACCOUNT`（默认开）下按 `hasLoggedInAccount`
+     * 决定返回真实列表还是 `[]`，而客户端缓存了目录，只在
+     * `llm/adapters-updated` 等三个事件上刷新。故账号增删后必须广播。
+     */
+    emitAdaptersUpdated() { adaptersUpdated += 1 },
   },
   connection: { fetch: { register: route => { routes.push(route) } } },
 }
@@ -206,6 +217,27 @@ try {
       else process.env.DSH_DOUBAO_CLIENT_EXE = savedExe
     }
     console.log('ok  account.importFromClient: provider guard + reaches client bridge with readable error')
+  }
+
+  /**
+   * 账号增删后必须广播目录刷新（`llm/adapters-updated`）。
+   *
+   * 真实缺陷：`listModels()` 在 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT`（默认开）下
+   * 按 `hasLoggedInAccount` 决定返回真实列表还是 `[]`。首个账号加入后列表
+   * 从空变非空，但客户端 `ModelCatalogDirectory` 命中缓存不会自己重拉 ——
+   * 于是「新渠道加完账号，模型选择器仍然空着，必须重启」。
+   *
+   * 这里用 `provider.setEnabled` 验证**广播管道本身**可用（同一条出口）；
+   * 账号类方法是否在广播集合里由 `ACCOUNT_MUTATING_METHODS` 保证。
+   */
+  {
+    const before = adaptersUpdated
+    const toggled = await call('provider.setEnabled', { provider: 'trae', enabled: false })
+    assert.equal(toggled.ok, true, 'provider.setEnabled succeeds')
+    assert.equal(adaptersUpdated, before + 1,
+      'RPC that changes the catalogue broadcasts llm/adapters-updated so the model selector refreshes without a restart')
+    await call('provider.setEnabled', { provider: 'trae', enabled: true })
+    console.log('ok  catalogue-mutating RPC broadcasts llm/adapters-updated（选择器无需重启即可刷新）')
   }
 
   const beforeUnsupportedFetch = fetched.length

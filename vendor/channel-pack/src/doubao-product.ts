@@ -38,6 +38,33 @@ export const ALICE_CAMPAIGN_LANDING_PATH = '/alice/ug/campaign/landing/get'
 export const ALICE_CLAIM_PATH = '/alice/ug/campaign/item/reward/claim/'
 /** 积分用量历史（**实测 200**：`/commerce/...`，无 `/alice` 前缀）。 */
 export const ALICE_CREDIT_USAGE_PATH = '/commerce/benefit_supply/credit/get_credit_usage_history'
+
+/**
+ * 订阅 / 额度总览（**实测 `code: 0`**，带真实登录态）。
+ *
+ * body 需要 `{ product_line: "membership" }`（缺省等价 membership）。
+ * 返回 `incentive_quota_entitlements[]`（活动赠送额度，含 `total_used_percent`）
+ * 与 `current_subscription.display`（如「免费体验」）。
+ *
+ * ⚠️ 只有百分比，没有绝对额度值 —— 详见 `fetchDoubaoCreditBalance` 注释。
+ */
+export const SUBSCRIPTION_OVERVIEW_PATH = '/alice/commerce/sale/subscription/overview/'
+
+/**
+ * 额度汇总（**实测 `code: 0`**）。
+ *
+ * 与 overview 同为百分比口径（`window_limits[].used_percent`）。
+ * 保留给需要「按 feature_group 分组」的展示，当前余额只用 overview。
+ */
+export const SUBSCRIPTION_QUOTA_SUMMARY_PATH = '/alice/commerce/sale/subscription/quota/summary/'
+
+/**
+ * 产品线。
+ *
+ * ⚠️ 实测：`membership`（或空串）返回会员额度数据；`office` / `workspace`
+ * 之类返回空结构。豆包工作的额度挂在**同一个字节账号的会员体系**下。
+ */
+export const DOUBAO_PRODUCT_LINE = 'membership'
 /** 积分提示/可用任务（**实测 200**：`/commerce/...` 无 `/alice` 前缀）。 */
 export const ALICE_CREDIT_TIP_PATH = '/commerce/benefit_supply/credit/get_credit_tip'
 

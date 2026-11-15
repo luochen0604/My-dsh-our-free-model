@@ -36,6 +36,9 @@ import {
   BOT_LIST_LEGACY_PATH,
   BOT_LIST_PATH,
   DOUBAO,
+  DOUBAO_PRODUCT_LINE,
+  SUBSCRIPTION_OVERVIEW_PATH,
+  SUBSCRIPTION_QUOTA_SUMMARY_PATH,
   type DoubaoProduct,
 } from './doubao-product.js'
 import {
@@ -308,84 +311,118 @@ export async function claimDoubaoDailyPoints(
 }
 
 /**
- * 查询积分余额（**只读**）。
+ * 查询豆包工作的**额度**（产品里叫「额度」，不叫「积分」）。
  *
- * 先试轻量的 `get_credit_tip`，再试 `get_credit_usage_history`。
- * 两次都拿不到 → `undefined`（不填 0）。
+ * ## 端点（2026-11-15 带真实登录态实测，均 `code: 0`）
+ *
+ * `POST /alice/commerce/sale/subscription/overview/`
+ * body `{ product_line: "membership" }` 返回：
+ * - `current_subscription.display` → 如「个人订阅 / 免费体验」
+ * - `incentive_quota_entitlements[]` → 活动赠送额度，每条含
+ *   `display.title` / `end_time` / `total_used_percent` / `status`
+ * - `incentive_quota_section` → `entitlement_count` / `usage_exhausted`
+ *
+ * ## ⚠️ 服务端只给百分比，不给绝对值
+ *
+ * 逐字段实测确认：`total_used_percent` 有值，但任何 `total` / `amount` /
+ * `remaining` 字段都不存在。旁路端点也都没有绝对值：
+ * - `subscription/quota/summary/` → 同样只有 `used_percent`
+ * - `subscription/activity_reward_quota/` → `entitlements: []`
+ * - `intake/entitlement/query`（`scene` 必须是 **int**，仅 `1` 有效）→ 只回
+ *   `fingerprint`，是**变更探测**端点，不是额度数据
+ *
+ * 客户端界面上的「可用额度 400 / 已用 0/200」由**客户端本地**计算，
+ * 绝对值不在这些响应里。故这里**不编造绝对数**：以百分比为单位如实呈现，
+ * `unit` 明确标成 `'%'`，每个包的 `total` 固定 100。
+ *
+ * @returns `undefined` = "拿不到"（未登录 / 网络异常 / 响应不符），
+ *          **不是**"额度为 0"。调用方据此如实报错，不要显示 0。
  */
 export async function fetchDoubaoCreditBalance(
   credential: DoubaoCredential,
   product: DoubaoProduct = DOUBAO,
   fetchImpl: typeof fetch = fetch,
 ): Promise<CreditBalance | undefined> {
-  for (const path of [ALICE_CREDIT_TIP_PATH, ALICE_CREDIT_USAGE_PATH]) {
-    let result: PostResult
-    try {
-      result = await post(credential, path, {}, product, fetchImpl)
-    } catch {
-      continue
-    }
-    if (!result.ok || !businessOk(result.payload)) continue
+  let result: PostResult
+  try {
+    result = await post(
+      credential,
+      SUBSCRIPTION_OVERVIEW_PATH,
+      { product_line: DOUBAO_PRODUCT_LINE },
+      product,
+      fetchImpl,
+    )
+  } catch {
+    return undefined
+  }
+  if (!result.ok || !businessOk(result.payload)) return undefined
 
-    const data = unwrapData(result.payload)
-    if (data === null || typeof data !== 'object') continue
+  const data = unwrapData(result.payload)
+  if (data === null || typeof data !== 'object') return undefined
 
-    // 情况 1：直接给总余额。
-    const directTotal = asNumber(pick(data, [
-      'total', 'balance', 'credit', 'remaining', 'available', 'total_credit',
-    ]))
-    if (directTotal !== undefined) {
-      return {
-        total: directTotal,
-        packages: [
-          {
-            name: '豆包积分',
-            unit: 'credit',
-            remaining: directTotal,
-            total: directTotal,
-            used: 0,
-            active: true,
-            cycleStartTime: '',
-            cycleEndTime: '',
-            expiredTime: '',
-          },
-        ],
-        expiredTotal: 0,
-      }
-    }
+  const rows = pick(data, ['incentive_quota_entitlements'])
+  if (!Array.isArray(rows)) return undefined
 
-    // 情况 2：给明细包列表。
-    const rawPackages = pick(data, ['packages', 'credits', 'items', 'list', 'accounts'])
-    if (Array.isArray(rawPackages)) {
-      const packages: CreditPackage[] = []
-      let total = 0
-      let expiredTotal = 0
-      for (const raw of rawPackages) {
-        const remaining = asNumber(pick(raw, ['remaining', 'amount', 'credit', 'left', 'capacity_remain']))
-        if (remaining === undefined) continue
-        const active = asBoolean(pick(raw, ['active', 'valid', 'enabled', 'status_active'])) ?? true
-        const packageTotal = asNumber(pick(raw, ['total', 'capacity', 'total_amount'])) ?? remaining
-        const used = asNumber(pick(raw, ['used', 'consumed'])) ?? Math.max(0, packageTotal - remaining)
-        packages.push({
-          name: pickString(raw, ['name', 'title', 'package_name']) || '豆包积分',
-          unit: pickString(raw, ['unit', 'capacity_unit']) || 'credit',
-          remaining,
-          total: packageTotal,
-          used,
-          active,
-          cycleStartTime: pickString(raw, ['cycle_start_time', 'start_time']),
-          cycleEndTime: pickString(raw, ['cycle_end_time', 'end_time']),
-          expiredTime: pickString(raw, ['expired_time', 'expire_time']),
-        })
-        if (active) total += remaining
-        else expiredTotal += remaining
-      }
-      if (packages.length > 0) {
-        return { total, packages, expiredTotal }
-      }
+  const now = Date.now()
+  const packages: CreditPackage[] = []
+  let remainingPercentSum = 0
+  let activeCount = 0
+
+  for (const row of rows) {
+    const display = pick(row, ['display'])
+    const title = display !== null && typeof display === 'object'
+      ? pick(display, ['title'])
+      : undefined
+    const endTime = pick(row, ['end_time', 'subscription_end_time'])
+    const endMs = typeof endTime === 'number'
+      ? (endTime > 1e12 ? endTime : endTime * 1000)
+      : 0
+    const usedRaw = pick(row, ['total_used_percent'])
+    const used = typeof usedRaw === 'number' ? Math.max(0, Math.min(100, usedRaw)) : 0
+    const remaining = Math.max(0, 100 - used)
+    const active = endMs === 0 || endMs > now
+
+    const baseName = typeof title === 'string' && title.length > 0 ? title : '活动赠送额度'
+    packages.push({
+      name: endMs === 0 ? baseName : `${baseName}（${formatShortDate(endMs)} 到期）`,
+      // 单位如实标成百分比：绝对额度值确实不在接口响应里。
+      unit: '%',
+      remaining,
+      total: 100,
+      used,
+      active,
+      cycleStartTime: '',
+      cycleEndTime: endMs === 0 ? '' : new Date(endMs).toISOString(),
+      expiredTime: '',
+    })
+    if (active) {
+      remainingPercentSum += remaining
+      activeCount += 1
     }
   }
-  return undefined
+
+  if (packages.length === 0) {
+    // 有响应但没有额度包：如实返回空列表（当前没有活动赠送额度），不编造数字。
+    return { total: 0, packages: [], expiredTotal: 0 }
+  }
+
+  /**
+   * 顶层 `total` = **有效包的剩余百分比均值**。
+   *
+   * 为什么取均值而不是求和：每个包是独立额度池，求和会得到 200%（两包全新）
+   * 这种没有意义的数字；均值给出「整体还剩几成」，配 `unit: '%'` 读作
+   * 「剩余 100 %」= 全部未用，语义正确。
+   */
+  const total = activeCount === 0
+    ? 0
+    : Math.round(remainingPercentSum / activeCount)
+  return { total, packages, expiredTotal: 0 }
+}
+
+/** `MM-DD`（本地时区），用于额度包到期提示。 */
+function formatShortDate(ms: number): string {
+  const date = new Date(ms)
+  return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
 /**
