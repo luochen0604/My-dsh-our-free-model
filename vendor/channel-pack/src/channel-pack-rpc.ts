@@ -2039,7 +2039,10 @@ if (provider === LOBSTERAI.id) {
         if (req.provider !== DOUBAO.id) {
           return { ok: false, error: { code: 'bad-request', message: `该渠道不支持从客户端导入：${String(req.provider)}` } }
         }
-        const accounts = pool.listAccounts(DOUBAO.id).map((entry) => ({
+        // ⚠️ `pool.listAccounts()` 是 **async**（返回 Promise），不能直接 `.map`。
+        // 这里要的只是 id + credentialRef（同步可得），故用同步的
+        // `listAccountsByProvider()` —— 它返回原始条目，正是去重所需。
+        const accounts = pool.listAccountsByProvider(DOUBAO.id).map((entry) => ({
           id: entry.id,
           credentialRef: entry.credentialRef,
         }))

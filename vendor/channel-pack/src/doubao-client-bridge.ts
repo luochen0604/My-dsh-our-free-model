@@ -36,8 +36,18 @@ export const DOUBAO_COOKIE_URL = 'https://www.doubao.com'
  *
  * ⚠️ 用「安装目录里的 app\DoubaoWork.exe」而不是外层的 launcher：
  * 后者只是个引导器，真正跑 Chromium 的是它。
+ *
+ * 支持 `DSH_DOUBAO_CLIENT_EXE` 覆盖（非默认安装路径 / 测试用）。
  */
 export const DEFAULT_DOUBAO_EXE = 'D:\\Program Files\\DoubaoWork\\app\\DoubaoWork.exe'
+
+/** 解析实际使用的客户端路径（环境变量优先）。 */
+export function resolveDoubaoExePath(exePath?: string): string {
+  if (typeof exePath === 'string' && exePath.length > 0) return exePath
+  const fromEnv = process.env.DSH_DOUBAO_CLIENT_EXE
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv
+  return DEFAULT_DOUBAO_EXE
+}
 
 /** Windows 专用（本模块依赖 taskkill/tasklist）。 */
 export function isDoubaoClientBridgeSupported(): boolean {
@@ -260,7 +270,7 @@ export async function readCookiesFromDoubaoClient(
   if (!isDoubaoClientBridgeSupported()) {
     throw new Error('从客户端导入仅支持 Windows')
   }
-  const exePath = options.exePath ?? DEFAULT_DOUBAO_EXE
+  const exePath = resolveDoubaoExePath(options.exePath)
   const onProgress = options.onProgress ?? ((): void => {})
   if (!fs.existsSync(exePath)) {
     throw new Error(`找不到豆包工作客户端：${exePath}（可在设置里改路径）`)

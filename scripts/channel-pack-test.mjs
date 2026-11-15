@@ -174,6 +174,40 @@ try {
   }
   assert.equal((await call('account.list', { provider: 'opencode' })).value.accounts.length, 1)
   assert.equal(writes.length, 0, 'rejected RPCs leave credentials untouched')
+
+  /**
+   * `account.importFromClient` 的路径守卫。
+   *
+   * ⚠️ 这条用例的存在理由是一个真实缺陷：该 RPC 初版写成
+   * `pool.listAccounts(...).map(...)`，而 `listAccounts()` 是 **async**
+   *（返回 Promise），于是点击「添加账号」直接报
+   * `pool.listAccounts(...).map is not a function`。
+   * 仓库的 `npm run typecheck` 只覆盖 `adapter/**`，`vendor/channel-pack/src`
+   * 不在其中，故类型检查也没拦住 —— 只能靠这里的行为用例兜住。
+   *
+   * 用 `DSH_DOUBAO_CLIENT_EXE` 指向一个不存在的路径：桥接层会立刻抛
+   *「找不到客户端」，因此**不会**真的重启用户的豆包工作。
+   */
+  {
+    const notDoubao = await call('account.importFromClient', { provider: 'cline' })
+    assert.equal(notDoubao.ok, false, 'importFromClient rejects non-doubao providers')
+    assert.match(String(notDoubao.error?.message ?? ''), /不支持从客户端导入/)
+
+    const savedExe = process.env.DSH_DOUBAO_CLIENT_EXE
+    process.env.DSH_DOUBAO_CLIENT_EXE = path.join(scratch, 'no-such-DoubaoWork.exe')
+    try {
+      const doubao = await call('account.importFromClient', { provider: 'doubao' })
+      assert.equal(doubao.ok, false, 'importFromClient fails closed when the client is absent')
+      // 关键：必须是「找不到客户端」这类可读业务错误，而不是 TypeError。
+      assert.match(String(doubao.error?.message ?? ''), /找不到豆包工作客户端/,
+        'reaches the client bridge and reports a readable error (not a TypeError)')
+    } finally {
+      if (savedExe === undefined) delete process.env.DSH_DOUBAO_CLIENT_EXE
+      else process.env.DSH_DOUBAO_CLIENT_EXE = savedExe
+    }
+    console.log('ok  account.importFromClient: provider guard + reaches client bridge with readable error')
+  }
+
   const beforeUnsupportedFetch = fetched.length
   for (const entry of unsupportedAccounts) {
     assert.equal(adapters.has(entry.provider), false, 'unsupported provider is never registered')

@@ -42494,6 +42494,12 @@ import fs from "node:fs";
 import net from "node:net";
 var DOUBAO_COOKIE_URL = "https://www.doubao.com";
 var DEFAULT_DOUBAO_EXE = "D:\\Program Files\\DoubaoWork\\app\\DoubaoWork.exe";
+function resolveDoubaoExePath(exePath) {
+  if (typeof exePath === "string" && exePath.length > 0) return exePath;
+  const fromEnv = process.env.DSH_DOUBAO_CLIENT_EXE;
+  if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv;
+  return DEFAULT_DOUBAO_EXE;
+}
 function isDoubaoClientBridgeSupported() {
   return process.platform === "win32";
 }
@@ -42657,7 +42663,7 @@ async function readCookiesFromDoubaoClient(options = {}) {
   if (!isDoubaoClientBridgeSupported()) {
     throw new Error("\u4ECE\u5BA2\u6237\u7AEF\u5BFC\u5165\u4EC5\u652F\u6301 Windows");
   }
-  const exePath = options.exePath ?? DEFAULT_DOUBAO_EXE;
+  const exePath = resolveDoubaoExePath(options.exePath);
   const onProgress = options.onProgress ?? (() => {
   });
   if (!fs.existsSync(exePath)) {
@@ -61583,7 +61589,7 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
         if (req.provider !== DOUBAO.id) {
           return { ok: false, error: { code: "bad-request", message: `\u8BE5\u6E20\u9053\u4E0D\u652F\u6301\u4ECE\u5BA2\u6237\u7AEF\u5BFC\u5165\uFF1A${String(req.provider)}` } };
         }
-        const accounts = pool.listAccounts(DOUBAO.id).map((entry) => ({
+        const accounts = pool.listAccountsByProvider(DOUBAO.id).map((entry) => ({
           id: entry.id,
           credentialRef: entry.credentialRef
         }));
