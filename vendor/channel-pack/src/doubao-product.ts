@@ -95,10 +95,10 @@ export const SAMANTHA_THREAD_PATH = '/samantha/thread/create_or_get'
  * 模块头与 `client.js` 的 `CHANNEL_CREDITS.raccoon.desktop`），纯网页 token 永远
  * `granted:false`。豆包若同构，则必须让请求带上桌面端标记。
  *
- * 未知：`DesktopAskAssistant` 在服务端是"来源枚举"还是"能力开关"。未实测前
- * 一律照发（与官方客户端同形，不会更差），但**不得据此在 UI 上承诺积分可领**。
+ * 未知：服务端把这个字段当"来源枚举"还是"能力开关"。**已实测：必须是数字
+ * 枚举**，传字符串会让 `/samantha/chat/completion` 直接 400（proto 解码层拒绝）。
+ * 数值定义见 `doubao.ts` 的 `DOUBAO_MESSAGE_FROM_DESKTOP`。
  */
-export const DOUBAO_MESSAGE_FROM_DESKTOP = 'DesktopAskAssistant'
 
 /** 一个兜底模型条目。 */
 export interface DoubaoFallbackModel {
@@ -124,8 +124,19 @@ export interface DoubaoFallbackModel {
  * 因此策略与其它 provider 一致：**优先远端目录，失败才回退本表**；
  * 而本表只放"已知存在"的豆包模型家族名，绝不编造型号。
  */
+/**
+ * 兜底模型表。
+ *
+ * ⚠️ **实测只有这一个能确认**：`POST /alice/bot/get_bot_list_v2`
+ * 传 `{ bot_id_list: [<主 bot>], scene: "default" }` 返回
+ * `code:0` + `[{id:"7338286299411103781", name:"豆包"}]` —— 该端点按 id **查**，
+ * 不枚举，所以拿不到客户端模型选择器里那一整列。
+ *
+ * 模型选择器的完整目录需要一个「枚举」端点（尚未定位）；在找到之前这里如实
+ * 只声明「豆包」一个，**不编造型号**。
+ */
 const DOUBAO_FALLBACK_MODELS: readonly DoubaoFallbackModel[] = [
-  { id: 'doubao-seed-1.6', name: 'Doubao-Seed-1.6', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
+  { id: 'doubao', name: '豆包', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
 ]
 
 /** 豆包工作产品配置。 */
@@ -149,21 +160,25 @@ export interface DoubaoProduct {
   /** 兜底模型表。 */
   fallbackModels: readonly DoubaoFallbackModel[]
   /**
-   * 未验证的构建期常量。
+   * 应用 ID（`aid` / `real_aid`）。
    *
-   * ⚠️ 这些值**不是取证结果**，是"按形态填的占位"。首次实测后必须校正，
-   * 校正前不得声称 provider 可用。
+   * ✅ **2026-11-15 运行时抓包取证**：真实请求里是 `aid=1044603`。
+   *（此前占位值 `497858` 是错的。）
    */
-  unverified: {
-    /** `aid`（应用 ID）。 */
-    aid: string
-    /** `real_aid`。 */
-    realAid: string
-    /** `pkg_type`。 */
-    pkgType: string
-    /** 对话使用的 bot 标识。 */
-    botId: string
-  }
+  aid: string
+  /** `version_code`（真实请求里是 `20800`）。 */
+  versionCode: string
+  /** `runtime_version`（真实请求里是 `3.45.1`）。 */
+  runtimeVersion: string
+  /** `chromium_version`（真实请求里是宿主 Chromium 版本）。 */
+  chromiumVersion: string
+  /**
+   * 对话使用的 bot 标识。
+   *
+   * ✅ **2026-11-15 运行时抓包取证**：真实请求里是 `7338286299411103781`
+   *（此前占位空串，必然导致失败）。
+   */
+  botId: string
 }
 
 /** 豆包工作 provider 配置。 */
@@ -175,19 +190,17 @@ export const DOUBAO: DoubaoProduct = {
   apiBase: DOUBAO_API_BASE,
   chatPrefix: SAMANTHA_PREFIX,
   pointsPrefix: ALICE_PREFIX,
-  // 观察：`desktop` 端的 UA 由 `mH` 常量拼装，本次未取到字面量。
-  // 先按版本号拼一个保守形态；UA 只是伪装的次要维度（Raccoon 实测该端不校验 UA）。
+  // ⚠️ UA 仍未取到字面量（`mH` 常量在混淆代码里拼装）。UA 是伪装的次要维度。
   userAgent: 'DoubaoWork/2.36.7 (Windows)',
   clientVersion: '2.36.7',
   defaultCredentialRef: 'DOUBAO_ACCESS_TOKEN',
   fallbackModels: DOUBAO_FALLBACK_MODELS,
-  unverified: {
-    // 以下是形态占位：取证只拿到变量名（sl/sc/sg/bot_id），没拿到字面量。
-    aid: '497858',
-    realAid: '497858',
-    pkgType: '1',
-    botId: '',
-  },
+  // 以下全部来自 2026-11-15 的 CDP 抓包（见 doubao.ts 的 doubaoCommonParams 注释）。
+  aid: '1044603',
+  versionCode: '20800',
+  runtimeVersion: '3.45.1',
+  chromiumVersion: '147.0.7727.149',
+  botId: '7338286299411103781',
 }
 
 /** 全部豆包产品配置（当前只有一个，保留数组以便将来扩展）。 */

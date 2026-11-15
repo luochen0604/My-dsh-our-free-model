@@ -53,10 +53,13 @@ import {
   DOUBAO_SSE,
   doubaoHeaders,
   isDoubaoAuthError,
+  isDoubaoRateLimitError,
   isDoubaoQuotaError,
   isDoubaoUsable,
   splitSseBlocks,
   withCommonParams,
+  DOUBAO_MESSAGE_FROM_DESKTOP,
+  DOUBAO_CONTENT_TYPE_TEXT,
   type DoubaoCredential,
 } from './doubao.js'
 
@@ -123,7 +126,96 @@ function extractTextDelta(item: unknown): string {
   return ''
 }
 
-/** 从一帧 JSON 里抽出所有文本增量。 */
+/**
+ * 解析一帧豆包 SSE 的 `data` 载荷。
+ *
+ * ## 真实结构（2026-11-15 带登录态实测）
+ *
+ * ```json
+ * { "event_data": "<JSON 字符串>", "event_id": "2", "event_type": 2001 }
+ * ```
+ *
+ * `event_type` 语义：
+ * - `2001` 文本增量：`event_data.message.content` = `{"text":"增量"}`，`is_delta:true`
+ * - `2002` 会话/消息 id 下发（无文本）
+ * - `2003` 结束
+ * - `2005` 业务错误：`event_data` 内含 `code`/`message`
+ * - `2010` 意图判定（无文本）
+ *
+ * 结束判定：`2003`，或 `2001` 帧里 `is_finish:true`。
+ *
+ * @returns `{ text }` 文本增量 / `{ done }` 结束 / `{ error }` 业务错误 /
+ *          `undefined` 表示这帧没有可用信息（忽略）。
+ */
+export type DoubaoEventOutcome =
+  | { kind: 'text'; text: string }
+  | { kind: 'done' }
+  | { kind: 'error'; message: string }
+
+export function parseDoubaoEvent(raw: string): DoubaoEventOutcome | undefined {
+  let outer: unknown
+  try {
+    outer = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  if (outer === null || typeof outer !== 'object') return undefined
+  const record = outer as Record<string, unknown>
+  const type = record['event_type']
+  const typeCode = typeof type === 'number' ? type : Number(type)
+
+  // event_data 是 JSON 字符串（二次编码）。
+  let data: unknown = record['event_data']
+  if (typeof data === 'string') {
+    try {
+      data = JSON.parse(data)
+    } catch {
+      return undefined
+    }
+  }
+  const payload = data !== null && typeof data === 'object' ? data as Record<string, unknown> : undefined
+
+  // 业务错误帧。
+  if (typeCode === 2005) {
+    const code = payload?.['code']
+    const message = payload?.['message']
+    return { kind: 'error', message: `business error ${String(code ?? '?')}: ${String(message ?? '')}`.trim() }
+  }
+  // 结束帧。
+  if (typeCode === 2003) return { kind: 'done' }
+  // 非文本帧。
+  if (typeCode !== 2001) return undefined
+
+  if (payload?.['is_finish'] === true) return { kind: 'done' }
+
+  // 文本增量：event_data.message.content = "{\"text\":\"...\"}"
+  const message = payload?.['message']
+  if (message === null || typeof message !== 'object') return undefined
+  const content = (message as Record<string, unknown>)['content']
+  const text = textFromContent(content)
+  return text.length === 0 ? undefined : { kind: 'text', text }
+}
+
+/** 从 `content` 里取文本：可能是 `{"text":"..."}` 字符串，也可能已是对象。 */
+function textFromContent(content: unknown): string {
+  if (typeof content === 'string') {
+    if (content.length === 0) return ''
+    try {
+      const parsed = JSON.parse(content) as unknown
+      return textFromContent(parsed)
+    } catch {
+      // 不是 JSON：当作纯文本（少数帧直接给裸文本）。
+      return content
+    }
+  }
+  if (content !== null && typeof content === 'object') {
+    const text = (content as Record<string, unknown>)['text']
+    return typeof text === 'string' ? text : ''
+  }
+  return ''
+}
+
+/** 从一帧 JSON 里抽出所有文本增量（旧结构兜底）。 */
 function extractDeltas(payload: unknown): string {
   if (payload === null || typeof payload !== 'object') return ''
   const record = payload as Record<string, unknown>
@@ -273,13 +365,36 @@ export class DoubaoAdapter extends LlmAdapter {
       throw new LlmError('doubao: no usable credential; log in first', 'MISSING_CREDENTIAL')
     }
 
-    // 组装请求体。字段名照抄 `completion_option` 的形状（观察见报告 §2.2）。
+    /**
+     * 组装请求体。
+     *
+     * ## ⚠️ 2026-11-15 运行时抓包 + 逐字段实测校正
+     *
+     * 用真实登录态对 `/samantha/chat/completion` 做二分探测，得到两条硬结论：
+     *
+     * 1. **id 类字段必须是数字（int64）**，传空字符串会被 proto 解码层直接拒
+     *    成 `400`（响应 `content-type` 为 null、空 body）：
+     *    `conversation_id: ''` / `section_id: ''` / `reply_id: ''` 全部 400，
+     *    而 `conversation_id: 0` / `section_id: 0` / `reply_id: 0` 是 200。
+     * 2. **`message_from` 必须是枚举数字**，传字符串
+     *    `'DesktopAskAssistant'` 同样 400；传 `0/1/2` 是 200。
+     *
+     * 另外：**未知字段会被静默忽略**（试过 20 个候选消息字段名 + 空数组，
+     * 全部 200，错误信息不变），所以「字段名拼错」不会报错 —— 只会表现为
+     * 服务端说「消息列表为空」：
+     * `last: cannot extract the last element of an empty slice`。
+     *
+     * 也就是说：**当前的 400 是类型错，不是形状错**；把类型改对之后，
+     * 服务端的报错会变成「消息为空」，说明还需要正确的消息字段名/形状
+     *（见文件头未知项）。这里不再静默吞掉，让错误如实冒泡。
+     */
     const body = JSON.stringify({
-      // 观察：`conversation_id` / `bot_id` / `section_id` / `local_message_id`
-      // 都是顶层字段；新会话时为空串由服务端创建。
-      conversation_id: '',
-      bot_id: this.product.unverified.botId,
-      section_id: '',
+      // int64：新会话用 0（空串会被 proto 拒成 400，实测）。
+      conversation_id: 0,
+      // 真实主 bot id（抓包得到，见 doubao-product.ts）。
+      bot_id: this.product.botId,
+      section_id: 0,
+      // `local_message_id` 是字符串，空串实测无害（保留）。
       local_message_id: '',
       messages: toWireMessages(options),
       completion_option: {
@@ -288,16 +403,17 @@ export class DoubaoAdapter extends LlmAdapter {
         // 观察：`need_create_conversation` 由是否有本地会话 ID 决定；新会话为 true。
         need_create_conversation: true,
         memory_type: 0,
+        // ⚠️ `event_id` 是字符串（实测字符串无害）。
         event_id: '0',
-        // 观察：桌面端来源标记（见 doubao-product.ts 的警告）。
-        message_from: 'DesktopAskAssistant',
+        // ⚠️ 枚举数字，不是字符串（实测字符串会 400）。
+        message_from: DOUBAO_MESSAGE_FROM_DESKTOP,
       },
       ...options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens },
       ...options.temperature === undefined ? {} : { temperature: options.temperature },
       ...options.stop === undefined || options.stop.length === 0 ? {} : { stop: options.stop },
     })
 
-    const url = `${this.product.apiBase}${withCommonParams(SAMANTHA_CHAT_PATH, this.product)}`
+    const url = `${this.product.apiBase}${withCommonParams(SAMANTHA_CHAT_PATH, this.product, credential.deviceId)}`
     const controller = new AbortController()
     const onAbort = (): void => controller.abort()
     options.signal?.addEventListener('abort', onAbort, { once: true })
@@ -375,21 +491,26 @@ export class DoubaoAdapter extends LlmAdapter {
             throw new LlmError(`doubao: server error: ${frame.data.slice(0, 300)}`, 'PROVIDER')
           }
           /**
-           * `gateway-error` —— **2026-11-14 实测确认的真实事件名**。
+           * ## 真实帧结构（2026-11-15 带登录态实测抓到的完整成功流）
            *
-           * 不带 cookie 直接 POST `/samantha/chat/completion` 得到：
+           * ⚠️ **成功流只有 `data:`，没有 `event:` 行**。此前按 `event: json`
+           * 过滤会让所有内容帧被静默丢弃（表现成"流结束但没有文本"）。
            *
+           * `data` 是 JSON：
+           * ```json
+           * { "event_data": "<JSON 字符串>", "event_id": "2", "event_type": 2001 }
            * ```
-           * event: gateway-error
-           * data: {"code":"Internal","message":"ErrorX:code=710012000 stable=true ..."}
-           * ```
            *
-           * 两点结论：
-           * 1. **这是标准 SSE（`event:` + `data:`）**，与官方解析器的 `case"json"`
-           *    分支配得上 —— 至少错误帧是 JSON；
-           * 2. **不需要 X-Bogus/msToken**：请求已进入业务层（报的是登录态），
-           *    而不是被风控/签名层拒掉。P1 由此得到实测支持（但仍未拿到
-           *    成功流的样本，见文件头未知 #1）。
+           * | event_type | 含义 |
+           * |---|---|
+           * | 2001 | 文本增量（`event_data.message.content` 是 `{"text":"..."}`，`is_delta:true`）|
+           * | 2002 | 会话/消息 id 下发 |
+           * | 2003 | 结束 |
+           * | 2005 | 业务错误（`event_data` 里带 `code`/`message`）|
+           * | 2010 | 意图判定（忽略）|
+           *
+           * 最后一帧（2001 + `is_finish:true`）的 `event_data.tts_content` 是
+           * **完整文本**，可用来校验增量拼接是否完整。
            */
           if (frame.event === 'gateway-error') {
             throw new LlmError(
@@ -398,27 +519,36 @@ export class DoubaoAdapter extends LlmAdapter {
             )
           }
           if (frame.event === DOUBAO_SSE.pb) {
-            // ⚠️ 明确不支持，而不是静默丢帧 —— 见文件头未知 #1。
             throw new LlmError(
-              'doubao: server sent protobuf SSE frames ("event: pb"); this adapter only handles "event: json". '
-              + 'A protobuf schema for the samantha chat stream was not found in pb.desc/pb_server.desc.',
+              'doubao: server sent protobuf SSE frames ("event: pb"); this adapter only handles JSON frames.',
               'UNSUPPORTED_CONTENT',
             )
           }
-          if (frame.event !== DOUBAO_SSE.json) continue
+          // 成功流没有 event 名（默认 message）；只有显式非 json 事件才跳过。
+          if (frame.event !== undefined && frame.event !== '' && frame.event !== DOUBAO_SSE.json) {
+            continue
+          }
+          if (frame.data.length === 0) continue
 
-          let payload: unknown
-          try {
-            payload = JSON.parse(frame.data)
-          } catch {
+          const parsed = parseDoubaoEvent(frame.data)
+          if (parsed === undefined) {
             droppedFrames += 1
             continue
           }
-          const text = extractDeltas(payload)
-          if (text.length === 0) {
-            droppedFrames += 1
+          if (parsed.kind === 'error') {
+            throw new LlmError(
+              `doubao: ${parsed.message}`,
+              isDoubaoAuthError(200, frame.data) ? 'AUTH'
+                : isDoubaoRateLimitError(200, frame.data) ? 'QUOTA_EXCEEDED'
+                  : 'PROVIDER',
+            )
+          }
+          if (parsed.kind === 'done') {
+            sawDone = true
             continue
           }
+          const text = parsed.text
+          if (text.length === 0) continue
           if (!started) {
             started = true
             yield { type: 'block-start', index, blockType: 'text' }
@@ -450,16 +580,61 @@ export class DoubaoAdapter extends LlmAdapter {
   }
 }
 
-/** 把 `GenerateOptions.messages` 转成豆包的线上形状。 */
+/**
+ * 把 `GenerateOptions.messages` 转成豆包的真实线上形状。
+ *
+ * ## ⚠️ 2026-11-15 从 bundle 取证 + 实测验证
+ *
+ * 客户端构造请求体时（`ai-views` 里的 `M`/`N` 函数）用的是：
+ *
+ * ```js
+ * messages: [{ content: JSON.stringify({ text }), content_type, attachments: [], references: [] }]
+ * ```
+ *
+ * 三点与 OpenAI 方言不同，且**每一点都会导致失败**：
+ * 1. **没有 `role` 字段** —— 豆包靠 `content_type` 区分；
+ * 2. `content` 是**JSON 字符串**（`'{"text":"..."}'`），不是裸字符串
+ *    （裸文本会 `invalid character 'ä' looking for beginning of value`）；
+ * 3. 每条必须带 `attachments` 与 `references` 数组。
+ *
+ * `content_type` 取 `2001`（实测可用的文本类型）。
+ *
+ * 多轮对话：豆包这个端点一次只接受当前输入（历史由 `conversation_id` 承载），
+ * 故这里**只发最后一条 user 消息**；system 提示豆包无对应字段，走
+ * `custom_prompt_skill_id`/skill 机制，暂不注入（见文件头限制）。
+ */
 function toWireMessages(options: GenerateOptions): unknown[] {
-  const out: unknown[] = []
-  if (options.system !== undefined && options.system.length > 0) {
-    out.push({ role: 'system', content: options.system })
+  // 取最后一条 user 消息作为本轮输入。
+  let input = ''
+  for (let i = options.messages.length - 1; i >= 0; i -= 1) {
+    const message = options.messages[i] as unknown as Record<string, unknown>
+    if (message['role'] === 'user') {
+      input = contentToText(message['content'])
+      break
+    }
   }
-  for (const message of options.messages) {
-    out.push(message)
+  if (input.length === 0 && options.system !== undefined) input = options.system
+  return [{
+    content: JSON.stringify({ text: input }),
+    content_type: DOUBAO_CONTENT_TYPE_TEXT,
+    attachments: [],
+    references: [],
+  }]
+}
+
+/** 把宿主消息内容（字符串或多段块）拍平成纯文本。 */
+function contentToText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  let text = ''
+  for (const part of content) {
+    if (typeof part === 'string') { text += part; continue }
+    if (part === null || typeof part !== 'object') continue
+    const record = part as Record<string, unknown>
+    const value = record['text']
+    if (typeof value === 'string') text += value
   }
-  return out
+  return text
 }
 
 /** 在 `ctx.llm` 上注册豆包 provider 路由与适配器。 */

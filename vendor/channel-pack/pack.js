@@ -42060,7 +42060,7 @@ var ALICE_CREDIT_TIP_PATH = "/commerce/benefit_supply/credit/get_credit_tip";
 var BOT_LIST_PATH = "/alice/bot/get_bot_list_v2";
 var BOT_LIST_LEGACY_PATH = "/alice/bot/get_bot_list";
 var DOUBAO_FALLBACK_MODELS = [
-  { id: "doubao-seed-1.6", name: "Doubao-Seed-1.6", contextWindow: 256e3, maxTokens: 32e3, supportsImage: true }
+  { id: "doubao", name: "\u8C46\u5305", contextWindow: 256e3, maxTokens: 32e3, supportsImage: true }
 ];
 var DOUBAO = {
   id: "doubao",
@@ -42070,19 +42070,17 @@ var DOUBAO = {
   apiBase: DOUBAO_API_BASE,
   chatPrefix: SAMANTHA_PREFIX,
   pointsPrefix: ALICE_PREFIX,
-  // 观察：`desktop` 端的 UA 由 `mH` 常量拼装，本次未取到字面量。
-  // 先按版本号拼一个保守形态；UA 只是伪装的次要维度（Raccoon 实测该端不校验 UA）。
+  // ⚠️ UA 仍未取到字面量（`mH` 常量在混淆代码里拼装）。UA 是伪装的次要维度。
   userAgent: "DoubaoWork/2.36.7 (Windows)",
   clientVersion: "2.36.7",
   defaultCredentialRef: "DOUBAO_ACCESS_TOKEN",
   fallbackModels: DOUBAO_FALLBACK_MODELS,
-  unverified: {
-    // 以下是形态占位：取证只拿到变量名（sl/sc/sg/bot_id），没拿到字面量。
-    aid: "497858",
-    realAid: "497858",
-    pkgType: "1",
-    botId: ""
-  }
+  // 以下全部来自 2026-11-15 的 CDP 抓包（见 doubao.ts 的 doubaoCommonParams 注释）。
+  aid: "1044603",
+  versionCode: "20800",
+  runtimeVersion: "3.45.1",
+  chromiumVersion: "147.0.7727.149",
+  botId: "7338286299411103781"
 };
 
 // vendor/channel-pack/src/doubao.ts
@@ -42122,21 +42120,32 @@ function doubaoHeaders(credential, product = DOUBAO) {
   };
   return headers;
 }
-function doubaoCommonParams(product = DOUBAO) {
+function doubaoCommonParams(product = DOUBAO, deviceId) {
+  const device = typeof deviceId === "string" && deviceId.length > 0 ? deviceId : "";
   return {
-    // 观察 `di()`：平台声明是 "web"（不是 desktop-*）。
+    version_code: product.versionCode,
+    language: "zh",
     device_platform: "web",
-    doubao_device_platform: "web",
-    aid: product.unverified.aid,
-    real_aid: product.unverified.realAid,
-    pkg_type: product.unverified.pkgType,
-    // 观察：`samantha_web: "1"`、`use-olympus-account: 1` 是固定值。
+    // ⚠️ desktop（不是 web）—— 抓包确认。
+    doubao_device_platform: "desktop",
+    aid: product.aid,
+    real_aid: product.aid,
+    pkg_type: "release_version",
+    ...device === "" ? {} : { device_id: device },
+    pc_version: product.clientVersion,
+    doubao_pc_version: product.clientVersion,
+    region: "CN",
+    sys_region: "CN",
     samantha_web: "1",
+    // ⚠️ desktop（不是 web）—— 抓包确认。
+    web_platform: "desktop",
     "use-olympus-account": "1",
-    // 观察：`is_new_user: "0"` 固定。
-    is_new_user: "0",
-    // 观察：`doubao_pc_version` 由产品版本注入。
-    doubao_pc_version: product.clientVersion
+    runtime: "web",
+    runtime_version: product.runtimeVersion,
+    client_platform: "pc_client",
+    chromium_version: product.chromiumVersion,
+    channel: "win",
+    ...device === "" ? {} : { fp: `verify_${device}` }
   };
 }
 function toQueryString(params) {
@@ -42149,11 +42158,14 @@ function toQueryString(params) {
   }
   return parts.join("&");
 }
-function withCommonParams(path3, product = DOUBAO) {
-  const query = toQueryString(doubaoCommonParams(product));
+function withCommonParams(path3, product = DOUBAO, deviceId) {
+  const query = toQueryString(doubaoCommonParams(product, deviceId));
   if (query.length === 0) return path3;
   return path3.includes("?") ? `${path3}&${query}` : `${path3}?${query}`;
 }
+var DOUBAO_MESSAGE_FROM_DESKTOP = 0;
+var DOUBAO_CONTENT_TYPE_TEXT = 2001;
+var DOUBAO_ACTIVITY_GRANT_SIZE = 200;
 function parseSseBlock(block) {
   let event = "";
   const dataLines = [];
@@ -42198,6 +42210,15 @@ var DOUBAO_LOGIN_INVALID_CODES = Object.freeze([
   // 实测（chat SSE gateway-error）：未登录/登录态缺失
   710012e3
 ]);
+var DOUBAO_RATE_LIMIT_CODES = Object.freeze([710022004]);
+function isDoubaoRateLimitError(status, body) {
+  if (status === 429) return true;
+  const text = String(body ?? "");
+  for (const code of DOUBAO_RATE_LIMIT_CODES) {
+    if (text.includes(String(code))) return true;
+  }
+  return /rate limited|too many requests|限流|请求过于频繁/i.test(text);
+}
 function isDoubaoAuthError(status, body) {
   if (status === 401 || status === 403) return true;
   const text = String(body ?? "");
@@ -42219,7 +42240,7 @@ async function post(credential, path3, body, product, fetchImpl) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DOUBAO_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetchImpl(`${product.apiBase}${withCommonParams(path3, product)}`, {
+    const response = await fetchImpl(`${product.apiBase}${withCommonParams(path3, product, credential.deviceId)}`, {
       method: "POST",
       headers: doubaoHeaders(credential, product),
       body: JSON.stringify(body ?? {}),
@@ -42401,7 +42422,7 @@ async function fetchDoubaoCreditBalance(credential, product = DOUBAO, fetchImpl 
   if (!Array.isArray(rows)) return void 0;
   const now = Date.now();
   const packages = [];
-  let remainingPercentSum = 0;
+  let remainingSum = 0;
   let activeCount = 0;
   for (const row of rows) {
     const display = pick(row, ["display"]);
@@ -42409,16 +42430,17 @@ async function fetchDoubaoCreditBalance(credential, product = DOUBAO, fetchImpl 
     const endTime = pick(row, ["end_time", "subscription_end_time"]);
     const endMs = typeof endTime === "number" ? endTime > 1e12 ? endTime : endTime * 1e3 : 0;
     const usedRaw = pick(row, ["total_used_percent"]);
-    const used = typeof usedRaw === "number" ? Math.max(0, Math.min(100, usedRaw)) : 0;
-    const remaining = Math.max(0, 100 - used);
+    const usedPercent = typeof usedRaw === "number" ? Math.max(0, Math.min(100, usedRaw)) : 0;
     const active = endMs === 0 || endMs > now;
+    const packageTotal = DOUBAO_ACTIVITY_GRANT_SIZE;
+    const used = Math.round(packageTotal * usedPercent / 100);
+    const remaining = Math.max(0, packageTotal - used);
     const baseName = typeof title === "string" && title.length > 0 ? title : "\u6D3B\u52A8\u8D60\u9001\u989D\u5EA6";
     packages.push({
       name: endMs === 0 ? baseName : `${baseName}\uFF08${formatShortDate(endMs)} \u5230\u671F\uFF09`,
-      // 单位如实标成百分比：绝对额度值确实不在接口响应里。
-      unit: "%",
+      unit: "credit",
       remaining,
-      total: 100,
+      total: packageTotal,
       used,
       active,
       cycleStartTime: "",
@@ -42426,15 +42448,14 @@ async function fetchDoubaoCreditBalance(credential, product = DOUBAO, fetchImpl 
       expiredTime: ""
     });
     if (active) {
-      remainingPercentSum += remaining;
+      remainingSum += remaining;
       activeCount += 1;
     }
   }
   if (packages.length === 0) {
     return { total: 0, packages: [], expiredTotal: 0 };
   }
-  const total = activeCount === 0 ? 0 : Math.round(remainingPercentSum / activeCount);
-  return { total, packages, expiredTotal: 0 };
+  return { total: remainingSum, packages, expiredTotal: 0 };
 }
 function formatShortDate(ms) {
   const date = new Date(ms);
@@ -42456,14 +42477,14 @@ async function fetchDoubaoModels(credential, product = DOUBAO, fetchImpl = fetch
   for (const path3 of [BOT_LIST_PATH, BOT_LIST_LEGACY_PATH]) {
     let result;
     try {
-      result = await post(credential, path3, {}, product, fetchImpl);
+      result = await post(credential, path3, { bot_id_list: [product.botId], scene: "default" }, product, fetchImpl);
     } catch {
       continue;
     }
     if (!result.ok || !businessOk(result.payload)) continue;
     const data = unwrapData(result.payload);
     if (data === null || typeof data !== "object") continue;
-    const rows = pick(data, ["bot_list", "bots", "list", "items", "data"]);
+    const rows = Array.isArray(data) ? data : pick(data, ["bot_list", "bots", "list", "items"]);
     if (!Array.isArray(rows)) continue;
     for (const row of rows) {
       const id = pick(row, ["bot_id", "botId", "id"]);
@@ -42971,41 +42992,55 @@ function normalizeCookieInput(raw) {
 
 // vendor/channel-pack/src/doubao-adapter.ts
 import { LlmAdapter as LlmAdapter7, LlmError as LlmError12 } from "@deepseek-ai/dsh-llm";
-function extractTextDelta(item) {
-  if (item === null || typeof item !== "object") return "";
-  const record = item;
-  for (const key of ["content", "text", "delta", "answer"]) {
-    const value = record[key];
-    if (typeof value === "string" && value.length > 0) return value;
-    if (value !== null && typeof value === "object") {
-      const nested = value;
-      for (const inner of ["text", "content", "delta"]) {
-        const innerValue = nested[inner];
-        if (typeof innerValue === "string" && innerValue.length > 0) return innerValue;
-      }
+function parseDoubaoEvent(raw) {
+  let outer;
+  try {
+    outer = JSON.parse(raw);
+  } catch {
+    return void 0;
+  }
+  if (outer === null || typeof outer !== "object") return void 0;
+  const record = outer;
+  const type = record["event_type"];
+  const typeCode = typeof type === "number" ? type : Number(type);
+  let data = record["event_data"];
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      return void 0;
     }
+  }
+  const payload = data !== null && typeof data === "object" ? data : void 0;
+  if (typeCode === 2005) {
+    const code = payload?.["code"];
+    const message2 = payload?.["message"];
+    return { kind: "error", message: `business error ${String(code ?? "?")}: ${String(message2 ?? "")}`.trim() };
+  }
+  if (typeCode === 2003) return { kind: "done" };
+  if (typeCode !== 2001) return void 0;
+  if (payload?.["is_finish"] === true) return { kind: "done" };
+  const message = payload?.["message"];
+  if (message === null || typeof message !== "object") return void 0;
+  const content = message["content"];
+  const text = textFromContent(content);
+  return text.length === 0 ? void 0 : { kind: "text", text };
+}
+function textFromContent(content) {
+  if (typeof content === "string") {
+    if (content.length === 0) return "";
+    try {
+      const parsed = JSON.parse(content);
+      return textFromContent(parsed);
+    } catch {
+      return content;
+    }
+  }
+  if (content !== null && typeof content === "object") {
+    const text = content["text"];
+    return typeof text === "string" ? text : "";
   }
   return "";
-}
-function extractDeltas(payload) {
-  if (payload === null || typeof payload !== "object") return "";
-  const record = payload;
-  const list = record["message_list"];
-  if (!Array.isArray(list)) {
-    return extractTextDelta(record);
-  }
-  let text = "";
-  for (const item of list) {
-    const itemRecord = item !== null && typeof item === "object" ? item : void 0;
-    if (itemRecord !== void 0) {
-      const kind = itemRecord["event_type"] ?? itemRecord["type"];
-      if (typeof kind === "string" && kind.length > 0 && !/message|text|content/i.test(kind)) {
-        continue;
-      }
-    }
-    text += extractTextDelta(item);
-  }
-  return text;
 }
 var DoubaoAdapter = class extends LlmAdapter7 {
   constructor(options) {
@@ -43112,11 +43147,12 @@ var DoubaoAdapter = class extends LlmAdapter7 {
       throw new LlmError12("doubao: no usable credential; log in first", "MISSING_CREDENTIAL");
     }
     const body = JSON.stringify({
-      // 观察：`conversation_id` / `bot_id` / `section_id` / `local_message_id`
-      // 都是顶层字段；新会话时为空串由服务端创建。
-      conversation_id: "",
-      bot_id: this.product.unverified.botId,
-      section_id: "",
+      // int64：新会话用 0（空串会被 proto 拒成 400，实测）。
+      conversation_id: 0,
+      // 真实主 bot id（抓包得到，见 doubao-product.ts）。
+      bot_id: this.product.botId,
+      section_id: 0,
+      // `local_message_id` 是字符串，空串实测无害（保留）。
       local_message_id: "",
       messages: toWireMessages(options),
       completion_option: {
@@ -43125,15 +43161,16 @@ var DoubaoAdapter = class extends LlmAdapter7 {
         // 观察：`need_create_conversation` 由是否有本地会话 ID 决定；新会话为 true。
         need_create_conversation: true,
         memory_type: 0,
+        // ⚠️ `event_id` 是字符串（实测字符串无害）。
         event_id: "0",
-        // 观察：桌面端来源标记（见 doubao-product.ts 的警告）。
-        message_from: "DesktopAskAssistant"
+        // ⚠️ 枚举数字，不是字符串（实测字符串会 400）。
+        message_from: DOUBAO_MESSAGE_FROM_DESKTOP
       },
       ...options.maxTokens === void 0 ? {} : { max_tokens: options.maxTokens },
       ...options.temperature === void 0 ? {} : { temperature: options.temperature },
       ...options.stop === void 0 || options.stop.length === 0 ? {} : { stop: options.stop }
     });
-    const url = `${this.product.apiBase}${withCommonParams(SAMANTHA_CHAT_PATH, this.product)}`;
+    const url = `${this.product.apiBase}${withCommonParams(SAMANTHA_CHAT_PATH, this.product, credential.deviceId)}`;
     const controller = new AbortController();
     const onAbort = () => controller.abort();
     options.signal?.addEventListener("abort", onAbort, { once: true });
@@ -43206,23 +43243,31 @@ var DoubaoAdapter = class extends LlmAdapter7 {
           }
           if (frame.event === DOUBAO_SSE.pb) {
             throw new LlmError12(
-              'doubao: server sent protobuf SSE frames ("event: pb"); this adapter only handles "event: json". A protobuf schema for the samantha chat stream was not found in pb.desc/pb_server.desc.',
+              'doubao: server sent protobuf SSE frames ("event: pb"); this adapter only handles JSON frames.',
               "UNSUPPORTED_CONTENT"
             );
           }
-          if (frame.event !== DOUBAO_SSE.json) continue;
-          let payload;
-          try {
-            payload = JSON.parse(frame.data);
-          } catch {
+          if (frame.event !== void 0 && frame.event !== "" && frame.event !== DOUBAO_SSE.json) {
+            continue;
+          }
+          if (frame.data.length === 0) continue;
+          const parsed = parseDoubaoEvent(frame.data);
+          if (parsed === void 0) {
             droppedFrames += 1;
             continue;
           }
-          const text = extractDeltas(payload);
-          if (text.length === 0) {
-            droppedFrames += 1;
+          if (parsed.kind === "error") {
+            throw new LlmError12(
+              `doubao: ${parsed.message}`,
+              isDoubaoAuthError(200, frame.data) ? "AUTH" : isDoubaoRateLimitError(200, frame.data) ? "QUOTA_EXCEEDED" : "PROVIDER"
+            );
+          }
+          if (parsed.kind === "done") {
+            sawDone = true;
             continue;
           }
+          const text = parsed.text;
+          if (text.length === 0) continue;
           if (!started) {
             started = true;
             yield { type: "block-start", index, blockType: "text" };
@@ -43249,14 +43294,37 @@ var DoubaoAdapter = class extends LlmAdapter7 {
   }
 };
 function toWireMessages(options) {
-  const out = [];
-  if (options.system !== void 0 && options.system.length > 0) {
-    out.push({ role: "system", content: options.system });
+  let input = "";
+  for (let i = options.messages.length - 1; i >= 0; i -= 1) {
+    const message = options.messages[i];
+    if (message["role"] === "user") {
+      input = contentToText5(message["content"]);
+      break;
+    }
   }
-  for (const message of options.messages) {
-    out.push(message);
+  if (input.length === 0 && options.system !== void 0) input = options.system;
+  return [{
+    content: JSON.stringify({ text: input }),
+    content_type: DOUBAO_CONTENT_TYPE_TEXT,
+    attachments: [],
+    references: []
+  }];
+}
+function contentToText5(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  let text = "";
+  for (const part of content) {
+    if (typeof part === "string") {
+      text += part;
+      continue;
+    }
+    if (part === null || typeof part !== "object") continue;
+    const record = part;
+    const value = record["text"];
+    if (typeof value === "string") text += value;
   }
-  return out;
+  return text;
 }
 function registerDoubaoLlm(ctx, options) {
   const product = options.product ?? DOUBAO;
@@ -64081,7 +64149,7 @@ async function partsFromContent(content, bridge, limits) {
   }
   return blocks;
 }
-function textFromContent(content) {
+function textFromContent2(content) {
   if (typeof content === "string") return content;
   if (content === null || content === void 0) return "";
   if (!Array.isArray(content)) {
@@ -64141,14 +64209,14 @@ async function convertMessage(raw, provider, model, bridge, limits) {
   if (role === "system") {
     return createGatewayMessage("system", [{
       type: "text",
-      text: textFromContent(value.content)
+      text: textFromContent2(value.content)
     }], gatewaySource());
   }
   if (role === "user") {
     return createGatewayMessage("user", await partsFromContent(value.content, bridge, limits), { kind: "user" });
   }
   if (role === "assistant") {
-    const text = textFromContent(value.content);
+    const text = textFromContent2(value.content);
     const content = [];
     const reasoning = inboundReasoning(value);
     if (reasoning !== void 0) content.push({ type: "reasoning", text: reasoning });
@@ -64710,14 +64778,14 @@ async function toMessages(input, provider, model, bridge, limits) {
         continue;
       }
       if (raw.role === "assistant") {
-        const text = textFromContent(content);
+        const text = textFromContent2(content);
         pushAssistant(text.length > 0 ? [{ type: "text", text }] : []);
         continue;
       }
       if (raw.role === "system" || raw.role === "developer") {
         messages.push(createGatewayMessage("system", [{
           type: "text",
-          text: textFromContent(content)
+          text: textFromContent2(content)
         }], gatewaySource()));
         continue;
       }

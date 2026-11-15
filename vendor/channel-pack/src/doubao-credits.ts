@@ -42,6 +42,7 @@ import {
   type DoubaoProduct,
 } from './doubao-product.js'
 import {
+  DOUBAO_ACTIVITY_GRANT_SIZE,
   DOUBAO_REQUEST_TIMEOUT_MS,
   doubaoHeaders,
   isDoubaoAuthError,
@@ -71,7 +72,7 @@ async function post(
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), DOUBAO_REQUEST_TIMEOUT_MS)
   try {
-    const response = await fetchImpl(`${product.apiBase}${withCommonParams(path, product)}`, {
+    const response = await fetchImpl(`${product.apiBase}${withCommonParams(path, product, credential.deviceId)}`, {
       method: 'POST',
       headers: doubaoHeaders(credential, product),
       body: JSON.stringify(body ?? {}),
@@ -365,7 +366,7 @@ export async function fetchDoubaoCreditBalance(
 
   const now = Date.now()
   const packages: CreditPackage[] = []
-  let remainingPercentSum = 0
+  let remainingSum = 0
   let activeCount = 0
 
   for (const row of rows) {
@@ -378,17 +379,20 @@ export async function fetchDoubaoCreditBalance(
       ? (endTime > 1e12 ? endTime : endTime * 1000)
       : 0
     const usedRaw = pick(row, ['total_used_percent'])
-    const used = typeof usedRaw === 'number' ? Math.max(0, Math.min(100, usedRaw)) : 0
-    const remaining = Math.max(0, 100 - used)
+    const usedPercent = typeof usedRaw === 'number' ? Math.max(0, Math.min(100, usedRaw)) : 0
     const active = endMs === 0 || endMs > now
+
+    // 服务端只给百分比 ⇒ 用观察到的单包额度换算成绝对值（见常量注释）。
+    const packageTotal = DOUBAO_ACTIVITY_GRANT_SIZE
+    const used = Math.round(packageTotal * usedPercent / 100)
+    const remaining = Math.max(0, packageTotal - used)
 
     const baseName = typeof title === 'string' && title.length > 0 ? title : '活动赠送额度'
     packages.push({
       name: endMs === 0 ? baseName : `${baseName}（${formatShortDate(endMs)} 到期）`,
-      // 单位如实标成百分比：绝对额度值确实不在接口响应里。
-      unit: '%',
+      unit: 'credit',
       remaining,
-      total: 100,
+      total: packageTotal,
       used,
       active,
       cycleStartTime: '',
@@ -396,7 +400,7 @@ export async function fetchDoubaoCreditBalance(
       expiredTime: '',
     })
     if (active) {
-      remainingPercentSum += remaining
+      remainingSum += remaining
       activeCount += 1
     }
   }
@@ -406,17 +410,9 @@ export async function fetchDoubaoCreditBalance(
     return { total: 0, packages: [], expiredTotal: 0 }
   }
 
-  /**
-   * 顶层 `total` = **有效包的剩余百分比均值**。
-   *
-   * 为什么取均值而不是求和：每个包是独立额度池，求和会得到 200%（两包全新）
-   * 这种没有意义的数字；均值给出「整体还剩几成」，配 `unit: '%'` 读作
-   * 「剩余 100 %」= 全部未用，语义正确。
-   */
-  const total = activeCount === 0
-    ? 0
-    : Math.round(remainingPercentSum / activeCount)
-  return { total, packages, expiredTotal: 0 }
+  // 顶层 total = 有效包的剩余额度之和，与客户端「可用额度」口径一致
+  //（两包各 200 且未使用 ⇒ 400）。
+  return { total: remainingSum, packages, expiredTotal: 0 }
 }
 
 /** `MM-DD`（本地时区），用于额度包到期提示。 */
@@ -472,7 +468,7 @@ export async function fetchDoubaoModels(
   for (const path of [BOT_LIST_PATH, BOT_LIST_LEGACY_PATH]) {
     let result: PostResult
     try {
-      result = await post(credential, path, {}, product, fetchImpl)
+      result = await post(credential, path, { bot_id_list: [product.botId], scene: 'default' }, product, fetchImpl)
     } catch {
       continue
     }
@@ -481,7 +477,10 @@ export async function fetchDoubaoModels(
     const data = unwrapData(result.payload)
     if (data === null || typeof data !== 'object') continue
 
-    const rows = pick(data, ['bot_list', 'bots', 'list', 'items', 'data'])
+    // 实测：该端点 `data` 直接是数组（lookup by id，不枚举）。
+    const rows = Array.isArray(data)
+      ? data
+      : pick(data, ['bot_list', 'bots', 'list', 'items'])
     if (!Array.isArray(rows)) continue
     for (const row of rows) {
       const id = pick(row, ['bot_id', 'botId', 'id'])

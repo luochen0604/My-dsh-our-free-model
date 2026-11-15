@@ -68,6 +68,13 @@ export interface DoubaoCredential {
    */
   lastVerifiedAt: number
   /**
+   * 设备号（豆包侧的 `device_id`）。
+   *
+   * 从 `LARK_SUITE_ACCESS_TOKEN` JWT 的 payload 解出
+   *（见 `extractDeviceIdFromCookie`）。缺省时公共 query 里省略该字段。
+   */
+  deviceId?: string
+  /**
    * 是否判定为桌面端来源会话。
    *
    * `false` 表示这是网页扫码得来的 cookie（`message_from` 不会带桌面标记），
@@ -144,21 +151,65 @@ export function doubaoHeaders(credential: DoubaoCredential | undefined, product:
  * ⚠️ 三个未验证值（`aid` / `real_aid` / `pkg_type`）来自 `product.unverified`，
  * 已在 `doubao-product.ts` 里标注为占位。
  */
-export function doubaoCommonParams(product: DoubaoProduct = DOUBAO): Record<string, string> {
+/**
+ * 公共 query 参数。
+ *
+ * ## ⚠️ 2026-11-15 运行时抓包校正（关键）
+ *
+ * 用 CDP 记录客户端真实请求，拿到**逐字符准确**的参数集。此前凭静态分析
+ * 猜的那套（`doubao_device_platform=web`、`aid=497858`、`pkg_type=1`、
+ * 缺 `runtime`/`pc_version`/`fp` 等）与真实请求差距很大 —— 这也是
+ * `/samantha/chat/completion` 返回 400 的直接原因之一。
+ *
+ * 真实请求（以 `/samantha/skill/list` 为例，未带签名参数）：
+ *
+ * ```text
+ * version_code=20800&language=zh&device_platform=web
+ * &doubao_device_platform=desktop&aid=1044603&real_aid=1044603
+ * &pkg_type=release_version&device_id=<device_id>&pc_version=2.36.7
+ * &doubao_pc_version=2.36.7&region=CN&sys_region=CN&samantha_web=1
+ * &web_platform=desktop&use-olympus-account=1&runtime=web
+ * &runtime_version=<version>&client_platform=pc_client
+ * &chromium_version=<chrome>&channel=win&fp=verify_<device_id>
+ * &web_tab_id=<uuid>
+ * ```
+ *
+ * ⚠️ `device_platform` 仍是 `web`，但 **`doubao_device_platform=desktop`**
+ * 且 **`web_platform=desktop`** —— 两者不同名、值也不同，之前只抄了一个。
+ *
+ * ⚠️ `device_id` 必须来自真实客户端（设置页「Device id:」或 cookie 侧），
+ * 写死别人的值会被判定为设备不一致。这里由 credential 注入，拿不到就
+ * 退化为 `fp=verify_` 空值（服务端多数端点仍可通，见测试）。
+ */
+export function doubaoCommonParams(
+  product: DoubaoProduct = DOUBAO,
+  deviceId?: string,
+): Record<string, string> {
+  const device = typeof deviceId === 'string' && deviceId.length > 0 ? deviceId : ''
   return {
-    // 观察 `di()`：平台声明是 "web"（不是 desktop-*）。
+    version_code: product.versionCode,
+    language: 'zh',
     device_platform: 'web',
-    doubao_device_platform: 'web',
-    aid: product.unverified.aid,
-    real_aid: product.unverified.realAid,
-    pkg_type: product.unverified.pkgType,
-    // 观察：`samantha_web: "1"`、`use-olympus-account: 1` 是固定值。
-    samantha_web: '1',
-    'use-olympus-account': '1',
-    // 观察：`is_new_user: "0"` 固定。
-    is_new_user: '0',
-    // 观察：`doubao_pc_version` 由产品版本注入。
+    // ⚠️ desktop（不是 web）—— 抓包确认。
+    doubao_device_platform: 'desktop',
+    aid: product.aid,
+    real_aid: product.aid,
+    pkg_type: 'release_version',
+    ...device === '' ? {} : { device_id: device },
+    pc_version: product.clientVersion,
     doubao_pc_version: product.clientVersion,
+    region: 'CN',
+    sys_region: 'CN',
+    samantha_web: '1',
+    // ⚠️ desktop（不是 web）—— 抓包确认。
+    web_platform: 'desktop',
+    'use-olympus-account': '1',
+    runtime: 'web',
+    runtime_version: product.runtimeVersion,
+    client_platform: 'pc_client',
+    chromium_version: product.chromiumVersion,
+    channel: 'win',
+    ...device === '' ? {} : { fp: `verify_${device}` },
   }
 }
 
@@ -175,10 +226,81 @@ export function toQueryString(params: Record<string, string | number | boolean |
 }
 
 /** 给一个路径加上公共 query。 */
-export function withCommonParams(path: string, product: DoubaoProduct = DOUBAO): string {
-  const query = toQueryString(doubaoCommonParams(product))
+export function withCommonParams(
+  path: string,
+  product: DoubaoProduct = DOUBAO,
+  deviceId?: string,
+): string {
+  const query = toQueryString(doubaoCommonParams(product, deviceId))
   if (query.length === 0) return path
   return path.includes('?') ? `${path}&${query}` : `${path}?${query}`
+}
+
+/**
+ * `completion_option.message_from` 的桌面端取值。
+ *
+ * ## ⚠️ 必须是**数字枚举**，不是字符串（2026-11-15 实测）
+ *
+ * 传 `'DesktopAskAssistant'` 会让 `/samantha/chat/completion` 直接返回
+ * `400`（`content-type` 为 null、空 body）—— 这是 proto 解码层的类型拒绝。
+ * 传 `0` / `1` / `2` 都是 200。
+ *
+ * 具体哪个数字代表「桌面端」尚未确认（服务端在登录态无效时统一回
+ * `gateway-error`，看不出差异），故先用 `0`（默认枚举值，最保守）。
+ * 该未知项已记入文件头。
+ */
+export const DOUBAO_MESSAGE_FROM_DESKTOP = 0
+
+/**
+ * `messages[].content_type` 的文本取值。
+ *
+ * 实测：`2001` 是文本（成功流里 `input_content_type`/`content_type` 都是 2001）。
+ */
+export const DOUBAO_CONTENT_TYPE_TEXT = 2001
+
+/**
+ * 「活动赠送额度」单包的额度值。
+ *
+ * ## 为什么是个常量（以及它从哪来）
+ *
+ * 服务端（`subscription/overview`、`quota/summary`）**只下发已用百分比**
+ *（`total_used_percent` / `used_percent`），不下发绝对额度值 —— 逐字段实测
+ * 确认，旁路端点（`activity_reward_quota`、`intake/entitlement/query`、
+ * `marketing/card/balance`）也都没有。
+ *
+ * 而客户端设置页「订阅与额度管理」显示绝对值：两个「活动赠送额度」各
+ * `已用 0/200`、顶部「可用额度 400」⇒ **单包 200，两包合计 400**。
+ * 这个 200 是客户端侧的固定发放值。
+ *
+ * 故这里按实观察口径取 200，把服务端百分比换算成绝对值。若将来额度发放
+ * 规则变化（或服务端给出总额字段），应改为以服务端为准。
+ */
+export const DOUBAO_ACTIVITY_GRANT_SIZE = 200
+
+/**
+ * 从凭据 cookie 里尽力提取 `device_id`。
+ *
+ * 豆包把设备号放在 `LARK_SUITE_ACCESS_TOKEN` 这个 JWT 的 payload 里
+ *（实测 `{"device_id":"2029068688324745", ...}`）。取不到就返回 `undefined`，
+ * 公共参数里相应字段会被省略（多数端点仍可通，只是缺少设备一致性声明）。
+ */
+export function extractDeviceIdFromCookie(cookie: string): string | undefined {
+  if (typeof cookie !== 'string' || cookie.length === 0) return undefined
+  const match = /(?:^|;\s*)LARK_SUITE_ACCESS_TOKEN=([^;]+)/.exec(cookie)
+  if (match === null) return undefined
+  const parts = match[1].split('.')
+  if (parts.length < 2) return undefined
+  try {
+    // JWT payload 是 base64url，补齐 padding 后按 UTF-8 解码。
+    const padded = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const json = Buffer.from(padded, 'base64').toString('utf8')
+    const payload = JSON.parse(json) as { device_id?: unknown }
+    return typeof payload.device_id === 'string' && payload.device_id.length > 0
+      ? payload.device_id
+      : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -277,6 +399,23 @@ export const DOUBAO_LOGIN_INVALID_CODES: readonly number[] = Object.freeze([
   // 实测（chat SSE gateway-error）：未登录/登录态缺失
   710012000,
 ])
+
+/**
+ * 限流 / 额度耗尽的业务码（实测）。
+ *
+ * `710022004` —— `rate limited`（请求过于频繁）。
+ */
+export const DOUBAO_RATE_LIMIT_CODES: readonly number[] = Object.freeze([710022004])
+
+/** 是否是限流/额度类错误。 */
+export function isDoubaoRateLimitError(status: number, body: string): boolean {
+  if (status === 429) return true
+  const text = String(body ?? '')
+  for (const code of DOUBAO_RATE_LIMIT_CODES) {
+    if (text.includes(String(code))) return true
+  }
+  return /rate limited|too many requests|限流|请求过于频繁/i.test(text)
+}
 
 export function isDoubaoAuthError(status: number, body: string): boolean {
   if (status === 401 || status === 403) return true

@@ -4878,18 +4878,18 @@ window.__ModuleLoader__.load({
       lingxi: { claim: true, status: true, unit: 'points' },
       // 豆包工作：**额度**（产品里叫「额度」，不叫「积分」）。
       //
-      // 2026-11-15 带真实登录态实测：
+      // 2026-11-15 带真实登录态实测（CDP 抓包 + 逐端点验证）：
       // - `POST /alice/commerce/sale/subscription/overview/`
       //   body `{product_line:"membership"}` → `code:0`，返回
       //   `incentive_quota_entitlements[]`（活动赠送额度）与
       //   `current_subscription.display`（「免费体验」）。
-      // - ⚠️ **服务端只给百分比**（`total_used_percent`），没有绝对额度值；
-      //   界面上「可用额度 400 / 已用 0/200」由客户端本地算。
-      //   故这里 `unit: 'percent'`，余额按百分比如实显示，不编造绝对数。
-      // - 签到（`/alice/ug/campaign/landing/*`）仍返回 `710010702 系统错误`：
-      //   缺完整 `AgwCommonParam`，其构造处不在客户端 bundle 里（宿主注入）。
-      //   故**不置 `claim`/`status`** —— 不给用户一个必然失败的按钮。
-      doubao: { unit: 'percent' },
+      // - 服务端只给已用百分比，绝对额度按观察到的单包 200 换算 ⇒ 两包 = 400，
+      //   与客户端设置页口径一致（见 doubao.ts 的 DOUBAO_ACTIVITY_GRANT_SIZE）。
+      // - 签到（`/alice/ug/campaign/landing/*`）需要 `a_bogus` 签名参数
+      //   （抓包确认这些请求带 msToken+a_bogus），且 scene 是
+      //   `pc_incentive_task_mvp_v3`。签名未移植，故暂不置 claim/status ——
+      //   不给用户一个必然失败的按钮。
+      doubao: {},
       gemini: { unit: 'quota', quota: true },
     }
 
