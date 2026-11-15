@@ -92,6 +92,17 @@ export const SAMANTHA_CONVERSATION_LIST_PATH = '/samantha/conversation/list'
 export const BOT_LIST_PATH = '/alice/bot/get_bot_list_v2'
 /** bot 目录（旧版，作为备用）。 */
 export const BOT_LIST_LEGACY_PATH = '/alice/bot/get_bot_list'
+
+/**
+ * 模型选择器配置端点（**2026-11-15 CDP 抓包确认**）。
+ *
+ * 返回 `data.entry_list[].active_switch_conf.menu_conf_v2.model_list.item_list[]`，
+ * 每项 `{ item_id, model_item_key, name }` —— 就是客户端「模型」下拉里的那一列。
+ *
+ * ⚠️ 这是**唯一**能拿到完整模型列表的地方：`bot/get_bot`、`slot/input/list`、
+ * `get_bot_list_v2` 都没有；点开下拉也不发新请求（冷启动就加载了）。
+ */
+export const ACTION_BAR_BRIEF_PATH = '/alice/slot/action_bar_v3/brief_list'
 /** 线程创建（观察：`/samantha/thread/create_or_get`）。 */
 export const SAMANTHA_THREAD_PATH = '/samantha/thread/create_or_get'
 
@@ -139,16 +150,39 @@ export interface DoubaoFallbackModel {
 /**
  * 兜底模型表。
  *
- * ⚠️ **实测只有这一个能确认**：`POST /alice/bot/get_bot_list_v2`
- * 传 `{ bot_id_list: [<主 bot>], scene: "default" }` 返回
- * `code:0` + `[{id:"7338286299411103781", name:"豆包"}]` —— 该端点按 id **查**，
- * 不枚举，所以拿不到客户端模型选择器里那一整列。
+ * ## 来源：2026-11-15 CDP 抓包取到的真实目录
  *
- * 模型选择器的完整目录需要一个「枚举」端点（尚未定位）；在找到之前这里如实
- * 只声明「豆包」一个，**不编造型号**。
+ * 这是客户端「模型」下拉里的那一列（`action_bar_v3/brief_list` 的
+ * `menu_conf_v2.model_list.item_list`）。真实值，**不是编造**。
+ *
+ * `fallback` 的含义：正常路径下适配器会**动态**从 `fetchRemoteModels()` 拉最新
+ * 列表；这份表只在拉取失败时兜底（未登录/网络异常/形状变化），
+ * 保证模型选择器不会因为一次抖动而整个消失。
+ *
+ * | id | 显示名 |
+ * |---|---|
+ * | `9` | 自动 |
+ * | `seed-lite-7b` | 豆包 2.1 Lite |
+ * | `5` | 豆包 2.1 Pro |
+ * | `person-deepseek-v4-1-flash-261017` | DeepSeek V4.1 Flash |
+ * | `person-kimi-k3-1-pro-261111` | Kimi K3.1 Pro |
+ * | `person-kimi-k3-1-pro-highspeed-261111` | Kimi K3.1 Pro 高速 |
+ * | `person-kimi-k3-261111` | Kimi K3 |
+ * | `person-glm-5-3-261111` | GLM 5.3 |
+ * | `person-glm-5-3-flash-261111` | GLM 5.3 Flash |
+ * | `person-deepseek-v4-pro-ga-260813` | DeepSeek V4 Pro |
  */
 const DOUBAO_FALLBACK_MODELS: readonly DoubaoFallbackModel[] = [
-  { id: 'doubao', name: '豆包', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
+  { id: '9', name: '自动', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
+  { id: 'seed-lite-7b', name: '豆包 2.1 Lite', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
+  { id: '5', name: '豆包 2.1 Pro', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
+  { id: 'person-deepseek-v4-1-flash-261017', name: 'DeepSeek V4.1 Flash', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-kimi-k3-1-pro-261111', name: 'Kimi K3.1 Pro', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-kimi-k3-1-pro-highspeed-261111', name: 'Kimi K3.1 Pro 高速', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-kimi-k3-261111', name: 'Kimi K3', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-glm-5-3-261111', name: 'GLM 5.3', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-glm-5-3-flash-261111', name: 'GLM 5.3 Flash', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-deepseek-v4-pro-ga-260813', name: 'DeepSeek V4 Pro', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
 ]
 
 /** 豆包工作产品配置。 */

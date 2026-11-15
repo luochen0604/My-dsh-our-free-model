@@ -308,14 +308,21 @@ export const DOUBAO_DEFAULT_MODE_ID = '3'
 /**
  * 把宿主的模型 id 解析成 `model_item_key`。
  *
- * 约定：模型 id 形如 `doubao`（默认）或 `doubao-<key>`（指定 key），
- * 这样将来拿到完整 key 表时，无需改代码即可暴露多个模型。
+ * ## 2026-11-15 抓包取证后简化
+ *
+ * 模型的真实标识就是 `model_item_key` 本身，抓到的合法值形如
+ * `9`（自动）、`5`（豆包 2.1 Pro）、`seed-lite-7b`（豆包 2.1 Lite）、
+ * `person-deepseek-v4-1-flash-261017`、`person-kimi-k3-261111` 等。
+ *
+ * 因此约定：**适配器暴露的模型 id 直接等于 `model_item_key`**，
+ * 这里原样透传即可。只有 `undefined`/空串才回退默认 `9`。
+ *
+ * （不再需要 `doubao-<key>` 那种前缀约定 —— 那是我在没有真实 key 表时的临时设计。）
  */
 export function resolveDoubaoModelItemKey(model: string | undefined): string {
   if (typeof model !== 'string') return DOUBAO_DEFAULT_MODEL_ITEM_KEY
-  const match = /^doubao-([A-Za-z0-9_]+)$/.exec(model)
-  if (match !== null) return match[1]
-  return DOUBAO_DEFAULT_MODEL_ITEM_KEY
+  const trimmed = model.trim()
+  return trimmed.length === 0 ? DOUBAO_DEFAULT_MODEL_ITEM_KEY : trimmed
 }
 
 /** 思考强度：宿主传数字/字符串时归一成抓包口径的字符串。 */

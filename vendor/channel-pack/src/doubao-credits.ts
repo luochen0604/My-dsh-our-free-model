@@ -28,6 +28,7 @@
  */
 
 import {
+  ACTION_BAR_BRIEF_PATH,
   ALICE_CAMPAIGN_LANDING_PATH,
   ALICE_CHECKIN_PATH,
   ALICE_CLAIM_PATH,
@@ -541,42 +542,102 @@ export async function probeDoubaoCredential(
  *
  * @returns 空数组表示"拿不到"（未登录 / 形状不符 / 网络异常），不是"没有模型"。
  */
+/**
+ * 拉取豆包的**真实模型目录**（客户端「模型」下拉里的那一列）。
+ *
+ * ## 端点（2026-11-15 CDP 抓包确认）
+ *
+ * `POST /alice/slot/action_bar_v3/brief_list`
+ * body `{ bot_id, language_code: "zh" }`
+ *
+ * 模型列表在：
+ * `data.entry_list[].active_switch_conf.menu_conf_v2.model_list.item_list[]`
+ * 每项 `{ item_id, model_item_key, name }`。
+ *
+ * 实测拿到的目录（10 项）：
+ *
+ * | model_item_key | name |
+ * |---|---|
+ * | `9` | 自动 |
+ * | `seed-lite-7b` | 豆包 2.1 Lite |
+ * | `5` | 豆包 2.1 Pro |
+ * | `person-deepseek-v4-1-flash-261017` | DeepSeek V4.1 Flash |
+ * | `person-kimi-k3-1-pro-261111` | Kimi K3.1 Pro |
+ * | `person-kimi-k3-1-pro-highspeed-261111` | Kimi K3.1 Pro 高速 |
+ * | `person-kimi-k3-261111` | Kimi K3 |
+ * | `person-glm-5-3-261111` | GLM 5.3 |
+ * | `person-glm-5-3-flash-261111` | GLM 5.3 Flash |
+ * | `person-deepseek-v4-pro-ga-260813` | DeepSeek V4 Pro |
+ *
+ * ⚠️ 这是**唯一**能拿到完整列表的地方：`bot/get_bot`、`slot/input/list`、
+ * `get_bot_list_v2` 都没有；点开下拉也不发新请求（冷启动就加载了）。
+ *
+ * @returns 空数组表示"拿不到"（未登录/形状变化/网络异常），调用方回退兜底表。
+ */
 export async function fetchDoubaoModels(
   credential: DoubaoCredential,
   product: DoubaoProduct = DOUBAO,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Array<{ id: string; name: string }>> {
+  let result: PostResult
+  try {
+    result = await post(
+      credential,
+      ACTION_BAR_BRIEF_PATH,
+      { bot_id: product.botId, language_code: 'zh' },
+      product,
+      fetchImpl,
+    )
+  } catch {
+    return []
+  }
+  if (!result.ok || !businessOk(result.payload)) return []
+
+  const data = unwrapData(result.payload)
+  if (data === null || typeof data !== 'object') return []
+
   const out: Array<{ id: string; name: string }> = []
   const seen = new Set<string>()
-  for (const path of [BOT_LIST_PATH, BOT_LIST_LEGACY_PATH]) {
-    let result: PostResult
-    try {
-      result = await post(credential, path, { bot_id_list: [product.botId], scene: 'default' }, product, fetchImpl)
-    } catch {
-      continue
+  const collect = (modelList: unknown): void => {
+    if (modelList === null || typeof modelList !== 'object') return
+    const items = pick(modelList, ['item_list'])
+    if (!Array.isArray(items)) return
+    for (const item of items) {
+      if (item === null || typeof item !== 'object') continue
+      const key = pick(item, ['model_item_key'])
+      const name = pick(item, ['name', 'title', 'text'])
+      if (typeof key !== 'string' || key.length === 0 || seen.has(key)) continue
+      seen.add(key)
+      out.push({ id: key, name: typeof name === 'string' && name.length > 0 ? name : key })
     }
-    if (!result.ok || !businessOk(result.payload)) continue
+  }
 
-    const data = unwrapData(result.payload)
-    if (data === null || typeof data !== 'object') continue
-
-    // 实测：该端点 `data` 直接是数组（lookup by id，不枚举）。
-    const rows = Array.isArray(data)
-      ? data
-      : pick(data, ['bot_list', 'bots', 'list', 'items'])
-    if (!Array.isArray(rows)) continue
-    for (const row of rows) {
-      const id = pick(row, ['bot_id', 'botId', 'id'])
-      const name = pick(row, ['bot_name', 'botName', 'name', 'title'])
-      const idText = typeof id === 'string' ? id : (typeof id === 'number' ? String(id) : '')
-      if (idText.length === 0 || seen.has(idText)) continue
-      seen.add(idText)
-      out.push({ id: idText, name: typeof name === 'string' && name.length > 0 ? name : idText })
+  const entries = pick(data, ['entry_list'])
+  if (!Array.isArray(entries)) return []
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== 'object') continue
+    const conf = pick(entry, ['active_switch_conf'])
+    if (conf === null || typeof conf !== 'object') continue
+    // 主列表。
+    const menuConf = pick(conf, ['menu_conf_v2', 'menu_conf'])
+    if (menuConf !== null && typeof menuConf === 'object') {
+      collect(pick(menuConf, ['model_list']))
+      // 某些模式（如「工作任务」mode_id=3）自带一份列表，一并收集。
+      const modes = pick(menuConf, ['mode_list'])
+      const modeItems = modes !== null && typeof modes === 'object'
+        ? pick(modes, ['item_list']) : undefined
+      if (Array.isArray(modeItems)) {
+        for (const mode of modeItems) {
+          if (mode === null || typeof mode !== 'object') continue
+          collect(pick(mode, ['model_list']))
+        }
+      }
     }
-    if (out.length > 0) return out
+    if (out.length > 0) break
   }
   return out
 }
+
 
 /** 领取任务奖励（观察端点，暂未接入 UI；保留给后续扩展）。 */export async function claimDoubaoCampaignReward(
   credential: DoubaoCredential,
