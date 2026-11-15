@@ -50018,6 +50018,69 @@ function renderRaccoonLoginPage(product, qrCode) {
 // vendor/channel-pack/src/raccoon-desktop-login.ts
 import { createServer as createServer5 } from "node:http";
 import { randomBytes as randomBytes7 } from "node:crypto";
+
+// vendor/channel-pack/src/raccoon-device.ts
+var RACCOON_DESKTOP_PLATFORM = "desktop-windows";
+var DEVICE_ID_SOURCE = "unknown";
+function deviceMetadata(product, credential, hostname, osRelease) {
+  return {
+    client_device_id_source: DEVICE_ID_SOURCE,
+    client_device_id: credential.device_id ?? "",
+    client_platform: RACCOON_DESKTOP_PLATFORM,
+    // 版本号与 `product.clientVersion` 同源：官方这里传的是不带 `v` 的 `1.2.1`。
+    client_version: product.clientVersion.replace(/^v/, ""),
+    device_name: hostname.slice(0, 120),
+    os: "windows",
+    os_version: osRelease,
+    application: "desktop",
+    push_permission: "unknown"
+  };
+}
+async function postDevice(product, credential, path3, body, fetcher) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RACCOON_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetcher(`${product.apiBase}${product.authApiPrefix}${path3}`, {
+      method: "POST",
+      headers: raccoonHeaders(credential, {
+        platform: RACCOON_DESKTOP_PLATFORM,
+        version: product.clientVersion,
+        desktopClient: true
+      }),
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(() => void 0);
+    const record = typeof payload === "object" && payload !== null && !Array.isArray(payload) ? payload : {};
+    const code = typeof record.code === "number" ? record.code : response.ok ? 0 : response.status;
+    const data = typeof record.data === "object" && record.data !== null && !Array.isArray(record.data) ? record.data : void 0;
+    const message = typeof record.message === "string" ? record.message : "";
+    return { ok: code === 0 && response.ok, status: response.status, data, message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function bindRaccoonTrustedDevice(product, credential, options, fetcher = fetch) {
+  const result = await postDevice(
+    product,
+    credential,
+    "/devices_current_bind",
+    deviceMetadata(product, credential, options.hostname, options.osRelease),
+    fetcher
+  );
+  if (!result.ok) {
+    return { deviceId: void 0, trusted: false, failure: result.message.length > 0 ? result.message : `HTTP ${String(result.status)}` };
+  }
+  const deviceId = typeof result.data?.device_id === "string" ? result.data.device_id : void 0;
+  const trusted = result.data?.trusted_device === true;
+  return { deviceId, trusted };
+}
+async function heartbeatRaccoonTrustedDevice(product, credential, fetcher = fetch) {
+  const result = await postDevice(product, credential, "/devices_current_heartbeat", {}, fetcher);
+  return result.ok;
+}
+
+// vendor/channel-pack/src/raccoon-desktop-login.ts
 var RACCOON_DESKTOP_CALLBACK_PATH = "/auth/callback";
 var RACCOON_DESKTOP_APP_NAME = "\u5546\u6C64\u5C0F\u6D63\u718A\u5BA2\u6237\u7AEF";
 function buildRaccoonDesktopAuthorizeUrl(options) {
@@ -50121,6 +50184,24 @@ async function startRaccoonDesktopLogin(options = {}) {
   });
   return { loginUrl: authorizeUrl, result, close };
 }
+async function upgradeToTrustedDesktopSession(product, credential, fetcher) {
+  const { hostname, release } = await import("node:os");
+  try {
+    const bind = await bindRaccoonTrustedDevice(
+      product,
+      credential,
+      { hostname: hostname(), osRelease: release() },
+      fetcher
+    );
+    if (bind.deviceId !== void 0) {
+      await heartbeatRaccoonTrustedDevice(product, credential, fetcher).catch(() => false);
+      return { ...credential, device_id: bind.deviceId };
+    }
+    return credential;
+  } catch {
+    return credential;
+  }
+}
 async function handleCallback(request, response, deps) {
   const localPort = request.socket.localPort ?? 0;
   const url = new URL(request.url ?? "/", `http://127.0.0.1:${localPort}`);
@@ -50139,7 +50220,8 @@ async function handleCallback(request, response, deps) {
     return;
   }
   try {
-    const credential = await exchangeRaccoonAuthorizationCode(deps.product, code, deps.fetcher);
+    const exchanged = await exchangeRaccoonAuthorizationCode(deps.product, code, deps.fetcher);
+    const credential = await upgradeToTrustedDesktopSession(deps.product, exchanged, deps.fetcher);
     deps.settleOk(credential);
     response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(callbackPageHtml(true, "\u5DF2\u5207\u6362\u5230\u684C\u9762\u7AEF\u4F1A\u8BDD\uFF0C\u53EF\u4EE5\u5173\u95ED\u8FD9\u4E2A\u6807\u7B7E\u9875\u56DE\u5230 OFM\u3002"));
   } catch (error) {
