@@ -348,7 +348,7 @@ export async function fetchDoubaoCreditBalance(
   try {
     result = await post(
       credential,
-      SUBSCRIPTION_OVERVIEW_PATH,
+      SUBSCRIPTION_QUOTA_SUMMARY_PATH,
       { product_line: DOUBAO_PRODUCT_LINE },
       product,
       fetchImpl,
@@ -361,59 +361,142 @@ export async function fetchDoubaoCreditBalance(
   const data = unwrapData(result.payload)
   if (data === null || typeof data !== 'object') return undefined
 
-  const rows = pick(data, ['incentive_quota_entitlements'])
-  if (!Array.isArray(rows)) return undefined
-
   const now = Date.now()
   const packages: CreditPackage[] = []
   let remainingSum = 0
-  let activeCount = 0
+  let expiredSum = 0
 
-  for (const row of rows) {
-    const display = pick(row, ['display'])
-    const title = display !== null && typeof display === 'object'
-      ? pick(display, ['title'])
-      : undefined
-    const endTime = pick(row, ['end_time', 'subscription_end_time'])
-    const endMs = typeof endTime === 'number'
-      ? (endTime > 1e12 ? endTime : endTime * 1000)
-      : 0
-    const usedRaw = pick(row, ['total_used_percent'])
-    const usedPercent = typeof usedRaw === 'number' ? Math.max(0, Math.min(100, usedRaw)) : 0
-    const active = endMs === 0 || endMs > now
-
-    // 服务端只给百分比 ⇒ 用观察到的单包额度换算成绝对值（见常量注释）。
-    const packageTotal = DOUBAO_ACTIVITY_GRANT_SIZE
-    const used = Math.round(packageTotal * usedPercent / 100)
-    const remaining = Math.max(0, packageTotal - used)
-
-    const baseName = typeof title === 'string' && title.length > 0 ? title : '活动赠送额度'
-    packages.push({
-      name: endMs === 0 ? baseName : `${baseName}（${formatShortDate(endMs)} 到期）`,
-      unit: 'credit',
-      remaining,
-      total: packageTotal,
-      used,
-      active,
-      cycleStartTime: '',
-      cycleEndTime: endMs === 0 ? '' : new Date(endMs).toISOString(),
-      expiredTime: '',
-    })
-    if (active) {
-      remainingSum += remaining
-      activeCount += 1
+  /**
+   * ## 主口径：`window_limit_section`（**实测这里才有绝对值**）
+   *
+   * 订阅/试用账号的响应形如：
+   *
+   * ```jsonc
+   * "window_limit_section": {
+   *   "window_limit_groups": [{
+   *     "feature_group": "monthly_quota",
+   *     "window_limits": [{ "total_amount": "2,142", "used_amount": "0",
+   *                         "used_percent": 0, "end_time": 1797304202075 }]
+   *   }]
+   * }
+   * ```
+   *
+   * ⚠️ `total_amount` / `used_amount` 是**带千分位的字符串**（`"2,142"`），
+   * 必须去掉逗号再 Number，否则会得到 NaN。
+   */
+  const windowSection = pick(data, ['window_limit_section'])
+  const groups = windowSection !== null && typeof windowSection === 'object'
+    ? pick(windowSection, ['window_limit_groups'])
+    : undefined
+  if (Array.isArray(groups)) {
+    for (const group of groups) {
+      if (group === null || typeof group !== 'object') continue
+      const groupName = pick(group, ['feature_group_name', 'feature_group'])
+      const limits = pick(group, ['window_limits'])
+      if (!Array.isArray(limits)) continue
+      for (const limit of limits) {
+        if (limit === null || typeof limit !== 'object') continue
+        const total = parseAmount(pick(limit, ['total_amount']))
+        if (total === undefined) continue
+        const used = parseAmount(pick(limit, ['used_amount']))
+          ?? Math.round(total * normalizePercent(pick(limit, ['used_percent'])) / 100)
+        const remaining = Math.max(0, total - used)
+        const endMs = toMillis(pick(limit, ['end_time', 'expire_time']))
+        const active = endMs === 0 || endMs > now
+        packages.push({
+          name: typeof groupName === 'string' && groupName.length > 0
+            ? (endMs === 0 ? groupName : `${groupName}（${formatShortDate(endMs)} 到期）`)
+            : (endMs === 0 ? '额度' : `额度（${formatShortDate(endMs)} 到期）`),
+          unit: 'credit',
+          remaining,
+          total,
+          used,
+          active,
+          cycleStartTime: '',
+          cycleEndTime: endMs === 0 ? '' : new Date(endMs).toISOString(),
+          expiredTime: '',
+        })
+        if (active) remainingSum += remaining
+        else expiredSum += remaining
+      }
     }
   }
 
+  /**
+   * ## 兜底：活动赠送额度（**只有百分比**）
+   *
+   * 老账号 / 纯活动额度账号走这里：`incentive_quota_section` 与
+   * `incentive_quota_entitlements[]` 只给 `used_percent`，绝对额度按实观察到的
+   * 单包 200 换算（见 `DOUBAO_ACTIVITY_GRANT_SIZE` 注释）。
+   */
   if (packages.length === 0) {
-    // 有响应但没有额度包：如实返回空列表（当前没有活动赠送额度），不编造数字。
-    return { total: 0, packages: [], expiredTotal: 0 }
+    const incentive = pick(data, ['incentive_quota_section'])
+    const incentiveGroups = incentive !== null && typeof incentive === 'object'
+      ? pick(incentive, ['window_limit_groups'])
+      : undefined
+    if (Array.isArray(incentiveGroups)) {
+      for (const group of incentiveGroups) {
+        if (group === null || typeof group !== 'object') continue
+        const groupName = pick(group, ['feature_group_name', 'feature_group'])
+        const limits = pick(group, ['window_limits'])
+        if (!Array.isArray(limits)) continue
+        for (const limit of limits) {
+          if (limit === null || typeof limit !== 'object') continue
+          const usedPercent = normalizePercent(pick(limit, ['used_percent']))
+          const total = DOUBAO_ACTIVITY_GRANT_SIZE
+          const used = Math.round(total * usedPercent / 100)
+          const endMs = toMillis(pick(limit, ['end_time']))
+          const active = endMs === 0 || endMs > now
+          packages.push({
+            name: typeof groupName === 'string' && groupName.length > 0
+              ? (endMs === 0 ? groupName : `${groupName}（${formatShortDate(endMs)} 到期）`)
+              : (endMs === 0 ? '活动赠送额度' : `活动赠送额度（${formatShortDate(endMs)} 到期）`),
+            unit: 'credit',
+            remaining: Math.max(0, total - used),
+            total,
+            used,
+            active,
+            cycleStartTime: '',
+            cycleEndTime: endMs === 0 ? '' : new Date(endMs).toISOString(),
+            expiredTime: '',
+          })
+          if (active) remainingSum += Math.max(0, total - used)
+          else expiredSum += Math.max(0, total - used)
+        }
+      }
+    }
   }
 
-  // 顶层 total = 有效包的剩余额度之和，与客户端「可用额度」口径一致
-  //（两包各 200 且未使用 ⇒ 400）。
-  return { total: remainingSum, packages, expiredTotal: 0 }
+  // 既没有 window_limit_section 也没有 incentive：**返回 undefined（拿不到）**，
+  // 不要返回 0 —— 那会让界面显示「余额 0」，而真实情况是"没查到"。
+  if (packages.length === 0) return undefined
+  return { total: remainingSum, packages, expiredTotal: expiredSum }
 }
+
+/** 解析 `"2,142"` 这类带千分位的额度字符串。 */
+function parseAmount(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value !== 'string') return undefined
+  const cleaned = value.replace(/[,\s]/g, '')
+  if (cleaned.length === 0) return undefined
+  const parsed = Number(cleaned)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/** 百分比归一：数字或数字字符串 → [0,100]。 */
+function normalizePercent(value: unknown): number {
+  const raw = typeof value === 'number' ? value
+    : typeof value === 'string' ? Number(value) : 0
+  if (!Number.isFinite(raw)) return 0
+  return Math.max(0, Math.min(100, raw))
+}
+
+/** 时间戳归一：秒/毫秒（`>1e12` 视为毫秒）→ 毫秒；无效返回 0。 */
+function toMillis(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
+  return value > 1e12 ? value : value * 1000
+}
+
 
 /** `MM-DD`（本地时区），用于额度包到期提示。 */
 function formatShortDate(ms: number): string {

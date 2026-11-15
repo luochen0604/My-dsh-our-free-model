@@ -68,7 +68,14 @@ export interface DoubaoClientCookieReadResult {
   /** 读取前客户端是否在运行（收尾时要还原）。 */
   wasRunning: boolean
   /** 本次用的调试端口（仅诊断用）。 */
-  port: number
+  port: number  /**
+   * 客户端设备号（`desktop_device_id`，localStorage 里）。
+   *
+   * 实测：chat 请求的 query 里有 `device_id=` 和 `fp=verify_<device_id>`，
+   * 值来自客户端本地存储的 `desktop_device_id`（不是 cookie、也不在 JWT 里）。
+   * 缺它会少两个参数，风控更容易判异常。
+   */
+  deviceId?: string
   /** 浏览器标识（诊断用）。 */
   browser: string
 }
@@ -228,7 +235,9 @@ class CdpClient {
 }
 
 /** 在已就绪的调试端口上读 doubao.com cookie。 */
-async function readCookiesOverCdp(port: number): Promise<DoubaoClientCookie[]> {
+async function readCookiesOverCdp(
+  port: number,
+): Promise<{ cookies: DoubaoClientCookie[]; deviceId?: string }> {
   const listing = await getJson(`http://127.0.0.1:${port}/json/list`)
   const targets = Array.isArray(listing) ? listing as Array<Record<string, unknown>> : []
   if (targets.length === 0) throw new Error('CDP 没有可用 target')
@@ -246,17 +255,62 @@ async function readCookiesOverCdp(port: number): Promise<DoubaoClientCookie[]> {
     const result = await cdp.send('Network.getCookies', { urls: [DOUBAO_COOKIE_URL] }) as
       { cookies?: Array<Record<string, unknown>> } | undefined
     const raw = Array.isArray(result?.cookies) ? result.cookies : []
-    return raw
+    // 顺便读设备号：`desktop_device_id` 存在某个 doubao 页面的 localStorage 里
+    //（实测不在聊天页，需遍历所有 target 找）。
+    let deviceId = await readDeviceIdOverCdp(port)
+
+    return { cookies: raw
       .map((row) => ({
         name: typeof row['name'] === 'string' ? row['name'] : '',
         value: typeof row['value'] === 'string' ? row['value'] : '',
         domain: typeof row['domain'] === 'string' ? row['domain'] : '',
         path: typeof row['path'] === 'string' ? row['path'] : '',
       }))
-      .filter((row) => row.name.length > 0)
+      .filter((row) => row.name.length > 0), deviceId }
   } finally {
     cdp.close()
   }
+}
+
+/**
+ * 遍历所有 CDP target 的 localStorage，找出 `desktop_device_id`。
+ *
+ * 实测：该键**不在聊天页**（`doubaowork-chat/chat` 里读不到），需要逐个 target
+ * 试。取不到返回 `undefined` —— 只影响 query 里 `device_id`/`fp` 两个参数。
+ */
+async function readDeviceIdOverCdp(port: number): Promise<string | undefined> {
+  const listing = await getJson(`http://127.0.0.1:${port}/json/list`)
+  const targets = Array.isArray(listing) ? listing as Array<Record<string, unknown>> : []
+  for (const target of targets) {
+    const wsUrl = target['webSocketDebuggerUrl']
+    if (typeof wsUrl !== 'string') continue
+    let cdp: CdpClient | undefined
+    try {
+      cdp = await CdpClient.connect(wsUrl)
+      await cdp.send('Runtime.enable')
+      const evaluated = await cdp.send('Runtime.evaluate', {
+        expression: `(() => {
+          try {
+            const direct = localStorage.getItem('desktop_device_id')
+            if (direct) return direct
+            for (let i = 0; i < localStorage.length; i += 1) {
+              const key = localStorage.key(i) || ''
+              if (!/device_?id/i.test(key)) continue
+              const value = localStorage.getItem(key) || ''
+              if (/^[0-9]{10,}$/.test(value)) return value
+            }
+          } catch { /* cross-origin 页面读不到，跳过 */ }
+          return undefined
+        })()`,
+        returnByValue: true,
+      }) as { result?: { value?: unknown } } | undefined
+      const value = evaluated?.result?.value
+      if (typeof value === 'string' && value.length > 0) return value
+    } catch { /* 该 target 不可用，继续下一个 */ } finally {
+      cdp?.close()
+    }
+  }
+  return undefined
 }
 
 /**
@@ -306,11 +360,17 @@ export async function readCookiesFromDoubaoClient(
     }
     onProgress(`调试端口已就绪（${version.browser ?? 'Chromium'}），正在读取 cookie…`)
 
-    const cookies = await readCookiesOverCdp(port)
-    if (cookies.length === 0) {
+    const read = await readCookiesOverCdp(port)
+    if (read.cookies.length === 0) {
       throw new Error('未读到任何 cookie —— 客户端可能尚未登录豆包')
     }
-    result = { cookies, wasRunning, port, browser: version.browser ?? '' }
+    result = {
+      cookies: read.cookies,
+      wasRunning,
+      port,
+      browser: version.browser ?? '',
+      ...read.deviceId === undefined ? {} : { deviceId: read.deviceId },
+    }
   } catch (error) {
     failure = error instanceof Error ? error : new Error(String(error))
   } finally {

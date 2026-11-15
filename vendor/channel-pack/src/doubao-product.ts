@@ -26,7 +26,19 @@ export const SAMANTHA_PREFIX = '/samantha'
 export const ALICE_PREFIX = '/alice'
 
 /** 对话端点（观察：`async-infra-message-samantha.js` byte 49235）。 */
-export const SAMANTHA_CHAT_PATH = '/samantha/chat/completion'
+/**
+ * 对话端点。
+ *
+ * ## ⚠️ 2026-11-15 CDP 抓包校正（关键）
+ *
+ * **不是** `/samantha/chat/completion` —— 那是旧接口，实测现在只会回
+ * `710022004 rate limited`（看起来像限流，实际是打错的端点）。
+ *
+ * 桌面端 v2.36.7 真正用的是 **`/chat/completion`**（无 `/samantha` 前缀），
+ * 且**不需要 `a_bogus` / `msToken` 签名**（实测：去掉这两个参数仍返回
+ * 200 SSE 并给出完整回答）。
+ */
+export const SAMANTHA_CHAT_PATH = '/chat/completion'
 /** 分片续传端点（观察：同文件的 `reply_id` / `seq_st` / `binary_type` body）。 */
 export const SAMANTHA_CHUNK_PATH = '/chat/async/chunk_stream'
 

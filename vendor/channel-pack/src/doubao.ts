@@ -278,11 +278,61 @@ export const DOUBAO_CONTENT_TYPE_TEXT = 2001
 export const DOUBAO_ACTIVITY_GRANT_SIZE = 200
 
 /**
+ * `content_block[].block_type` 的文本取值。
+ *
+ * 实测：抓包里用户文本块的 `block_type` 是 `10000`。
+ */
+export const DOUBAO_BLOCK_TYPE_TEXT = 10000
+
+/**
+ * 兜底模型 § `model_item_key` 的映射。
+ *
+ * ## 从哪来
+ *
+ * 抓包看到 `/chat/completion` 的
+ * `option.conversation_init_ext.model_item_key` 是 `"9"` ——
+ * **模型就是这样选的**，不是靠换 `bot_id`。
+ *
+ * ⚠️ 目前**只知道 `9` 这一个合法值**（客户端当前选中的那个）。
+ * 完整的 key → 名称对照表仍未取到（需要抓到模型选择器展开时的请求）。
+ * 故这里默认 `9`，其余一律回退 `9`，**不编造型号名**。
+ */
+export const DOUBAO_DEFAULT_MODEL_ITEM_KEY = '9'
+
+/** 默认思考强度（抓包值 `"5"`）。 */
+export const DOUBAO_DEFAULT_REASONING_EFFORT = '5'
+
+/** 默认模式 id（抓包值 `"3"`）。 */
+export const DOUBAO_DEFAULT_MODE_ID = '3'
+
+/**
+ * 把宿主的模型 id 解析成 `model_item_key`。
+ *
+ * 约定：模型 id 形如 `doubao`（默认）或 `doubao-<key>`（指定 key），
+ * 这样将来拿到完整 key 表时，无需改代码即可暴露多个模型。
+ */
+export function resolveDoubaoModelItemKey(model: string | undefined): string {
+  if (typeof model !== 'string') return DOUBAO_DEFAULT_MODEL_ITEM_KEY
+  const match = /^doubao-([A-Za-z0-9_]+)$/.exec(model)
+  if (match !== null) return match[1]
+  return DOUBAO_DEFAULT_MODEL_ITEM_KEY
+}
+
+/** 思考强度：宿主传数字/字符串时归一成抓包口径的字符串。 */
+export function resolveDoubaoReasoningEffort(effort: unknown): string {
+  if (typeof effort === 'number' && Number.isFinite(effort)) return String(effort)
+  if (typeof effort === 'string' && /^[0-9]+$/.test(effort)) return effort
+  return DOUBAO_DEFAULT_REASONING_EFFORT
+}
+
+/**
  * 从凭据 cookie 里尽力提取 `device_id`。
  *
- * 豆包把设备号放在 `LARK_SUITE_ACCESS_TOKEN` 这个 JWT 的 payload 里
- *（实测 `{"device_id":"2029068688324745", ...}`）。取不到就返回 `undefined`，
- * 公共参数里相应字段会被省略（多数端点仍可通，只是缺少设备一致性声明）。
+ * 豆包把设备号放在 `LARK_SUITE_ACCESS_TOKEN`（JWT）的 payload 里，实际位置是
+ * **`session_extra.device_id`**（实测：顶层只有 aid/uid/doubao_uid/tid/auth_* 等，
+ * 设备号在嵌套的 `session_extra` 内）。顶层也兼容一下，以防版本变化。
+ *
+ * 取不到就返回 `undefined` —— 公共参数里相应字段会被省略（实测多数端点仍可通）。
  */
 export function extractDeviceIdFromCookie(cookie: string): string | undefined {
   if (typeof cookie !== 'string' || cookie.length === 0) return undefined
@@ -294,10 +344,15 @@ export function extractDeviceIdFromCookie(cookie: string): string | undefined {
     // JWT payload 是 base64url，补齐 padding 后按 UTF-8 解码。
     const padded = parts[1].replace(/-/g, '+').replace(/_/g, '/')
     const json = Buffer.from(padded, 'base64').toString('utf8')
-    const payload = JSON.parse(json) as { device_id?: unknown }
-    return typeof payload.device_id === 'string' && payload.device_id.length > 0
-      ? payload.device_id
-      : undefined
+    const payload = JSON.parse(json) as Record<string, unknown>
+    const direct = payload['device_id']
+    if (typeof direct === 'string' && direct.length > 0) return direct
+    const extra = payload['session_extra']
+    if (extra !== null && typeof extra === 'object') {
+      const nested = (extra as Record<string, unknown>)['device_id']
+      if (typeof nested === 'string' && nested.length > 0) return nested
+    }
+    return undefined
   } catch {
     return undefined
   }

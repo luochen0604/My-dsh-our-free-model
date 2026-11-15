@@ -43,6 +43,7 @@ import {
   isDoubaoStale,
   isDoubaoUsable,
   parseCookieString,
+  extractDeviceIdFromCookie,
   type DoubaoCredential,
 } from './doubao.js'
 import {
@@ -176,7 +177,7 @@ export class DoubaoAuth extends Service {
    */
   async importCookie(
     cookieInput: string,
-    options: { nickname?: string; refName?: string; desktop?: boolean } = {},
+    options: { nickname?: string; refName?: string; desktop?: boolean; deviceId?: string } = {},
   ): Promise<DoubaoLoginResult> {
     const cookie = normalizeCookieInput(cookieInput)
     if (!cookie.includes('sessionid=')) {
@@ -184,8 +185,13 @@ export class DoubaoAuth extends Service {
     }
 
     const parsed = parseCookieString(cookie)
+    // 设备号：优先用调用方给的（客户端导入时会带上），其次尝试从 cookie 解。
+    const deviceId = (typeof options.deviceId === 'string' && options.deviceId.length > 0)
+      ? options.deviceId
+      : extractDeviceIdFromCookie(cookie)
     const credential: DoubaoCredential = {
       cookie,
+      ...deviceId === undefined ? {} : { deviceId },
       // 字节 cookie 里常见的 uid 载体；取不到就留空（仅影响显示）。
       uid: parsed['uid_tt'] ?? parsed['uid_tt_ss'] ?? '',
       nickname: options.nickname ?? '',
@@ -295,7 +301,10 @@ export class DoubaoAuth extends Service {
     // 新账号。
     const dedupeSuffix = (uid.length > 0 ? uid : sha256Hex(cookie)).replace(/[^0-9A-Za-z]/g, '').slice(0, 8).toUpperCase()
     const refName = `DOUBAO_ACCOUNT_${dedupeSuffix}`
-    const result = await this.importCookie(cookie, { refName, desktop: true })
+    const result = await this.importCookie(cookie, {
+      refName, desktop: true,
+      ...read.deviceId === undefined ? {} : { deviceId: read.deviceId },
+    })
     return { credentialRef: String(result.ref), cookie, uid, deduped: false }
   }
 

@@ -42051,10 +42051,10 @@ import { credentialRef as credentialRef2 } from "@deepseek-ai/dsh-credentials";
 var DOUBAO_API_BASE = "https://www.doubao.com";
 var SAMANTHA_PREFIX = "/samantha";
 var ALICE_PREFIX = "/alice";
-var SAMANTHA_CHAT_PATH = "/samantha/chat/completion";
+var SAMANTHA_CHAT_PATH = "/chat/completion";
 var ALICE_CHECKIN_PATH = "/alice/ug/campaign/landing/checkin";
 var ALICE_CAMPAIGN_LANDING_PATH = "/alice/ug/campaign/landing/get";
-var SUBSCRIPTION_OVERVIEW_PATH = "/alice/commerce/sale/subscription/overview/";
+var SUBSCRIPTION_QUOTA_SUMMARY_PATH = "/alice/commerce/sale/subscription/quota/summary/";
 var DOUBAO_PRODUCT_LINE = "membership";
 var ALICE_CREDIT_TIP_PATH = "/commerce/benefit_supply/credit/get_credit_tip";
 var BOT_LIST_PATH = "/alice/bot/get_bot_list_v2";
@@ -42164,8 +42164,43 @@ function withCommonParams(path3, product = DOUBAO, deviceId) {
   return path3.includes("?") ? `${path3}&${query}` : `${path3}?${query}`;
 }
 var DOUBAO_MESSAGE_FROM_DESKTOP = 0;
-var DOUBAO_CONTENT_TYPE_TEXT = 2001;
 var DOUBAO_ACTIVITY_GRANT_SIZE = 200;
+var DOUBAO_BLOCK_TYPE_TEXT = 1e4;
+var DOUBAO_DEFAULT_MODEL_ITEM_KEY = "9";
+var DOUBAO_DEFAULT_REASONING_EFFORT = "5";
+function resolveDoubaoModelItemKey(model) {
+  if (typeof model !== "string") return DOUBAO_DEFAULT_MODEL_ITEM_KEY;
+  const match = /^doubao-([A-Za-z0-9_]+)$/.exec(model);
+  if (match !== null) return match[1];
+  return DOUBAO_DEFAULT_MODEL_ITEM_KEY;
+}
+function resolveDoubaoReasoningEffort(effort) {
+  if (typeof effort === "number" && Number.isFinite(effort)) return String(effort);
+  if (typeof effort === "string" && /^[0-9]+$/.test(effort)) return effort;
+  return DOUBAO_DEFAULT_REASONING_EFFORT;
+}
+function extractDeviceIdFromCookie(cookie) {
+  if (typeof cookie !== "string" || cookie.length === 0) return void 0;
+  const match = /(?:^|;\s*)LARK_SUITE_ACCESS_TOKEN=([^;]+)/.exec(cookie);
+  if (match === null) return void 0;
+  const parts = match[1].split(".");
+  if (parts.length < 2) return void 0;
+  try {
+    const padded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = Buffer.from(padded, "base64").toString("utf8");
+    const payload = JSON.parse(json);
+    const direct = payload["device_id"];
+    if (typeof direct === "string" && direct.length > 0) return direct;
+    const extra = payload["session_extra"];
+    if (extra !== null && typeof extra === "object") {
+      const nested = extra["device_id"];
+      if (typeof nested === "string" && nested.length > 0) return nested;
+    }
+    return void 0;
+  } catch {
+    return void 0;
+  }
+}
 function parseSseBlock(block) {
   let event = "";
   const dataLines = [];
@@ -42407,7 +42442,7 @@ async function fetchDoubaoCreditBalance(credential, product = DOUBAO, fetchImpl 
   try {
     result = await post(
       credential,
-      SUBSCRIPTION_OVERVIEW_PATH,
+      SUBSCRIPTION_QUOTA_SUMMARY_PATH,
       { product_line: DOUBAO_PRODUCT_LINE },
       product,
       fetchImpl
@@ -42418,44 +42453,94 @@ async function fetchDoubaoCreditBalance(credential, product = DOUBAO, fetchImpl 
   if (!result.ok || !businessOk(result.payload)) return void 0;
   const data = unwrapData(result.payload);
   if (data === null || typeof data !== "object") return void 0;
-  const rows = pick(data, ["incentive_quota_entitlements"]);
-  if (!Array.isArray(rows)) return void 0;
   const now = Date.now();
   const packages = [];
   let remainingSum = 0;
-  let activeCount = 0;
-  for (const row of rows) {
-    const display = pick(row, ["display"]);
-    const title = display !== null && typeof display === "object" ? pick(display, ["title"]) : void 0;
-    const endTime = pick(row, ["end_time", "subscription_end_time"]);
-    const endMs = typeof endTime === "number" ? endTime > 1e12 ? endTime : endTime * 1e3 : 0;
-    const usedRaw = pick(row, ["total_used_percent"]);
-    const usedPercent = typeof usedRaw === "number" ? Math.max(0, Math.min(100, usedRaw)) : 0;
-    const active = endMs === 0 || endMs > now;
-    const packageTotal = DOUBAO_ACTIVITY_GRANT_SIZE;
-    const used = Math.round(packageTotal * usedPercent / 100);
-    const remaining = Math.max(0, packageTotal - used);
-    const baseName = typeof title === "string" && title.length > 0 ? title : "\u6D3B\u52A8\u8D60\u9001\u989D\u5EA6";
-    packages.push({
-      name: endMs === 0 ? baseName : `${baseName}\uFF08${formatShortDate(endMs)} \u5230\u671F\uFF09`,
-      unit: "credit",
-      remaining,
-      total: packageTotal,
-      used,
-      active,
-      cycleStartTime: "",
-      cycleEndTime: endMs === 0 ? "" : new Date(endMs).toISOString(),
-      expiredTime: ""
-    });
-    if (active) {
-      remainingSum += remaining;
-      activeCount += 1;
+  let expiredSum = 0;
+  const windowSection = pick(data, ["window_limit_section"]);
+  const groups = windowSection !== null && typeof windowSection === "object" ? pick(windowSection, ["window_limit_groups"]) : void 0;
+  if (Array.isArray(groups)) {
+    for (const group of groups) {
+      if (group === null || typeof group !== "object") continue;
+      const groupName = pick(group, ["feature_group_name", "feature_group"]);
+      const limits = pick(group, ["window_limits"]);
+      if (!Array.isArray(limits)) continue;
+      for (const limit of limits) {
+        if (limit === null || typeof limit !== "object") continue;
+        const total = parseAmount(pick(limit, ["total_amount"]));
+        if (total === void 0) continue;
+        const used = parseAmount(pick(limit, ["used_amount"])) ?? Math.round(total * normalizePercent(pick(limit, ["used_percent"])) / 100);
+        const remaining = Math.max(0, total - used);
+        const endMs = toMillis(pick(limit, ["end_time", "expire_time"]));
+        const active = endMs === 0 || endMs > now;
+        packages.push({
+          name: typeof groupName === "string" && groupName.length > 0 ? endMs === 0 ? groupName : `${groupName}\uFF08${formatShortDate(endMs)} \u5230\u671F\uFF09` : endMs === 0 ? "\u989D\u5EA6" : `\u989D\u5EA6\uFF08${formatShortDate(endMs)} \u5230\u671F\uFF09`,
+          unit: "credit",
+          remaining,
+          total,
+          used,
+          active,
+          cycleStartTime: "",
+          cycleEndTime: endMs === 0 ? "" : new Date(endMs).toISOString(),
+          expiredTime: ""
+        });
+        if (active) remainingSum += remaining;
+        else expiredSum += remaining;
+      }
     }
   }
   if (packages.length === 0) {
-    return { total: 0, packages: [], expiredTotal: 0 };
+    const incentive = pick(data, ["incentive_quota_section"]);
+    const incentiveGroups = incentive !== null && typeof incentive === "object" ? pick(incentive, ["window_limit_groups"]) : void 0;
+    if (Array.isArray(incentiveGroups)) {
+      for (const group of incentiveGroups) {
+        if (group === null || typeof group !== "object") continue;
+        const groupName = pick(group, ["feature_group_name", "feature_group"]);
+        const limits = pick(group, ["window_limits"]);
+        if (!Array.isArray(limits)) continue;
+        for (const limit of limits) {
+          if (limit === null || typeof limit !== "object") continue;
+          const usedPercent = normalizePercent(pick(limit, ["used_percent"]));
+          const total = DOUBAO_ACTIVITY_GRANT_SIZE;
+          const used = Math.round(total * usedPercent / 100);
+          const endMs = toMillis(pick(limit, ["end_time"]));
+          const active = endMs === 0 || endMs > now;
+          packages.push({
+            name: typeof groupName === "string" && groupName.length > 0 ? endMs === 0 ? groupName : `${groupName}\uFF08${formatShortDate(endMs)} \u5230\u671F\uFF09` : endMs === 0 ? "\u6D3B\u52A8\u8D60\u9001\u989D\u5EA6" : `\u6D3B\u52A8\u8D60\u9001\u989D\u5EA6\uFF08${formatShortDate(endMs)} \u5230\u671F\uFF09`,
+            unit: "credit",
+            remaining: Math.max(0, total - used),
+            total,
+            used,
+            active,
+            cycleStartTime: "",
+            cycleEndTime: endMs === 0 ? "" : new Date(endMs).toISOString(),
+            expiredTime: ""
+          });
+          if (active) remainingSum += Math.max(0, total - used);
+          else expiredSum += Math.max(0, total - used);
+        }
+      }
+    }
   }
-  return { total: remainingSum, packages, expiredTotal: 0 };
+  if (packages.length === 0) return void 0;
+  return { total: remainingSum, packages, expiredTotal: expiredSum };
+}
+function parseAmount(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return void 0;
+  const cleaned = value.replace(/[,\s]/g, "");
+  if (cleaned.length === 0) return void 0;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : void 0;
+}
+function normalizePercent(value) {
+  const raw = typeof value === "number" ? value : typeof value === "string" ? Number(value) : 0;
+  if (!Number.isFinite(raw)) return 0;
+  return Math.max(0, Math.min(100, raw));
+}
+function toMillis(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+  return value > 1e12 ? value : value * 1e3;
 }
 function formatShortDate(ms) {
   const date = new Date(ms);
@@ -42660,15 +42745,51 @@ async function readCookiesOverCdp(port) {
     await cdp.send("Network.enable");
     const result = await cdp.send("Network.getCookies", { urls: [DOUBAO_COOKIE_URL] });
     const raw = Array.isArray(result?.cookies) ? result.cookies : [];
-    return raw.map((row) => ({
+    let deviceId = await readDeviceIdOverCdp(port);
+    return { cookies: raw.map((row) => ({
       name: typeof row["name"] === "string" ? row["name"] : "",
       value: typeof row["value"] === "string" ? row["value"] : "",
       domain: typeof row["domain"] === "string" ? row["domain"] : "",
       path: typeof row["path"] === "string" ? row["path"] : ""
-    })).filter((row) => row.name.length > 0);
+    })).filter((row) => row.name.length > 0), deviceId };
   } finally {
     cdp.close();
   }
+}
+async function readDeviceIdOverCdp(port) {
+  const listing = await getJson(`http://127.0.0.1:${port}/json/list`);
+  const targets = Array.isArray(listing) ? listing : [];
+  for (const target of targets) {
+    const wsUrl = target["webSocketDebuggerUrl"];
+    if (typeof wsUrl !== "string") continue;
+    let cdp;
+    try {
+      cdp = await CdpClient.connect(wsUrl);
+      await cdp.send("Runtime.enable");
+      const evaluated = await cdp.send("Runtime.evaluate", {
+        expression: `(() => {
+          try {
+            const direct = localStorage.getItem('desktop_device_id')
+            if (direct) return direct
+            for (let i = 0; i < localStorage.length; i += 1) {
+              const key = localStorage.key(i) || ''
+              if (!/device_?id/i.test(key)) continue
+              const value = localStorage.getItem(key) || ''
+              if (/^[0-9]{10,}$/.test(value)) return value
+            }
+          } catch { /* cross-origin \u9875\u9762\u8BFB\u4E0D\u5230\uFF0C\u8DF3\u8FC7 */ }
+          return undefined
+        })()`,
+        returnByValue: true
+      });
+      const value = evaluated?.result?.value;
+      if (typeof value === "string" && value.length > 0) return value;
+    } catch {
+    } finally {
+      cdp?.close();
+    }
+  }
+  return void 0;
 }
 async function readCookiesFromDoubaoClient(options = {}) {
   if (!isDoubaoClientBridgeSupported()) {
@@ -42703,11 +42824,17 @@ async function readCookiesFromDoubaoClient(options = {}) {
       throw new Error("\u5BA2\u6237\u7AEF\u672A\u5F00\u653E\u8C03\u8BD5\u7AEF\u53E3\uFF08\u53EF\u80FD\u88AB\u4F01\u4E1A\u7B56\u7565\u7981\u7528\uFF09");
     }
     onProgress(`\u8C03\u8BD5\u7AEF\u53E3\u5DF2\u5C31\u7EEA\uFF08${version.browser ?? "Chromium"}\uFF09\uFF0C\u6B63\u5728\u8BFB\u53D6 cookie\u2026`);
-    const cookies = await readCookiesOverCdp(port);
-    if (cookies.length === 0) {
+    const read = await readCookiesOverCdp(port);
+    if (read.cookies.length === 0) {
       throw new Error("\u672A\u8BFB\u5230\u4EFB\u4F55 cookie \u2014\u2014 \u5BA2\u6237\u7AEF\u53EF\u80FD\u5C1A\u672A\u767B\u5F55\u8C46\u5305");
     }
-    result = { cookies, wasRunning, port, browser: version.browser ?? "" };
+    result = {
+      cookies: read.cookies,
+      wasRunning,
+      port,
+      browser: version.browser ?? "",
+      ...read.deviceId === void 0 ? {} : { deviceId: read.deviceId }
+    };
   } catch (error) {
     failure = error instanceof Error ? error : new Error(String(error));
   } finally {
@@ -42811,8 +42938,10 @@ var DoubaoAuth = class extends Service {
       throw new Error("\u8C46\u5305\u51ED\u636E\u7F3A\u5C11 sessionid\u3002\u8BF7\u7C98\u8D34\u5B8C\u6574 cookie\uFF08\u81F3\u5C11\u5305\u542B sessionid=...\uFF09\u3002");
     }
     const parsed = parseCookieString(cookie);
+    const deviceId = typeof options.deviceId === "string" && options.deviceId.length > 0 ? options.deviceId : extractDeviceIdFromCookie(cookie);
     const credential = {
       cookie,
+      ...deviceId === void 0 ? {} : { deviceId },
       // 字节 cookie 里常见的 uid 载体；取不到就留空（仅影响显示）。
       uid: parsed["uid_tt"] ?? parsed["uid_tt_ss"] ?? "",
       nickname: options.nickname ?? "",
@@ -42895,7 +43024,11 @@ var DoubaoAuth = class extends Service {
     }
     const dedupeSuffix = (uid.length > 0 ? uid : sha256Hex(cookie)).replace(/[^0-9A-Za-z]/g, "").slice(0, 8).toUpperCase();
     const refName = `DOUBAO_ACCOUNT_${dedupeSuffix}`;
-    const result = await this.importCookie(cookie, { refName, desktop: true });
+    const result = await this.importCookie(cookie, {
+      refName,
+      desktop: true,
+      ...read.deviceId === void 0 ? {} : { deviceId: read.deviceId }
+    });
     return { credentialRef: String(result.ref), cookie, uid, deduped: false };
   }
   // ── 刷新（探活式） ──────────────────────────────────────────────────────
@@ -42991,56 +43124,44 @@ function normalizeCookieInput(raw) {
 }
 
 // vendor/channel-pack/src/doubao-adapter.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
 import { LlmAdapter as LlmAdapter7, LlmError as LlmError12 } from "@deepseek-ai/dsh-llm";
-function parseDoubaoEvent(raw) {
-  let outer;
+function parseDoubaoEvent(event, raw) {
+  let payload;
   try {
-    outer = JSON.parse(raw);
+    payload = JSON.parse(raw);
   } catch {
     return void 0;
   }
-  if (outer === null || typeof outer !== "object") return void 0;
-  const record = outer;
-  const type = record["event_type"];
-  const typeCode = typeof type === "number" ? type : Number(type);
-  let data = record["event_data"];
-  if (typeof data === "string") {
-    try {
-      data = JSON.parse(data);
-    } catch {
-      return void 0;
+  if (payload === null || typeof payload !== "object") return void 0;
+  const record = payload;
+  if (typeof event === "string" && /ERROR/i.test(event)) {
+    const code = record["code"] ?? record["status_code"];
+    const message = record["message"] ?? record["msg"] ?? raw.slice(0, 200);
+    return { kind: "error", message: `business error ${String(code ?? "?")}: ${String(message)}` };
+  }
+  if (event === "SSE_REPLY_END") return { kind: "done" };
+  if (event !== "STREAM_CHUNK") return void 0;
+  let text = "";
+  const ops = record["patch_op"];
+  if (!Array.isArray(ops)) return void 0;
+  for (const op of ops) {
+    if (op === null || typeof op !== "object") continue;
+    const value = op["patch_value"];
+    if (value === null || typeof value !== "object") continue;
+    const blocks = value["content_block"];
+    if (!Array.isArray(blocks)) continue;
+    for (const block of blocks) {
+      if (block === null || typeof block !== "object") continue;
+      const content = block["content"];
+      if (content === null || typeof content !== "object") continue;
+      const textBlock = content["text_block"];
+      if (textBlock === null || typeof textBlock !== "object") continue;
+      const piece = textBlock["text"];
+      if (typeof piece === "string") text += piece;
     }
   }
-  const payload = data !== null && typeof data === "object" ? data : void 0;
-  if (typeCode === 2005) {
-    const code = payload?.["code"];
-    const message2 = payload?.["message"];
-    return { kind: "error", message: `business error ${String(code ?? "?")}: ${String(message2 ?? "")}`.trim() };
-  }
-  if (typeCode === 2003) return { kind: "done" };
-  if (typeCode !== 2001) return void 0;
-  if (payload?.["is_finish"] === true) return { kind: "done" };
-  const message = payload?.["message"];
-  if (message === null || typeof message !== "object") return void 0;
-  const content = message["content"];
-  const text = textFromContent(content);
   return text.length === 0 ? void 0 : { kind: "text", text };
-}
-function textFromContent(content) {
-  if (typeof content === "string") {
-    if (content.length === 0) return "";
-    try {
-      const parsed = JSON.parse(content);
-      return textFromContent(parsed);
-    } catch {
-      return content;
-    }
-  }
-  if (content !== null && typeof content === "object") {
-    const text = content["text"];
-    return typeof text === "string" ? text : "";
-  }
-  return "";
 }
 var DoubaoAdapter = class extends LlmAdapter7 {
   constructor(options) {
@@ -43146,29 +43267,36 @@ var DoubaoAdapter = class extends LlmAdapter7 {
     if (!isDoubaoUsable(credential)) {
       throw new LlmError12("doubao: no usable credential; log in first", "MISSING_CREDENTIAL");
     }
+    const modelItemKey = resolveDoubaoModelItemKey(options.model);
     const body = JSON.stringify({
-      // int64：新会话用 0（空串会被 proto 拒成 400，实测）。
-      conversation_id: 0,
-      // 真实主 bot id（抓包得到，见 doubao-product.ts）。
-      bot_id: this.product.botId,
-      section_id: 0,
-      // `local_message_id` 是字符串，空串实测无害（保留）。
-      local_message_id: "",
-      messages: toWireMessages(options),
-      completion_option: {
-        is_regen: false,
-        with_suggest: false,
-        // 观察：`need_create_conversation` 由是否有本地会话 ID 决定；新会话为 true。
-        need_create_conversation: true,
-        memory_type: 0,
-        // ⚠️ `event_id` 是字符串（实测字符串无害）。
-        event_id: "0",
-        // ⚠️ 枚举数字，不是字符串（实测字符串会 400）。
-        message_from: DOUBAO_MESSAGE_FROM_DESKTOP
+      client_meta: {
+        local_conversation_id: `local_${Date.now()}`,
+        conversation_id: "",
+        bot_id: this.product.botId,
+        last_section_id: "",
+        last_message_index: null,
+        local_permissions: []
       },
-      ...options.maxTokens === void 0 ? {} : { max_tokens: options.maxTokens },
-      ...options.temperature === void 0 ? {} : { temperature: options.temperature },
-      ...options.stop === void 0 || options.stop.length === 0 ? {} : { stop: options.stop }
+      messages: toWireMessages(options),
+      option: {
+        create_time_ms: Date.now(),
+        agent_mode: 1,
+        // 9 = 桌面端默认（抓包值）；含义未逐一验证。
+        need_deep_think: 9,
+        need_create_conversation: true,
+        unique_key: randomUuid(),
+        scene_type: 0,
+        conversation_init_option: { project_id: "", need_ack_conversation: true },
+        conversation_init_ext: {
+          model_item_key: modelItemKey,
+          reasoning_effort: resolveDoubaoReasoningEffort(options.reasoningEffort),
+          mode_id: "3"
+        },
+        sse_recv_event_options: { support_chunk_delta: true },
+        support_lazy_fetch_stream: true,
+        message_from: DOUBAO_MESSAGE_FROM_DESKTOP,
+        is_old_user: true
+      }
     });
     const url = `${this.product.apiBase}${withCommonParams(SAMANTHA_CHAT_PATH, this.product, credential.deviceId)}`;
     const controller = new AbortController();
@@ -43235,23 +43363,21 @@ var DoubaoAdapter = class extends LlmAdapter7 {
           if (frame.event === DOUBAO_SSE.err) {
             throw new LlmError12(`doubao: server error: ${frame.data.slice(0, 300)}`, "PROVIDER");
           }
+          if (frame.event === "SSE_REPLY_END") {
+            sawDone = true;
+            continue;
+          }
+          if (frame.event === "SSE_HEARTBEAT" || frame.event === "STREAM_TIMEOUT_CONTROL" || frame.event === "SSE_ACK" || frame.event === "FULL_MSG_NOTIFY" || frame.event === "STREAM_MSG_NOTIFY") {
+            continue;
+          }
           if (frame.event === "gateway-error") {
             throw new LlmError12(
               `doubao: gateway error: ${frame.data.slice(0, 300)}`,
               isDoubaoAuthError(200, frame.data) ? "AUTH" : "PROVIDER"
             );
           }
-          if (frame.event === DOUBAO_SSE.pb) {
-            throw new LlmError12(
-              'doubao: server sent protobuf SSE frames ("event: pb"); this adapter only handles JSON frames.',
-              "UNSUPPORTED_CONTENT"
-            );
-          }
-          if (frame.event !== void 0 && frame.event !== "" && frame.event !== DOUBAO_SSE.json) {
-            continue;
-          }
           if (frame.data.length === 0) continue;
-          const parsed = parseDoubaoEvent(frame.data);
+          const parsed = parseDoubaoEvent(frame.event, frame.data);
           if (parsed === void 0) {
             droppedFrames += 1;
             continue;
@@ -43304,11 +43430,28 @@ function toWireMessages(options) {
   }
   if (input.length === 0 && options.system !== void 0) input = options.system;
   return [{
-    content: JSON.stringify({ text: input }),
-    content_type: DOUBAO_CONTENT_TYPE_TEXT,
-    attachments: [],
-    references: []
+    local_message_id: randomUuid(),
+    content_block: [{
+      block_type: DOUBAO_BLOCK_TYPE_TEXT,
+      content: {
+        text_block: { text: input, icon_url: "", icon_url_dark: "", summary: "" },
+        pc_event_block: ""
+      },
+      block_id: randomUuid(),
+      parent_id: "",
+      meta_info: [],
+      extra_info: {},
+      append_fields: []
+    }],
+    message_status: 0
   }];
+}
+function randomUuid() {
+  try {
+    return randomUUID2();
+  } catch {
+    return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
+  }
 }
 function contentToText5(content) {
   if (typeof content === "string") return content;
@@ -43338,7 +43481,7 @@ import { Service as Service2 } from "@deepseek-ai/cordis";
 import { credentialRef as credentialRef3 } from "@deepseek-ai/dsh-credentials";
 
 // vendor/channel-pack/src/lobsterai-credits.ts
-import { randomUUID as randomUUID2 } from "node:crypto";
+import { randomUUID as randomUUID3 } from "node:crypto";
 var LOBSTERAI_ACTIVITY_SLOT_PATH = "/api/client-activities/slot";
 var LOBSTERAI_ACTIVITY_CONTEXT_PATH = "/api/client-activities";
 var LOBSTERAI_PROFILE_SUMMARY_PATH = "/api/user/profile-summary";
@@ -43452,7 +43595,7 @@ async function claimLobsteraiDailyCheckin(credential, product, clientVersion, fe
     body: JSON.stringify({
       configRevision: slot2.configRevision,
       // 客户端幂等键（对齐 sigin.py:63 的 uuid4）：服务端据此去重。
-      idempotencyKey: randomUUID2(),
+      idempotencyKey: randomUUID3(),
       payload: {}
     })
   });
@@ -43544,7 +43687,7 @@ function roundCredits(value) {
 }
 
 // vendor/channel-pack/src/lobsterai-identity.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
+import { randomUUID as randomUUID4 } from "node:crypto";
 import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync5, renameSync as renameSync4, writeFileSync as writeFileSync4 } from "node:fs";
 import { join as join4 } from "node:path";
 var LOBSTERAI_INSTALLATION_FILE = "lobsterai-installation.json";
@@ -43554,7 +43697,7 @@ function mergeLobsteraiIdentity(document, options = {}) {
   const channel = sanitizeLobsteraiKeyfrom(options.channel ?? LOBSTERAI_DEFAULT_KEYFROM);
   const record = typeof document === "object" && document !== null && !Array.isArray(document) ? document : {};
   const keyfrom = typeof record.keyfrom === "object" && record.keyfrom !== null && !Array.isArray(record.keyfrom) ? record.keyfrom : {};
-  const uuid = parseLobsteraiInstallationUuid(record.installationUuid) ?? (options.generateUuid ?? randomUUID3)();
+  const uuid = parseLobsteraiInstallationUuid(record.installationUuid) ?? (options.generateUuid ?? randomUUID4)();
   const storedFirst = parseLobsteraiKeyfrom(keyfrom.firstKeyfrom);
   return {
     uuid,
@@ -43626,10 +43769,10 @@ function createLobsteraiIdentityStore(ctx) {
 
 // vendor/channel-pack/src/lobsterai-oauth.ts
 import { createServer } from "node:http";
-import { randomBytes as randomBytes5, randomUUID as randomUUID4 } from "node:crypto";
+import { randomBytes as randomBytes5, randomUUID as randomUUID5 } from "node:crypto";
 function fallbackLobsteraiIdentity() {
   return {
-    uuid: randomUUID4(),
+    uuid: randomUUID5(),
     firstKeyfrom: LOBSTERAI_DEFAULT_KEYFROM,
     latestKeyfrom: LOBSTERAI_DEFAULT_KEYFROM
   };
@@ -46648,10 +46791,10 @@ import { Service as Service6 } from "@deepseek-ai/cordis";
 import { credentialRef as credentialRef7 } from "@deepseek-ai/dsh-credentials";
 
 // vendor/channel-pack/src/loomy-oauth.ts
-import { randomUUID as randomUUID6 } from "node:crypto";
+import { randomUUID as randomUUID7 } from "node:crypto";
 
 // vendor/channel-pack/src/loomy-sign.ts
-import { createHash as createHash6, createHmac, randomUUID as randomUUID5 } from "node:crypto";
+import { createHash as createHash6, createHmac, randomUUID as randomUUID6 } from "node:crypto";
 function loomyContentMd5(body) {
   if (body.length === 0) return "";
   return createHash6("md5").update(body, "utf8").digest("base64");
@@ -46693,7 +46836,7 @@ function buildLoomySigningString(options) {
 }
 function loomyAuthHeaders(options) {
   const date = (/* @__PURE__ */ new Date()).toUTCString();
-  const nonce = randomUUID5();
+  const nonce = randomUUID6();
   const contentType = options.contentType ?? "application/json";
   const body = options.body ?? "";
   const stringToSign = buildLoomySigningString({ ...options, contentType, body, date, nonce });
@@ -46793,7 +46936,7 @@ function buildLoomyAccountBody(product, param) {
       devid: "web",
       // ⚠️ 硬编码 macOS：客户端在 Windows 上发的也是这个值，照抄不要改。
       ua: "Loomy|Desktop|Electron|macOS",
-      traceid: randomUUID6().replace(/-/g, "")
+      traceid: randomUUID7().replace(/-/g, "")
     },
     param
   };
@@ -46934,7 +47077,7 @@ async function bindLoomySkip(rcode, product, fetcher = fetch) {
 
 // vendor/channel-pack/src/loomy-wechat-login.ts
 import { createServer as createServer3 } from "node:http";
-import { randomUUID as randomUUID7 } from "node:crypto";
+import { randomUUID as randomUUID8 } from "node:crypto";
 
 // vendor/channel-pack/src/loomy-wechat.ts
 var LOOMY_WECHAT_APP_ID = "wx18d60be432287cf8";
@@ -47088,7 +47231,7 @@ async function startLoomyWechatLoginFlow(options) {
     settled = true;
     rejectResult(error);
   };
-  state.uuid = await fetchLoomyWechatUuid(randomUUID7(), fetcher);
+  state.uuid = await fetchLoomyWechatUuid(randomUUID8(), fetcher);
   const server = createServer3((request, response) => {
     void handleRequest(request, response, {
       state,
@@ -52313,7 +52456,7 @@ var SerialQueue = class {
 };
 
 // vendor/channel-pack/src/zcode-login.ts
-import { randomBytes as randomBytes8, randomUUID as randomUUID8 } from "node:crypto";
+import { randomBytes as randomBytes8, randomUUID as randomUUID9 } from "node:crypto";
 var ZCODE_ORIGIN = "https://zcode.z.ai";
 var ZCODE_OAUTH_CLI_INIT_URL = `${ZCODE_ORIGIN}/api/v1/oauth/cli/init`;
 var zcodeOauthCliPollUrl = (flowId) => `${ZCODE_ORIGIN}/api/v1/oauth/cli/poll/${encodeURIComponent(flowId)}`;
@@ -52329,7 +52472,7 @@ function generateFlowSecret() {
   return randomBytes8(32).toString("hex");
 }
 function generateDeviceMid() {
-  return randomUUID8();
+  return randomUUID9();
 }
 async function startZcodeLogin(fetchImpl = fetch, options = {}) {
   const flowSecret = generateFlowSecret();
@@ -63944,7 +64087,7 @@ function reply(rpcId, result) {
 
 // vendor/channel-pack/src/openai-gateway/server.ts
 import { createServer as createServer7 } from "node:http";
-import { randomUUID as randomUUID12 } from "node:crypto";
+import { randomUUID as randomUUID13 } from "node:crypto";
 import { homedir as homedir4 } from "node:os";
 import { join as join12 } from "node:path";
 
@@ -63987,7 +64130,7 @@ function loadOrCreateApiKey(home, env = process.env) {
 }
 
 // vendor/channel-pack/src/openai-gateway/messages.ts
-import { randomUUID as randomUUID9 } from "node:crypto";
+import { randomUUID as randomUUID10 } from "node:crypto";
 import { createToolResultMessage, ReasoningEffortId as ReasoningEffortId10 } from "@deepseek-ai/dsh-llm";
 
 // vendor/channel-pack/src/openai-gateway/images.ts
@@ -64149,7 +64292,7 @@ async function partsFromContent(content, bridge, limits) {
   }
   return blocks;
 }
-function textFromContent2(content) {
+function textFromContent(content) {
   if (typeof content === "string") return content;
   if (content === null || content === void 0) return "";
   if (!Array.isArray(content)) {
@@ -64176,7 +64319,7 @@ function gatewaySource() {
   return { kind: "plugin:dsh-openai-gateway" };
 }
 function createGatewayMessage(role, content, source) {
-  return { id: randomUUID9(), role, content, source };
+  return { id: randomUUID10(), role, content, source };
 }
 function createGatewayToolMessage(toolCallId, content, isError) {
   return createToolResultMessage({
@@ -64209,14 +64352,14 @@ async function convertMessage(raw, provider, model, bridge, limits) {
   if (role === "system") {
     return createGatewayMessage("system", [{
       type: "text",
-      text: textFromContent2(value.content)
+      text: textFromContent(value.content)
     }], gatewaySource());
   }
   if (role === "user") {
     return createGatewayMessage("user", await partsFromContent(value.content, bridge, limits), { kind: "user" });
   }
   if (role === "assistant") {
-    const text = textFromContent2(value.content);
+    const text = textFromContent(value.content);
     const content = [];
     const reasoning = inboundReasoning(value);
     if (reasoning !== void 0) content.push({ type: "reasoning", text: reasoning });
@@ -64350,11 +64493,11 @@ function findCaseInsensitiveSuggestion(requested, catalog) {
 }
 
 // vendor/channel-pack/src/openai-gateway/responses.ts
-import { createHash as createHash7, randomUUID as randomUUID11 } from "node:crypto";
+import { createHash as createHash7, randomUUID as randomUUID12 } from "node:crypto";
 import { ReasoningEffortId as ReasoningEffortId11 } from "@deepseek-ai/dsh-llm";
 
 // vendor/channel-pack/src/openai-gateway/stream.ts
-import { randomUUID as randomUUID10 } from "node:crypto";
+import { randomUUID as randomUUID11 } from "node:crypto";
 
 // vendor/channel-pack/src/openai-gateway/usage.ts
 function count(value) {
@@ -64500,7 +64643,7 @@ function consumeChunk(state, chunk) {
       return void 0;
   }
 }
-async function* toOpenAiSse(chunks, requestId = `chatcmpl-${randomUUID10()}`, model, suggest) {
+async function* toOpenAiSse(chunks, requestId = `chatcmpl-${randomUUID11()}`, model, suggest) {
   const state = { content: "", reasoning: "", tools: /* @__PURE__ */ new Map(), nextToolIndex: 0 };
   try {
     for await (const chunk of chunks) {
@@ -64554,7 +64697,7 @@ async function* toOpenAiSse(chunks, requestId = `chatcmpl-${randomUUID10()}`, mo
     yield "data: [DONE]\n\n";
   }
 }
-async function collectOpenAiCompletion(chunks, requestId = `chatcmpl-${randomUUID10()}`, model, suggest) {
+async function collectOpenAiCompletion(chunks, requestId = `chatcmpl-${randomUUID11()}`, model, suggest) {
   const state = { content: "", reasoning: "", tools: /* @__PURE__ */ new Map(), nextToolIndex: 0 };
   try {
     for await (const chunk of chunks) {
@@ -64778,14 +64921,14 @@ async function toMessages(input, provider, model, bridge, limits) {
         continue;
       }
       if (raw.role === "assistant") {
-        const text = textFromContent2(content);
+        const text = textFromContent(content);
         pushAssistant(text.length > 0 ? [{ type: "text", text }] : []);
         continue;
       }
       if (raw.role === "system" || raw.role === "developer") {
         messages.push(createGatewayMessage("system", [{
           type: "text",
-          text: textFromContent2(content)
+          text: textFromContent(content)
         }], gatewaySource()));
         continue;
       }
@@ -64890,7 +65033,7 @@ async function toResponsesGenerateOptions(body, signal, reasoningEffortOverride,
   };
 }
 function hexId() {
-  return randomUUID11().replaceAll("-", "");
+  return randomUUID12().replaceAll("-", "");
 }
 function itemId(kind) {
   if (kind === "reasoning") return `rs_${hexId()}`;
@@ -65561,7 +65704,7 @@ function createOpenAiGateway(options) {
       });
       const stream = options.llm.stream(markGatewayChannel(generate));
       const fullId = `${route.provider}/${route.model}`;
-      const responseId = `resp_${randomUUID12().replaceAll("-", "")}`;
+      const responseId = `resp_${randomUUID13().replaceAll("-", "")}`;
       if (body.stream === true) {
         writeSseHead(response);
         for await (const event of toResponsesSse(stream, responseId, fullId, body, makeSuggestion(fullId))) {
