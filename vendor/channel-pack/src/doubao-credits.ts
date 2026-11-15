@@ -578,7 +578,7 @@ export async function fetchDoubaoModels(
   credential: DoubaoCredential,
   product: DoubaoProduct = DOUBAO,
   fetchImpl: typeof fetch = fetch,
-): Promise<Array<{ id: string; name: string }>> {
+): Promise<Array<{ id: string; name: string; contextWindow?: number }>> {
   let result: PostResult
   try {
     result = await post(
@@ -596,7 +596,7 @@ export async function fetchDoubaoModels(
   const data = unwrapData(result.payload)
   if (data === null || typeof data !== 'object') return []
 
-  const out: Array<{ id: string; name: string }> = []
+  const out: Array<{ id: string; name: string; contextWindow?: number }> = []
   const seen = new Set<string>()
   const collect = (modelList: unknown): void => {
     if (modelList === null || typeof modelList !== 'object') return
@@ -608,7 +608,26 @@ export async function fetchDoubaoModels(
       const name = pick(item, ['name', 'title', 'text'])
       if (typeof key !== 'string' || key.length === 0 || seen.has(key)) continue
       seen.add(key)
-      out.push({ id: key, name: typeof name === 'string' && name.length > 0 ? name : key })
+      /**
+       * 上下文窗口：`model_extra_params.total_window_size`（字符串，实测
+       * `"256000"` / `"300000"`）。**必须逐模型带出去** —— 各模型窗口不同，
+       * 一律按同一个值会让 DSH 的压缩阈值算错（见 `resolveModel` 注释）。
+       */
+      const extra = pick(item, ['model_extra_params'])
+      const windowRaw = extra !== null && typeof extra === 'object'
+        ? pick(extra, ['total_window_size'])
+        : undefined
+      const windowNumber = typeof windowRaw === 'number'
+        ? windowRaw
+        : typeof windowRaw === 'string' ? Number(windowRaw.replace(/[,\s]/g, '')) : undefined
+      const contextWindow = windowNumber !== undefined && Number.isFinite(windowNumber) && windowNumber > 0
+        ? Math.trunc(windowNumber)
+        : undefined
+      out.push({
+        id: key,
+        name: typeof name === 'string' && name.length > 0 ? name : key,
+        ...contextWindow === undefined ? {} : { contextWindow },
+      })
     }
   }
 

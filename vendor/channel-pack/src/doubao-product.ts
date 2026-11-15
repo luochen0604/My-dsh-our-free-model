@@ -176,13 +176,13 @@ const DOUBAO_FALLBACK_MODELS: readonly DoubaoFallbackModel[] = [
   { id: '9', name: '自动', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
   { id: 'seed-lite-7b', name: '豆包 2.1 Lite', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
   { id: '5', name: '豆包 2.1 Pro', contextWindow: 256_000, maxTokens: 32_000, supportsImage: true },
-  { id: 'person-deepseek-v4-1-flash-261017', name: 'DeepSeek V4.1 Flash', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
-  { id: 'person-kimi-k3-1-pro-261111', name: 'Kimi K3.1 Pro', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
-  { id: 'person-kimi-k3-1-pro-highspeed-261111', name: 'Kimi K3.1 Pro 高速', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
-  { id: 'person-kimi-k3-261111', name: 'Kimi K3', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
-  { id: 'person-glm-5-3-261111', name: 'GLM 5.3', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
-  { id: 'person-glm-5-3-flash-261111', name: 'GLM 5.3 Flash', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
-  { id: 'person-deepseek-v4-pro-ga-260813', name: 'DeepSeek V4 Pro', contextWindow: 256_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-deepseek-v4-1-flash-261017', name: 'DeepSeek V4.1 Flash', contextWindow: 300_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-kimi-k3-1-pro-261111', name: 'Kimi K3.1 Pro', contextWindow: 300_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-kimi-k3-1-pro-highspeed-261111', name: 'Kimi K3.1 Pro 高速', contextWindow: 300_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-kimi-k3-261111', name: 'Kimi K3', contextWindow: 300_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-glm-5-3-261111', name: 'GLM 5.3', contextWindow: 300_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-glm-5-3-flash-261111', name: 'GLM 5.3 Flash', contextWindow: 300_000, maxTokens: 32_000, supportsImage: false },
+  { id: 'person-deepseek-v4-pro-ga-260813', name: 'DeepSeek V4 Pro', contextWindow: 300_000, maxTokens: 32_000, supportsImage: false },
 ]
 
 /** 豆包工作产品配置。 */

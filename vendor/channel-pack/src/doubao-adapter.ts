@@ -89,7 +89,7 @@ export interface DoubaoAdapterOptions {
    * ⚠️ 豆包的模型目录响应形状**未实测**（见 `fetchDoubaoModels` 注释），
    * 故这里只做「拿到就用」的增强，不把目录缺失当错误。
    */
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; contextWindow?: number }>>
 }
 
 /**
@@ -205,9 +205,9 @@ export class DoubaoAdapter extends LlmAdapter {
    * ⚠️ 不做缓存失效：豆包的 bot 目录变化不频繁，且拉取需要一次带 cookie 的
    * 网络请求。首次 `listModels` 时拉一次，之后用进程内缓存。
    */
-  private remoteModels: Array<{ id: string; name: string }> | undefined
+  private remoteModels: Array<{ id: string; name: string; contextWindow?: number }> | undefined
 
-  private async loadModels(): Promise<Array<{ id: string; name: string }>> {
+  private async loadModels(): Promise<Array<{ id: string; name: string; contextWindow?: number }>> {
     if (this.remoteModels !== undefined) return this.remoteModels
     if (this.options.fetchRemoteModels !== undefined) {
       try {
@@ -220,7 +220,11 @@ export class DoubaoAdapter extends LlmAdapter {
         // 目录拉不到不是错误：回退兜底表即可。
       }
     }
-    this.remoteModels = this.product.fallbackModels.map((model) => ({ id: model.id, name: model.name }))
+    this.remoteModels = this.product.fallbackModels.map((model) => ({
+      id: model.id,
+      name: model.name,
+      contextWindow: model.contextWindow,
+    }))
     return this.remoteModels
   }
 
@@ -248,20 +252,64 @@ export class DoubaoAdapter extends LlmAdapter {
     return model?.supportsImage === true ? ['text', 'image'] : ['text']
   }
 
+  /**
+   * 解析模型元数据（含**上下文窗口**）。
+   *
+   * ## ⚠️ 上下文窗口必须按模型取，不能一律写死
+   *
+   * 2026-11-15 实测：豆包各模型的窗口**不一样**
+   *
+   * | 模型 | total_window_size |
+   * |---|---|
+   * | `9` 自动 / `seed-lite-7b` / `5` | 256000 |
+   * | 所有 `person-*`（DeepSeek / Kimi / GLM） | **300000** |
+   *
+   * 之前我把所有模型都声明成 256000，导致切到 `person-*` 时 DSH 仍按 256000
+   * 计算压缩阈值：
+   *
+   * ```
+   * threshold = floor(min(256000×0.8, 256000−32000−65536)) = 158464
+   * ```
+   *
+   * 于是一段 213034 tokens 的会话会被判定「无法压缩到阈值以下」并拒绝切换
+   *（真实报错：`no safe compaction range ... 213034 >= 158464`）。
+   * 用 300000 算则为 `min(240000, 202464) = 202464`，仍有空间。
+   *
+   * 现在的取值顺序：**远端目录的真实窗口 → 兜底表 → 不声明**。
+   */
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const fallback = this.fallbackIndex.get(model)
+    // 远端目录（含真实 total_window_size）优先；未拉取成功时退兜底表。
+    const remote = this.remoteModels?.find((entry) => entry.id === model)
+    const contextWindow = remote?.contextWindow ?? fallback?.contextWindow
     const resolved: LlmResolvedModelInfo = {
       provider,
       id: model,
-      name: fallback?.name ?? model,
+      name: remote?.name ?? fallback?.name ?? model,
       inputModalities: this.inputModalitiesFor(fallback),
     }
-    if (fallback !== undefined && fallback.contextWindow > 0) {
-      resolved.context = { contextWindow: fallback.contextWindow }
+    if (contextWindow !== undefined && contextWindow > 0) {
+      resolved.context = { contextWindow }
     }
-    if (fallback !== undefined && fallback.maxTokens > 0) {
-      resolved.defaultMaxTokens = fallback.maxTokens
-    }
+    /**
+     * ⚠️ **不声明 `defaultMaxTokens`**（2026-11-15 修正）。
+     *
+     * DSH 的压缩阈值是：
+     *
+     * ```
+     * reserved  = header.maxTokens ?? defaultMaxTokens ?? 0
+     * threshold = floor(min(W × 0.8, W − reserved − headroomTokens))
+     * ```
+     *
+     * 之前我声明了 `defaultMaxTokens: 32000`（**没有依据，是猜的**），
+     * 它会从窗口里扣掉 32K 再扣 64K 余量，把 300000 窗口的阈值压到 202464；
+     * 一段 213034 tokens 的会话因此被判「压不下去」而拒绝切换模型
+     *（真实报错：`no safe compaction range ... 213034 >= 158464/202464`）。
+     *
+     * 豆包**没有公开的单次输出上限**（客户端 bundle 里只有 zod schema 的
+     * `maxTokens` 字段名，没有字面量），所以本适配器不臆造这个值：留空则由
+     * 宿主按会话配置决定，阈值回到 `min(W×0.8, W−65536)` = 234464（300000 时）。
+     */
     return resolved
   }
 
