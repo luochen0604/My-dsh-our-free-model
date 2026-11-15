@@ -100,6 +100,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomBytes } from 'node:crypto'
 import { RACCOON_LOGIN_TIMEOUT_MS } from './raccoon.js'
 import { exchangeRaccoonAuthorizationCode } from './raccoon-oauth.js'
+import { bindRaccoonTrustedDevice, heartbeatRaccoonTrustedDevice } from './raccoon-device.js'
 import { RACCOON, type RaccoonProduct } from './raccoon-product.js'
 import type { RaccoonCredential } from './raccoon.js'
 import { listenOnRandomPort } from './raccoon-login-page.js'
@@ -309,6 +310,36 @@ interface CallbackDeps {
   settleErr: (error: unknown) => void
 }
 
+/**
+ * 把刚换到的会话补成官方客户端的形态：绑设备 → 心跳。
+ *
+ * 失败**不抛错**（否则一次网络抖动会让用户白过一遍滑块），只保留原凭据继续；
+ * 但会把设备 id 写回凭据，供后续请求带 `X-Client-Device-ID`。
+ */
+async function upgradeToTrustedDesktopSession(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  fetcher: typeof fetch,
+): Promise<RaccoonCredential> {
+  const { hostname, release } = await import('node:os')
+  try {
+    const bind = await bindRaccoonTrustedDevice(
+      product,
+      credential,
+      { hostname: hostname(), osRelease: release() },
+      fetcher,
+    )
+    // 心跳只为维持 online 状态，失败无所谓。
+    if (bind.deviceId !== undefined) {
+      await heartbeatRaccoonTrustedDevice(product, credential, fetcher).catch(() => false)
+      return { ...credential, device_id: bind.deviceId }
+    }
+    return credential
+  } catch {
+    return credential
+  }
+}
+
 /** 处理回调：校验 state → 换桌面端 token → 回一页极简 HTML。 */
 async function handleCallback(
   request: IncomingMessage,
@@ -337,7 +368,15 @@ async function handleCallback(
     return
   }
   try {
-    const credential = await exchangeRaccoonAuthorizationCode(deps.product, code, deps.fetcher)
+    const exchanged = await exchangeRaccoonAuthorizationCode(deps.product, code, deps.fetcher)
+    // ⚠️ 关键补充（2026-11-15 实证）：授权码换来的会话在服务端记为
+    // `client_platform=web / trusted_device=false / 无 device_id`，而官方客户端登录后
+    // 那条是 `desktop-windows / trusted=true / 有 device_id`。
+    // 官方在登录后立刻调 `devices_current_bind` + `devices_current_heartbeat`
+    // （见 desktopTrustedDeviceManager），这两步会把**当前会话原地升级**成可信桌面
+    // 会话（实测 session_id 与 login_at 不变）。本插件此前完全没有这两步，
+    // 于是会话形态一直停在 web —— 这是与官方唯一确定的结构性差异。
+    const credential = await upgradeToTrustedDesktopSession(deps.product, exchanged, deps.fetcher)
     deps.settleOk(credential)
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       .end(callbackPageHtml(true, '已切换到桌面端会话，可以关闭这个标签页回到 OFM。'))

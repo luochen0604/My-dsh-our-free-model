@@ -14,6 +14,7 @@ import { verifyChannelCreditsRpc } from './channel-credits-rpc-test.mjs'
 import { verifyChannelOps } from './channel-ops-rpc-test.mjs'
 import { verifyChannelImagePricing } from './channel-image-pricing-test.mjs'
 import { verifyRaccoonDesktopLogin } from './raccoon-desktop-login-test.mjs'
+import { verifyRaccoonDevice } from './raccoon-device-test.mjs'
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-channel-pack-'))
 const kernel = new URL('./lib/channel-pack-kernel.mjs', import.meta.url).href
@@ -298,6 +299,7 @@ try {
   // 桌面端授权要**直接** import 被打包模块（`raccoon-desktop-login.ts`）里的纯函数，
   // bundle 模式没有这些导出（同 `providerSets` 的处理口径），故只在 --source 下跑。
   if (sourceMode) await verifyRaccoonDesktopLogin({ ctx, call, creds })
+if (sourceMode) await verifyRaccoonDevice({ ctx, call, creds })
 
   // A failed browser callback must become a terminal, readable poll result.
   // Before this regression check, the Gemini placeholder was removed and

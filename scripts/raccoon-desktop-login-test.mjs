@@ -134,6 +134,7 @@ export async function verifyRaccoonDesktopLogin({ ctx, call, creds }) {
   // ② 真实起一个回环服务器，模拟官方页面投递 code（含错 state 与正确 state 两次）
   const savedFetch = globalThis.fetch
   let exchangeCalls = []
+  let deviceCalls = []
   globalThis.fetch = async (input, init) => {
     const target = String(input)
     exchangeCalls.push({ url: target, body: init?.body })
@@ -145,6 +146,15 @@ export async function verifyRaccoonDesktopLogin({ ctx, call, creds }) {
     }
     if (target.endsWith('/user_info')) {
       return Response.json({ code: 0, message: 'success', data: { id: '555', name: 'RaccoonDesk', phone: '13800000000' } })
+    }
+    // 换码之后、落盘之前，插件会把会话升级成官方客户端的形态：绑设备 + 心跳。
+    if (target.endsWith('/devices_current_bind')) {
+      deviceCalls.push('bind')
+      return Response.json({ code: 0, message: 'success', data: { device_id: 'dev-desktop-fixture', trusted_device: true } })
+    }
+    if (target.endsWith('/devices_current_heartbeat')) {
+      deviceCalls.push('heartbeat')
+      return Response.json({ code: 0, message: 'success', data: { device_id: 'dev-desktop-fixture', trusted_device: true } })
     }
     throw new Error(`未预期的桌面端授权端点：${new URL(target).pathname}`)
   }
@@ -175,7 +185,15 @@ export async function verifyRaccoonDesktopLogin({ ctx, call, creds }) {
     const ok = await deliver(`code=one-time-code&state=${flowState}`)
     assert.equal(ok.status, 200, `合法回调应成功：${ok.text.slice(0, 200)}`)
     const session = await started.result
-    assert.equal(exchangeCalls.length, 1, '授权码只换一次')
+    assert.equal(
+      exchangeCalls.filter((row) => String(row.url).endsWith('/login_with_authorization_code')).length,
+      1,
+      '授权码只换一次',
+    )
+    // 2026-11-15：换码后必须补上官方客户端的「绑设备 + 心跳」两步，
+    // 否则会话停在 web/trusted=false，这是与官方唯一确定的结构性差异。
+    assert.deepEqual(deviceCalls, ['bind', 'heartbeat'], '换码后必须绑设备并心跳一次')
+    assert.equal(session.device_id, 'dev-desktop-fixture', '绑到的设备 id 要写回凭据，供后续请求带 X-Client-Device-ID')
     assert.equal(JSON.parse(String(exchangeCalls[0]?.body)).authorization_code, 'one-time-code')
     assert.equal(session.sessionSource, 'desktop', '桌面端会话必须打来源标记（每日积分的文案靠它）')
 
