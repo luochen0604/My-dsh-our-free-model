@@ -101,6 +101,7 @@ export async function verifyDoubaoProtocol() {
     describeDoubaoFailure,
     extractDeviceIdFromCookie,
   } = doubao
+  const { DOUBAO } = await import(new URL('doubao-product.ts', sourceRoot).href)
 
   // ── 1. 事件名常量必须覆盖实测的全部事件 ──────────────────────────────
   {
@@ -170,19 +171,49 @@ export async function verifyDoubaoProtocol() {
     console.log('ok  protocol: thinking block falls back to finish_title')
   }
 
-  // ── 6. `CHUNK_DELTA` 出现后必须抑制 `STREAM_CHUNK` 全文 ──────────────
+  // ── 6. `CHUNK_DELTA` 与 `STREAM_CHUNK` 正文是互补增量，不互相抑制 ──────
   {
-    // 服务端在 support_chunk_delta=true 时同时下发两者：
-    // CHUNK_DELTA 是增量、STREAM_CHUNK 的 text_block.text 是**全量快照**。
-    // 两个都收 = 同一段话被播放两遍（真实缺陷形状）。
-    const suppressed = parseDoubaoSseFrame(parseSseBlock(textChunk('完整一句话')), true)
-    assert.equal(suppressed, undefined, 'seenChunkDelta=true 时 STREAM_CHUNK 正文必须被忽略')
-    // 但思考块不受影响（它没有增量替代路径）。
+    /**
+     * ⚠️ **2026-11-16 实测纠正**：参考实现的规则是「先收到 `CHUNK_DELTA` 就不再
+     * 用 `STREAM_CHUNK` 正文」，理由是后者是全量快照。但实测真实流的帧序是：
+     *
+     * | 帧序 | 事件 | 内容 |
+     * |---|---|---|
+     * | 9 | STREAM_CHUNK | text[8] |
+     * | 11 | STREAM_CHUNK | text[20] |
+     * | 14 | STREAM_CHUNK | text[9] |
+     * | 16 | STREAM_CHUNK | text[12] |
+     * | 18 | **CHUNK_DELTA** | text="。" |
+     *
+     * `STREAM_CHUNK` 正文 8+20+9+12=49 字 + `CHUNK_DELTA` 的 1 字 = 50 字，
+     * 与 `SSE_REPLY_END.msg_finish_attr.brief` 逐字一致。两者是**互补的增量流**，
+     * 不是同一段内容的双重表达。
+     *
+     * 若照抄参考实现的抑制规则，当 `CHUNK_DELTA` 先到达时（顺序不保证），
+     * 后续所有 `STREAM_CHUNK` 正文都会被丢掉 —— 用户只会收到一个句号。
+     * 故这里断言：**两者都作为增量输出，不做抑制**。
+     */
+    const deltaFrame = parseSseBlock(frame('CHUNK_DELTA', { text: '。' }))
+    const streamFrame = parseSseBlock(textChunk('正文增量'))
+
+    // 单独看：各自都能产出自己的增量。
+    assert.deepEqual(parseDoubaoSseFrame(deltaFrame), { kind: 'text', text: '。' })
+    assert.deepEqual(parseDoubaoSseFrame(streamFrame), { kind: 'text', text: '正文增量' })
+
+    // 关键：先收到 CHUNK_DELTA 时，STREAM_CHUNK 正文**仍然**必须被输出。
+    // （实测帧序里 CHUNK_DELTA 在最后，但顺序不能作为依赖。）
     assert.deepEqual(
-      parseDoubaoSseFrame(parseSseBlock(thinkingChunk('思考')), true),
+      parseDoubaoSseFrame(streamFrame),
+      { kind: 'text', text: '正文增量' },
+      'CHUNK_DELTA 先到时不得抑制 STREAM_CHUNK 正文（两者是互补增量）',
+    )
+
+    // 思考块不受影响。
+    assert.deepEqual(
+      parseDoubaoSseFrame(parseSseBlock(thinkingChunk('思考'))),
       { kind: 'reasoning', text: '思考' },
     )
-    console.log('ok  protocol: STREAM_CHUNK text is suppressed once CHUNK_DELTA is in use')
+    console.log('ok  protocol: CHUNK_DELTA and STREAM_CHUNK text are complementary deltas, never suppressed')
   }
 
   // ── 7. `SSE_ACK` 给出可复用的会话 id ────────────────────────────────
@@ -364,35 +395,41 @@ export async function verifyDoubaoProtocol() {
     console.log('ok  protocol: credential round-trip preserves deviceId')
   }
 
-  // ── 13. 完整成功流端到端：按真实顺序拼一遍 ──────────────────────────
+  // ── 13. 完整成功流端到端：按真实帧序拼一遍 ──────────────────────────
   {
+    /**
+     * 帧序严格对齐 2026-11-16 实测的真实流：
+     * `STREAM_CHUNK` 正文先来（多段增量），`CHUNK_DELTA` 在最后只带一个句号。
+     * 两者是**互补的增量流**，都作为增量输出。
+     */
     const raw = stream(
       frame('SSE_HEARTBEAT', {}),
       frame('STREAM_TIMEOUT_CONTROL', { timeout: 300 }),
       frame('SSE_ACK', { ack_client_meta: { conversation_id: 'conv-1', section_id: 'sec-1' } }),
       frame('FULL_MSG_NOTIFY', { message: {} }),
       thinkingChunk('先想一想'),
-      frame('CHUNK_DELTA', { text: '回答' }),
-      frame('CHUNK_DELTA', { text: '完毕' }),
-      textChunk('回答完毕'),
+      textChunk('我是豆包'),
+      textChunk('，能为你'),
+      textChunk('提供信息查询'),
+      frame('CHUNK_DELTA', { text: '。' }),
       frame('SSE_REPLY_END', { end_type: 1, msg_finish_attr: { brief: '' } }),
     )
     const { frames } = splitSseBlocks(raw)
-    let sawChunkDelta = false
     const texts = []
     const reasonings = []
     let conversation
     let ended = false
     for (const item of frames) {
-      if (item.event === DOUBAO_SSE.chunkDelta) sawChunkDelta = true
-      const outcome = parseDoubaoSseFrame(item, sawChunkDelta)
+      const outcome = parseDoubaoSseFrame(item)
       if (outcome === undefined) continue
       if (outcome.kind === 'text') texts.push(outcome.text)
       else if (outcome.kind === 'reasoning') reasonings.push(outcome.text)
       else if (outcome.kind === 'conversation') conversation = outcome.conversationId
       else if (outcome.kind === 'end') ended = true
     }
-    assert.deepEqual(texts, ['回答', '完毕'], '正文只能来自 CHUNK_DELTA，且不得被全量快照重复')
+    // 正文来自 STREAM_CHUNK 的多段增量 + CHUNK_DELTA 的句号，按帧序拼接。
+    assert.deepEqual(texts, ['我是豆包', '，能为你', '提供信息查询', '。'],
+      '正文必须按帧序完整拼接：STREAM_CHUNK 增量 + CHUNK_DELTA 结尾，不互相抑制')
     assert.deepEqual(reasonings, ['先想一想'], '思考过程必须保留')
     assert.equal(conversation, 'conv-1', '会话 id 必须取出')
     assert.equal(ended, true)
@@ -418,6 +455,92 @@ export async function verifyDoubaoProtocol() {
     assert.deepEqual(clarify, ['需要你确认目录'], '反问问题必须被识别')
     assert.equal(ended, false, '反问流确实没有结束帧 —— 所以调用方必须自己收尾')
     console.log('ok  protocol: interaction-ask arrives without a completion frame')
+  }
+
+  // ── 14. 额度：优先用服务端绝对值，不臆造 ──────────────────────────────
+  {
+    /**
+     * ⚠️ **2026-11-16 实测纠正**：`incentive_quota_section` 里服务端**确实给
+     * 绝对值**（`total_amount: "400"`、`used_amount: "0"`），不是只有百分比。
+     * 旧实现一律用 `DOUBAO_ACTIVITY_GRANT_SIZE`(200) 硬编码总额 + 百分比换算，
+     * 于是单包 400 被算成 200，界面显示「可用 200」而实际是 400。
+     */
+    const { fetchDoubaoCreditBalance } = await import(new URL('doubao-credits.ts', sourceRoot).href)
+
+    const credential = {
+      cookie: 'sessionid=fixture', uid: 'u', nickname: '',
+      lastVerifiedAt: 1, desktop: true,
+    }
+
+    // 服务端给绝对值（真实形态）。
+    const absolute = {
+      code: 0,
+      data: {
+        incentive_quota_section: {
+          entitlement_count: 1,
+          usage_exhausted: false,
+          window_limit_groups: [{
+            feature_group: 'doubao_activity_reward_quota',
+            feature_group_name: '活动赠送额度',
+            window_limits: [{
+              end_time: 1797416867924,
+              total_amount: '400',
+              used_amount: '0',
+              used_percent: 0,
+            }],
+          }],
+        },
+      },
+    }
+    const savedFetch = globalThis.fetch
+    globalThis.fetch = async () => new Response(JSON.stringify(absolute), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })
+    try {
+      const balance = await fetchDoubaoCreditBalance(credential, DOUBAO)
+      assert.equal(balance?.packages.length, 1, '应识别出 1 个额度包')
+      assert.equal(balance.packages[0].total, 400,
+        '必须用服务端的 total_amount=400，而不是硬编码 200')
+      assert.equal(balance.packages[0].used, 0, '必须用服务端的 used_amount=0')
+      assert.equal(balance.total, 400, '总余额必须是 400')
+    } finally {
+      globalThis.fetch = savedFetch
+    }
+
+    // 服务端只给百分比（老账号形态）：回退到硬编码 + 百分比换算。
+    const percentOnly = {
+      code: 0,
+      data: {
+        incentive_quota_section: {
+          window_limit_groups: [{
+            feature_group_name: '活动赠送额度',
+            window_limits: [{ total_amount: undefined, used_percent: 50 }],
+          }],
+        },
+      },
+    }
+    globalThis.fetch = async () => new Response(JSON.stringify(percentOnly), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })
+    try {
+      const balance2 = await fetchDoubaoCreditBalance(credential, DOUBAO)
+      assert.equal(balance2?.packages[0].total, 200, '无绝对值时回退到 DOUBAO_ACTIVITY_GRANT_SIZE')
+      assert.equal(balance2.packages[0].used, 100, '百分比 50% 换算成已用 100')
+    } finally {
+      globalThis.fetch = savedFetch
+    }
+
+    // 两者都没有：返回 undefined（拿不到），不编造 0。
+    globalThis.fetch = async () => new Response(JSON.stringify({ code: 0, data: {} }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    })
+    try {
+      const balance3 = await fetchDoubaoCreditBalance(credential, DOUBAO)
+      assert.equal(balance3, undefined, '无额度数据时返回 undefined，不显示 0')
+    } finally {
+      globalThis.fetch = savedFetch
+    }
+    console.log('ok  protocol: credit balance prefers server absolute amounts over hardcoded guesses')
   }
 
   console.log('doubao-protocol: all assertions passed')

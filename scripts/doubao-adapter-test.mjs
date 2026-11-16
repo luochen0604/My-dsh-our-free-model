@@ -308,17 +308,26 @@ export async function verifyDoubaoAdapter() {
     console.log('ok  adapter: msg_finish_attr.brief backs up a text-less stream')
   }
 
-  // ── 10. `CHUNK_DELTA` 与 `STREAM_CHUNK` 同时下发时不重复正文 ────────
+  // ── 10. `CHUNK_DELTA` 与 `STREAM_CHUNK` 正文是互补增量，都要输出 ──────
   {
-    // 服务端在 support_chunk_delta=true 时两者都发：前者增量、后者全量快照。
-    const snapshot = frame('STREAM_CHUNK', {
-      patch_op: [{ patch_value: { content_block: [{ block_type: 10000, content: { text_block: { text: '完整一句话' } } }] } }],
+    /**
+     * ⚠️ **2026-11-16 实测纠正**：参考实现的规则是「先收到 `CHUNK_DELTA` 就
+     * 不再用 `STREAM_CHUNK` 正文」，理由是后者是全量快照。但实测真实流的帧序是
+     * 正文先走 `STREAM_CHUNK`（4 段增量），`CHUNK_DELTA` 只在最后带了一个句号。
+     * 两者是**互补的增量流**，不是同一段内容的双重表达。
+     *
+     * 这里断言：两者都作为增量输出。若退化成抑制，`CHUNK_DELTA` 先到时
+     * 后续所有 `STREAM_CHUNK` 正文都会被丢掉 —— 用户只会收到一个句号。
+     */
+    const streamText = frame('STREAM_CHUNK', {
+      patch_op: [{ patch_value: { content_block: [{ block_type: 10000, content: { text_block: { text: '正文增量' } } }] } }],
     })
-    const { run } = await makeAdapter([ack('conv-G') + delta('完整') + delta('一句话') + snapshot + end()])
+    const { run } = await makeAdapter([ack('conv-G') + delta('正文') + delta('增量') + streamText + end()])
     const summary = summarize(await run())
-    assert.equal(summary.text, '完整一句话',
-      '正文不得被全量快照重复叠加（否则用户看到两遍）')
-    console.log('ok  adapter: snapshot frames do not duplicate CHUNK_DELTA text')
+    // STREAM_CHUNK 正文仍然被输出（不被抑制），与 CHUNK_DELTA 的增量拼接。
+    assert.equal(summary.text, '正文增量正文增量',
+      'CHUNK_DELTA 与 STREAM_CHUNK 正文都必须作为增量输出（两者互补，不互相抑制）')
+    console.log('ok  adapter: CHUNK_DELTA and STREAM_CHUNK text are both emitted as deltas')
   }
 
   // ── 11. 会话缓存按 DSH 会话隔离（不同会话不串） ──────────────────────

@@ -51,7 +51,6 @@ import {
 import {
   DOUBAO_CHUNK_TIMEOUT_MS,
   DOUBAO_FIRST_TOKEN_TIMEOUT_MS,
-  DOUBAO_SSE,
   doubaoHeaders,
   isDoubaoAuthError,
   isDoubaoRateLimitError,
@@ -554,7 +553,6 @@ export class DoubaoAdapter extends LlmAdapter {
     let sawText = false
     let sawReasoning = false
     let sawDone = false
-    let sawChunkDelta = false
     let sawClarify = false
     let finishedBrief = ''
     let clarifiedQuestions: string[] = []
@@ -592,11 +590,10 @@ export class DoubaoAdapter extends LlmAdapter {
         buffer = rest
 
         for (const frame of frames) {
-          // `CHUNK_DELTA` 一旦出现，`STREAM_CHUNK` 的正文就变成全量快照，
-          // 必须停止重复消费它——见 `collectStreamChunk` 的说明。
-          if (frame.event === DOUBAO_SSE.chunkDelta) sawChunkDelta = true
-
-          const parsed = parseDoubaoSseFrame(frame, sawChunkDelta)
+          // ⚠️ `CHUNK_DELTA` 与 `STREAM_CHUNK` 正文是**互补的增量流**，
+          // 不是同一段内容的双重表达（见 `doubao.ts` 的 `collectStreamChunk`
+          // 注释，含 2026-11-16 实测帧序）。两者都按增量消费，不做抑制。
+          const parsed = parseDoubaoSseFrame(frame)
           if (parsed === undefined) continue
 
           if (parsed.kind === 'error') {

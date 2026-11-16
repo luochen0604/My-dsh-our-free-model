@@ -562,10 +562,31 @@ function stringField(source: unknown, key: string): string {
  * ⚠️ `patch_value.content_block` 里可能同时出现多种块，因此**逐个按
  * `block_type` 分派**，不靠 `patch_type` 猜（耗时块也带 `content_block`，
  * 但没有 `text_block.text`，按字段存在性过滤即可）。
+ *
+ * ⚠️ **2026-11-16 实测校正：`STREAM_CHUNK` 的正文是增量，不是全量快照。**
+ *
+ * 参考实现（`dsh-connect-doubaowork` 的 `doubao-protocol.js`）的规则是
+ * 「先收到 `CHUNK_DELTA` 就不再用 `STREAM_CHUNK` 的正文」，理由是后者是快照。
+ * 但实测的真实流是：
+ *
+ * | 帧序 | 事件 | 内容 |
+ * |---|---|---|
+ * | 9 | STREAM_CHUNK | text[8] |
+ * | 11 | STREAM_CHUNK | text[20] |
+ * | 14 | STREAM_CHUNK | text[9] |
+ * | 16 | STREAM_CHUNK | text[12] |
+ * | 18 | **CHUNK_DELTA** | text="。" |
+ *
+ * `STREAM_CHUNK` 正文 8+20+9+12 = 49 字 + `CHUNK_DELTA` 的 1 字 = 50 字，
+ * 与 `SSE_REPLY_END.msg_finish_attr.brief` 完全一致。两者是**互补的增量流**，
+ * 不是同一段内容的双重表达。
+ *
+ * 后果：若照抄参考实现的抑制规则，当 `CHUNK_DELTA` **先于**正文到达时
+ * （顺序不保证），后续所有 `STREAM_CHUNK` 正文都会被丢掉 —— 用户只会收到
+ * 一个句号或什么都没收到。故这里**不做抑制**，两个来源都作为增量追加。
  */
 function collectStreamChunk(
   payload: unknown,
-  seenChunkDelta: boolean,
   sink: {
     text: (value: string) => void
     reasoning: (value: string) => void
@@ -590,12 +611,6 @@ function collectStreamChunk(
       const contentRecord = content as Record<string, unknown>
 
       if (blockType === DOUBAO_BLOCK.text) {
-        /**
-         * ⚠️ 有 `CHUNK_DELTA` 时**不再**用这里的全文，否则同一段话会被发两遍。
-         * 实测：服务端 `support_chunk_delta: true` 时会同时下发两者，
-         * `CHUNK_DELTA` 是增量、`STREAM_CHUNK` 的 `text_block.text` 是**全量快照**。
-         */
-        if (seenChunkDelta) continue
         const textBlock = contentRecord['text_block']
         const text = stringField(textBlock, 'text')
         if (text.length > 0) sink.text(text)
@@ -640,13 +655,10 @@ function collectStreamChunk(
  * 把一帧 SSE 解析成可消费的语义结果。
  *
  * @param frame `parseSseBlock` / `splitSseBlocks` 切出的帧
- * @param seenChunkDelta 本流里是否**已经**收到过 `CHUNK_DELTA`。
- *   为 `true` 时忽略 `STREAM_CHUNK` 的正文全文（避免重复播放）。
  * @returns `undefined` = 该帧无内容（心跳/元数据/空 data），调用方跳过即可。
  */
 export function parseDoubaoSseFrame(
   frame: DoubaoSseFrame,
-  seenChunkDelta = false,
 ): DoubaoSseOutcome | undefined {
   const event = frame.event
   const payload = frame.data
@@ -674,7 +686,7 @@ export function parseDoubaoSseFrame(
     let text = ''
     let reasoning = ''
     let clarify: string[] = []
-    collectStreamChunk(data, seenChunkDelta, {
+    collectStreamChunk(data, {
       text: (value) => { text += value },
       reasoning: (value) => { reasoning += value },
       clarify: (value) => { clarify = value },

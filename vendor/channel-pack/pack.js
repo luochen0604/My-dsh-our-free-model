@@ -42289,7 +42289,7 @@ function stringField(source, key) {
   const value = source[key];
   return typeof value === "string" ? value : "";
 }
-function collectStreamChunk(payload, seenChunkDelta, sink) {
+function collectStreamChunk(payload, sink) {
   if (payload === null || typeof payload !== "object") return;
   const ops = payload["patch_op"];
   if (!Array.isArray(ops)) return;
@@ -42307,7 +42307,6 @@ function collectStreamChunk(payload, seenChunkDelta, sink) {
       if (content === null || typeof content !== "object") continue;
       const contentRecord = content;
       if (blockType === DOUBAO_BLOCK.text) {
-        if (seenChunkDelta) continue;
         const textBlock = contentRecord["text_block"];
         const text = stringField(textBlock, "text");
         if (text.length > 0) sink.text(text);
@@ -42335,7 +42334,7 @@ function collectStreamChunk(payload, seenChunkDelta, sink) {
     }
   }
 }
-function parseDoubaoSseFrame(frame, seenChunkDelta = false) {
+function parseDoubaoSseFrame(frame) {
   const event = frame.event;
   const payload = frame.data;
   if (event === DOUBAO_SSE.heartbeat || event === DOUBAO_SSE.timeoutControl || event === DOUBAO_SSE.fullMsgNotify || event === DOUBAO_SSE.streamMsgNotify || event === DOUBAO_SSE.pb || event === DOUBAO_SSE.json) {
@@ -42356,7 +42355,7 @@ function parseDoubaoSseFrame(frame, seenChunkDelta = false) {
     let text = "";
     let reasoning = "";
     let clarify = [];
-    collectStreamChunk(data, seenChunkDelta, {
+    collectStreamChunk(data, {
       text: (value) => {
         text += value;
       },
@@ -42693,9 +42692,8 @@ async function fetchDoubaoCreditBalance(credential, product = DOUBAO, fetchImpl 
         if (!Array.isArray(limits)) continue;
         for (const limit of limits) {
           if (limit === null || typeof limit !== "object") continue;
-          const usedPercent = normalizePercent(pick(limit, ["used_percent"]));
-          const total = DOUBAO_ACTIVITY_GRANT_SIZE;
-          const used = Math.round(total * usedPercent / 100);
+          const total = parseAmount(pick(limit, ["total_amount"])) ?? DOUBAO_ACTIVITY_GRANT_SIZE;
+          const used = parseAmount(pick(limit, ["used_amount"])) ?? Math.round(total * normalizePercent(pick(limit, ["used_percent"])) / 100);
           const endMs = toMillis(pick(limit, ["end_time"]));
           const active = endMs === 0 || endMs > now;
           packages.push({
@@ -43698,7 +43696,6 @@ var DoubaoAdapter = class _DoubaoAdapter extends LlmAdapter7 {
     let sawText = false;
     let sawReasoning = false;
     let sawDone = false;
-    let sawChunkDelta = false;
     let sawClarify = false;
     let finishedBrief = "";
     let clarifiedQuestions = [];
@@ -43730,8 +43727,7 @@ var DoubaoAdapter = class _DoubaoAdapter extends LlmAdapter7 {
         const { frames, rest } = splitSseBlocks(buffer);
         buffer = rest;
         for (const frame of frames) {
-          if (frame.event === DOUBAO_SSE.chunkDelta) sawChunkDelta = true;
-          const parsed = parseDoubaoSseFrame(frame, sawChunkDelta);
+          const parsed = parseDoubaoSseFrame(frame);
           if (parsed === void 0) continue;
           if (parsed.kind === "error") {
             const readable = describeDoubaoFailure(frame.data);

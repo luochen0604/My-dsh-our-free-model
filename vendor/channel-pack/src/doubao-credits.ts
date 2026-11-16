@@ -424,11 +424,31 @@ export async function fetchDoubaoCreditBalance(
   }
 
   /**
-   * ## 兜底：活动赠送额度（**只有百分比**）
+   * ## 兜底：活动赠送额度
    *
-   * 老账号 / 纯活动额度账号走这里：`incentive_quota_section` 与
-   * `incentive_quota_entitlements[]` 只给 `used_percent`，绝对额度按实观察到的
-   * 单包 200 换算（见 `DOUBAO_ACTIVITY_GRANT_SIZE` 注释）。
+   * 老账号 / 纯活动额度账号走这里。
+   *
+   * ⚠️ **2026-11-16 实测校正：服务端其实给绝对值，不是只有百分比。**
+   *
+   * 实测 `incentive_quota_section.window_limit_groups[].window_limits[]`：
+   *
+   * ```jsonc
+   * {
+   *   "feature_group_name": "活动赠送额度",
+   *   "window_limits": [{
+   *     "end_time": 1797416867924,
+   *     "total_amount": "400",   // ← 绝对总额，字符串
+   *     "used_amount": "0",      // ← 绝对已用，字符串
+   *     "used_percent": 0
+   *   }]
+   * }
+   * ```
+   *
+   * 此前这里一律用 `DOUBAO_ACTIVITY_GRANT_SIZE`(200) 硬编码总额 + 百分比换算，
+   * 于是单包 400 被算成 200，界面显示「可用 200」而实际是 400。
+   *
+   * 修法：**优先用服务端给的 `total_amount` / `used_amount`**，
+   * 只有拿不到时才回退到硬编码 + 百分比换算（保持向后兼容）。
    */
   if (packages.length === 0) {
     const incentive = pick(data, ['incentive_quota_section'])
@@ -443,9 +463,10 @@ export async function fetchDoubaoCreditBalance(
         if (!Array.isArray(limits)) continue
         for (const limit of limits) {
           if (limit === null || typeof limit !== 'object') continue
-          const usedPercent = normalizePercent(pick(limit, ['used_percent']))
-          const total = DOUBAO_ACTIVITY_GRANT_SIZE
-          const used = Math.round(total * usedPercent / 100)
+          /** 服务端给绝对值就用它；拿不到才用硬编码 + 百分比换算。 */
+          const total = parseAmount(pick(limit, ['total_amount'])) ?? DOUBAO_ACTIVITY_GRANT_SIZE
+          const used = parseAmount(pick(limit, ['used_amount']))
+            ?? Math.round(total * normalizePercent(pick(limit, ['used_percent'])) / 100)
           const endMs = toMillis(pick(limit, ['end_time']))
           const active = endMs === 0 || endMs > now
           packages.push({
