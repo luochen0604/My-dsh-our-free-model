@@ -129,6 +129,34 @@ function readInputModalities(entry: Record<string, unknown>): string[] {
 }
 
 /**
+ * 合并多个账号拉到的远端目录：按 id 取并集，先见者优先、顺序保持稳定。
+ *
+ * ## 为什么必须合并（实测，用户报障 2026-11-18）
+ *
+ * Loomy 的 `/api/v1/models` 目录是**按账号下发**的：实测同一时刻三个账号，
+ * 两个只见 `spark-x2.6-low/-4b`，一个能看到完整目录（`deepseek-v4-flash-1017` /
+ * `DeepSeek-V4.1-Flash` / `GLM-5.3-Flash` / `qwen3.8-flash` …）。旧实现只拿
+ * **一个**账号（余额选号选中的那个）的目录，选中「窄目录」账号时整个
+ * provider 就只剩 2 个模型 —— 而官方客户端给每个账号各自渲染目录，
+ * 所以「客户端里有 DS 4.1」而 OFM 里没有。
+ *
+ * 合并语义：任一账号声明过的模型都进列表 —— chat 请求本身按账号轮换，
+ * 模型级限流/不可用由既有机制兜底。重复 id 不去改字段（各账号的同 id
+ * 条目元数据一致，实测 `reasoning_catalog_version` 相同）。
+ */
+export function mergeLoomyModelCatalogs(
+  catalogs: readonly (readonly LoomyRemoteModel[])[],
+): LoomyRemoteModel[] {
+  const byId = new Map<string, LoomyRemoteModel>()
+  for (const catalog of catalogs) {
+    for (const model of catalog) {
+      if (!byId.has(model.id)) byId.set(model.id, model)
+    }
+  }
+  return [...byId.values()]
+}
+
+/**
  * 解析远端 `GET /models` 响应，只保留 `type === 'chat'` 的条目。
  *
  * ⚠️ 过滤判据是 `type`，**不能**看 `input_modalities` —— 实测 5 个 chat

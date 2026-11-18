@@ -1034,7 +1034,22 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
   }
 
   const { RaccoonAdapter } = await import('../vendor/channel-pack/src/raccoon-adapter.ts')
-  const { LoomyAdapter } = await import('../vendor/channel-pack/src/loomy-adapter.ts')
+  const { LoomyAdapter, mergeLoomyModelCatalogs } = await import('../vendor/channel-pack/src/loomy-adapter.ts')
+  // loomy 目录按账号下发（实测 2026-11-18）：合并必须取并集、先到者优先、顺序稳定。
+  {
+    const merged = mergeLoomyModelCatalogs([
+      [{ id: 'spark-x2.6-low', name: 'spark x2.6', contextWindow: 1048576, supportsImage: false, supportsThinking: true }],
+      [
+        { id: 'deepseek-v4-flash-1017', name: 'DeepSeek V4.1 Flash 1017', contextWindow: 1048576, supportsImage: true, supportsThinking: true },
+        { id: 'spark-x2.6-low', name: 'spark x2.6', contextWindow: 1048576, supportsImage: false, supportsThinking: true },
+      ],
+      [{ id: 'GLM-5.3-Flash', name: 'GLM 5.3 Flash', contextWindow: 1048576, supportsImage: true, supportsThinking: true }],
+    ])
+    assert.deepEqual(merged.map(row => row.id), ['spark-x2.6-low', 'deepseek-v4-flash-1017', 'GLM-5.3-Flash'],
+      'catalog union keeps first-seen order and does not duplicate ids')
+    assert.equal(mergeLoomyModelCatalogs([]).length, 0, 'empty input merges to empty')
+    assert.equal(mergeLoomyModelCatalogs([[], []]).length, 0, 'all-narrow catalogs merge to empty')
+  }
   const { nextUtc8DayStartMs } = await import('../vendor/channel-pack/src/model-queue.ts')
   const credential = token => ({ access_token: token, refresh_token: `refresh-${token}` })
   for (const [provider, Adapter] of [['raccoon', RaccoonAdapter], ['loomy', LoomyAdapter]]) {

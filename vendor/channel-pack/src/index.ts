@@ -6,7 +6,7 @@ import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerQoderLlm } from './qoder-adapter.js'
 import { registerTraeLlm } from './trae-adapter.js'
 import { registerClineLlm } from './cline-adapter.js'
-import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
+import { registerLoomyLlm, parseLoomyRemoteModels, mergeLoomyModelCatalogs, type LoomyRemoteModel } from './loomy-adapter.js'
 import { registerRaccoonLlm } from './raccoon-adapter.js'
 import { DoubaoAuth } from './doubao-auth.js'
 import { registerDoubaoLlm } from './doubao-adapter.js'
@@ -807,25 +807,51 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
     // 远端模型目录：GET /api/v1/models。
     // ⚠️ 必须用 **token 头**（业务端点），不是 Bearer —— 带错会得到
     // `100002 缺少 token`，表现为「模型列表永远停在兜底表」。
-    // 失败时返回空数组，由适配器回退兜底表。
+    //
+    // ⚠️ 目录是**按账号下发**的（实测 2026-11-18，用户报障）：同一时刻不同
+    // 账号拿到的列表可以完全不同（有的只有 spark，有的有全量 DS/GLM/Qwen）。
+    // 故这里遍历**全部启用账号**逐个拉取并按 id 取并集
+    // （`mergeLoomyModelCatalogs`），任一账号声明过的模型都要出现在选择器里；
+    // 单账号失败只丢它自己的目录，不影响其它账号。全部失败时返回空数组，
+    // 由适配器回退兜底表。
     fetchRemoteModels: async () => {
-      const available = await pool.getAvailableAccount(LOOMY.id, '')
-      const resolved = available !== null && available !== undefined
-        ? { value: JSON.stringify(available.credential) }
-        : await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
-      if (resolved === undefined) return []
-      let credential: LoomyCredential
-      try {
-        credential = JSON.parse(resolved.value) as LoomyCredential
-      } catch {
-        return []
+      const tokens: string[] = []
+      for (const account of pool.listAccountsByProvider(LOOMY.id)) {
+        if (!account.enabled) continue
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) continue
+          const credential = JSON.parse(resolved.value) as LoomyCredential
+          if (typeof credential.access_token === 'string' && credential.access_token.length > 0) {
+            tokens.push(credential.access_token)
+          }
+        } catch { /* 单个凭据解析失败不拖累其它账号 */ }
       }
-      const response = await fetch(`${LOOMY.apiBase}/models`, {
-        headers: { Accept: 'application/json', token: credential.access_token },
-        signal: AbortSignal.timeout(30_000),
-      })
-      if (!response.ok) return []
-      return parseLoomyRemoteModels(await response.json())
+      // 无账号池时的单凭据兜底（去重：可能与某账号是同一个 token）。
+      try {
+        const resolved = await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
+        if (resolved) {
+          const credential = JSON.parse(resolved.value) as LoomyCredential
+          const token = credential.access_token
+          if (typeof token === 'string' && token.length > 0 && !tokens.includes(token)) {
+            tokens.push(token)
+          }
+        }
+      } catch { /* 同上 */ }
+      if (tokens.length === 0) return []
+
+      const catalogs: LoomyRemoteModel[][] = []
+      for (const token of tokens) {
+        try {
+          const response = await fetch(`${LOOMY.apiBase}/models`, {
+            headers: { Accept: 'application/json', token },
+            signal: AbortSignal.timeout(15_000),
+          })
+          if (!response.ok) continue
+          catalogs.push(parseLoomyRemoteModels(await response.json()))
+        } catch { /* 单账号失败只丢它自己的目录 */ }
+      }
+      return mergeLoomyModelCatalogs(catalogs)
     },
     // 图片字节桥接：按模型能力判定（远端 capabilities.input_modalities 含 image）。
     readImage: makeReadImage(ctx),
