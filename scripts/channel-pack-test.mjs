@@ -1011,6 +1011,25 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
       allOf: [{ required: ['a', 'b'] }, { required: ['c'] }],
     })
     assert.deepEqual([...unioned.required].sort(), ['a', 'b', 'c'], 'required is unioned across allOf')
+    // 白名单：allOf 之外的私键（anyOf/$ref/const/examples）整键删除，
+    // 递归下钻 properties 同罪；enum 空串成员剔除。
+    const whitelisted = trae.sanitizeTraeToolParameters({
+      type: 'object',
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      properties: {
+        mode: { type: 'string', enum: ['', 'fast', 'slow'], examples: ['fast'] },
+        target: { anyOf: [{ type: 'string' }, { type: 'null' }], $ref: '#/$defs/x' },
+        note: { type: 'string', default: '' },
+      },
+    })
+    assert.deepEqual(whitelisted, {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['fast', 'slow'] },
+        target: {},
+        note: { type: 'string', default: '' },
+      },
+    }, 'unknown keywords are dropped recursively, empty enum members removed')
     console.log('ok  source trae: tool parameter schemas are flattened (no allOf) before serialization')
   }
 

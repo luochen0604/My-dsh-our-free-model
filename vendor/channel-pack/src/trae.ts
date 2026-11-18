@@ -1662,25 +1662,36 @@ function normalizeToolChoice(body: Record<string, unknown>): void {
 }
 
 /**
- * 清洗工具参数 schema 里的 `allOf` 组合器（递归摊平）。
+ * TRAE 上游认的工具 schema 键白名单。
  *
- * ## 为什么必须清洗（实测 4027，用户报障 2026-11-18）
+ * ## 为什么用白名单而不是逐键打补丁（实测 4027，用户报障 2026-11-18）
  *
- * harness 下发的工具 schema 里，路径类参数常用这种形状：
- *
- * ```jsonc
- * { "expected_server_path": { "allOf": [{ "pattern": "…" }, { "pattern": "^/" }] } }
- * ```
- *
- * TRAE 上游对 `function.parameters` 做**严格 JSON Schema 校验**，不认 `allOf`
- * （报 `…/allOf/1/pattern: invalid JSON Schema`，code=4027），整个请求被拒。
- * `pattern`/`minLength` 这类常规键它本身是支持的 —— 拒的只是组合器。
+ * TRAE 上游对 `function.parameters` 做**严格 JSON Schema 校验**，遇到不认的
+ * 键就整段拒绝（`invalid JSON Schema; check the schema keywords and
+ * references`，code=4027）。第一轮只摊平 `allOf` 后，换一个工具立刻暴露下一批
+ * 不认的键（`…/properties/type: invalid`）—— 逐键打补丁等于跟上游的
+ * 私有校验器打地鼠。白名单一次收口：**只留 OpenAI function-calling 公认
+ * 支持的键**，其余（`$ref` / `anyOf` / `oneOf` / `const` / `examples` /
+ * `$schema` / `not` …）整键删除，上游没有机会再拒。
  *
  * ⚠️ 本适配器从不自己造 schema —— `stream()` 原样透传
  * `options.tools[].parameters`，脏数据来自上游 harness。但请求是我们发的，
  * 只能在我们这一侧拦住（与 `sanitizeClineToolParameters` 同因同型）。
+ */
+const TRAE_SCHEMA_ALLOWED_KEYS = new Set([
+  // 结构
+  'type', 'description', 'title', 'properties', 'required', 'items',
+  'additionalProperties',
+  // 约束（JSON Schema 标准关键词，OpenAI 生态普遍支持）
+  'enum', 'pattern', 'format', 'default',
+  'minimum', 'maximum', 'minLength', 'maxLength',
+  'minItems', 'maxItems', 'uniqueItems', 'multipleOf',
+])
+
+/**
+ * 清洗工具参数 schema（递归）：摊平 `allOf` + 按白名单剔键。
  *
- * ## 摊平规则
+ * ## 摊平规则（`allOf`）
  *
  * - 父级键**优先**：子 schema 里的键只有在父级没有同名键时才并入
  *   （两个 `pattern` 无法并存时保父级/先到的，语义近似）；
@@ -1688,35 +1699,59 @@ function normalizeToolChoice(body: Record<string, unknown>): void {
  * - 并入 `pattern` 后若仍无 `type`，补 `type: "string"` —— `pattern` 只约束
  *   字符串，声明它不改变校验意图，却能避免上游对「无类型的 pattern」再报错；
  * - 递归下钻：`properties` / `items` / 子 schema 里的嵌套 `allOf` 同罪。
+ *
+ * ## 白名单剔键
+ *
+ * 摊平后按 {@link TRAE_SCHEMA_ALLOWED_KEYS} 过滤，其余整键删除。
+ * `enum` 里的空字符串成员一并剔除（Gemini 系同款教训，见
+ * `sanitizeClineToolParameters`），剔空后为空则整键删除。
  */
 export function sanitizeTraeToolParameters(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sanitizeTraeToolParameters)
   if (value === null || typeof value !== 'object') return value
   const source = value as Record<string, unknown>
-  // 第一遍：父级自身的键（`allOf` 留到第二遍，保证父级键优先）。
-  const out: Record<string, unknown> = {}
+  // ── 第一遍：摊平 allOf（父级自身的键先入，保证父级键优先）──
+  const merged: Record<string, unknown> = {}
   for (const [key, raw] of Object.entries(source)) {
     if (key === 'allOf') continue
-    out[key] = sanitizeTraeToolParameters(raw)
+    merged[key] = raw
   }
-  // 第二遍：把 `allOf` 子 schema 逐个并入父级。
   const combinators = source.allOf
   if (Array.isArray(combinators)) {
     for (const item of combinators) {
       if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
       const sub = sanitizeTraeToolParameters(item) as Record<string, unknown>
       for (const [key, raw] of Object.entries(sub)) {
-        if (key === 'required' && Array.isArray(out.required) && Array.isArray(raw)) {
-          out.required = [...new Set([...out.required, ...raw])]
-        } else if (!(key in out)) {
-          out[key] = raw
+        if (key === 'required' && Array.isArray(merged.required) && Array.isArray(raw)) {
+          merged.required = [...new Set([...merged.required, ...raw])]
+        } else if (!(key in merged)) {
+          merged[key] = raw
         }
       }
     }
   }
-  // `pattern` 只对字符串有意义：摊平后缺 `type` 就补上，避免上游对
-  // 「无类型的 pattern」再次拒绝（错误信息只说 invalid，不给这次机会）。
-  if ('pattern' in out && !('type' in out)) out.type = 'string'
+  if ('pattern' in merged && !('type' in merged)) merged.type = 'string'
+  // ── 第二遍：白名单过滤（递归下钻对象/数组值）──
+  const out: Record<string, unknown> = {}
+  for (const [key, raw] of Object.entries(merged)) {
+    if (!TRAE_SCHEMA_ALLOWED_KEYS.has(key)) continue
+    if (key === 'enum' && Array.isArray(raw)) {
+      const cleaned = raw.filter((item) => !(typeof item === 'string' && item.trim().length === 0))
+      if (cleaned.length > 0) out[key] = cleaned
+      continue
+    }
+    if (key === 'properties' && raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+      // ⚠️ `properties` 的键是**属性名**，不是 schema 关键词 —— 不能拿白名单
+      // 过滤（否则所有属性都会被误删）。键全保留，只递归清洗每属性自己的 schema。
+      const map: Record<string, unknown> = {}
+      for (const [name, prop] of Object.entries(raw as Record<string, unknown>)) {
+        map[name] = sanitizeTraeToolParameters(prop)
+      }
+      out[key] = map
+      continue
+    }
+    out[key] = sanitizeTraeToolParameters(raw)
+  }
   return out
 }
 

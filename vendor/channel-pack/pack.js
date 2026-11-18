@@ -38765,14 +38765,37 @@ function normalizeToolChoice(body) {
   }
   delete body.tool_choice;
 }
+var TRAE_SCHEMA_ALLOWED_KEYS = /* @__PURE__ */ new Set([
+  // 结构
+  "type",
+  "description",
+  "title",
+  "properties",
+  "required",
+  "items",
+  "additionalProperties",
+  // 约束（JSON Schema 标准关键词，OpenAI 生态普遍支持）
+  "enum",
+  "pattern",
+  "format",
+  "default",
+  "minimum",
+  "maximum",
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "uniqueItems",
+  "multipleOf"
+]);
 function sanitizeTraeToolParameters(value) {
   if (Array.isArray(value)) return value.map(sanitizeTraeToolParameters);
   if (value === null || typeof value !== "object") return value;
   const source = value;
-  const out = {};
+  const merged = {};
   for (const [key, raw] of Object.entries(source)) {
     if (key === "allOf") continue;
-    out[key] = sanitizeTraeToolParameters(raw);
+    merged[key] = raw;
   }
   const combinators = source.allOf;
   if (Array.isArray(combinators)) {
@@ -38780,15 +38803,33 @@ function sanitizeTraeToolParameters(value) {
       if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
       const sub = sanitizeTraeToolParameters(item);
       for (const [key, raw] of Object.entries(sub)) {
-        if (key === "required" && Array.isArray(out.required) && Array.isArray(raw)) {
-          out.required = [.../* @__PURE__ */ new Set([...out.required, ...raw])];
-        } else if (!(key in out)) {
-          out[key] = raw;
+        if (key === "required" && Array.isArray(merged.required) && Array.isArray(raw)) {
+          merged.required = [.../* @__PURE__ */ new Set([...merged.required, ...raw])];
+        } else if (!(key in merged)) {
+          merged[key] = raw;
         }
       }
     }
   }
-  if ("pattern" in out && !("type" in out)) out.type = "string";
+  if ("pattern" in merged && !("type" in merged)) merged.type = "string";
+  const out = {};
+  for (const [key, raw] of Object.entries(merged)) {
+    if (!TRAE_SCHEMA_ALLOWED_KEYS.has(key)) continue;
+    if (key === "enum" && Array.isArray(raw)) {
+      const cleaned = raw.filter((item) => !(typeof item === "string" && item.trim().length === 0));
+      if (cleaned.length > 0) out[key] = cleaned;
+      continue;
+    }
+    if (key === "properties" && raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+      const map = {};
+      for (const [name2, prop] of Object.entries(raw)) {
+        map[name2] = sanitizeTraeToolParameters(prop);
+      }
+      out[key] = map;
+      continue;
+    }
+    out[key] = sanitizeTraeToolParameters(raw);
+  }
   return out;
 }
 function normalizeTools(body) {
