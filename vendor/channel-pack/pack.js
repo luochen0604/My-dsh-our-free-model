@@ -38303,10 +38303,11 @@ function randomHex(n) {
   crypto.getRandomValues(buf);
   return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("").slice(0, n);
 }
-function traeOAuthHeaders(token = "") {
+function traeOAuthHeaders(product) {
   return {
     "Content-Type": "application/json",
-    "x-cloudide-token": token
+    Accept: "application/json",
+    "User-Agent": product.userAgent
   };
 }
 function parseTraeExchangeResponse(data) {
@@ -45836,40 +45837,27 @@ function parseTraeCallbackDetailed(rawUrl) {
   return { ok: true, info };
 }
 async function exchangeTraeCallback(callback, session, product, fetcher = fetch, nowMs = Date.now()) {
-  const exchangeUrl = `${product.oauthHost}${TRAE_EXCHANGE_PATH}`;
   let exchange;
-  if (callback.authCode !== void 0 && callback.authCode.length > 0) {
-    if (session.codeVerifier.length === 0) {
-      throw new Error("TRAE \u56DE\u8C03\u8FD4\u56DE\u4E86\u6388\u6743\u7801\uFF0C\u4F46\u672C\u6B21\u767B\u5F55\u6CA1\u6709 PKCE code_verifier\uFF0C\u65E0\u6CD5\u6362\u53D6 token");
-    }
-    const deviceInfo = await buildTraeDeviceInfo(session, product);
-    const body = {
+  if (callback.refreshToken.length > 0) {
+    const exchangeBody = {
       ClientID: product.clientId,
-      AuthCode: callback.authCode,
-      CodeVerifier: session.codeVerifier,
-      DeviceInfo: deviceInfo,
-      IDEVersion: product.appVersion
-    };
-    exchange = await postTraeExchange(exchangeUrl, body, "", product, fetcher);
-  } else if (callback.refreshToken.length > 0) {
-    const deviceInfo = await buildTraeDeviceInfo(session, product);
-    const proof = session.deviceProof === void 0 ? void 0 : createTraeDeviceProof({
-      method: "POST",
-      path: TRAE_EXCHANGE_PATH,
-      clientId: product.clientId,
-      refreshToken: callback.refreshToken,
-      privateKeyPem: session.deviceProof.privateKeyPem
-    });
-    const body = {
-      ClientID: product.clientId,
-      // ⚠️ 客户端发的是空串（`ClientSecret:""`），不是 `'-'`。
-      ClientSecret: "",
       RefreshToken: callback.refreshToken,
-      DeviceInfo: deviceInfo,
-      ...proof === void 0 ? {} : { DeviceProof: proof },
-      IDEVersion: product.appVersion
+      ClientSecret: "-",
+      UserID: ""
     };
-    exchange = await postTraeExchange(exchangeUrl, body, "", product, fetcher);
+    const exchangeResp = await fetcher(`${product.oauthHost}${TRAE_EXCHANGE_PATH}`, {
+      method: "POST",
+      headers: traeOAuthHeaders(product),
+      body: JSON.stringify(exchangeBody),
+      signal: AbortSignal.timeout(TRAE_REQUEST_TIMEOUT_MS)
+    });
+    if (!exchangeResp.ok) {
+      const text = await exchangeResp.text().catch(() => "");
+      throw new Error(`TRAE ExchangeToken \u5931\u8D25\uFF08HTTP ${exchangeResp.status}\uFF09\uFF1A${text.length > 200 ? text.slice(0, 200) : text}`);
+    }
+    const parsed = parseTraeExchangeResponse(await exchangeResp.json());
+    if (parsed === void 0) throw new Error("TRAE ExchangeToken \u54CD\u5E94\u7F3A\u5C11 Token");
+    exchange = parsed;
   } else {
     exchange = {
       accessToken: callback.accessToken,
