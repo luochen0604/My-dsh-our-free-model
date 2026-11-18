@@ -38765,6 +38765,32 @@ function normalizeToolChoice(body) {
   }
   delete body.tool_choice;
 }
+function sanitizeTraeToolParameters(value) {
+  if (Array.isArray(value)) return value.map(sanitizeTraeToolParameters);
+  if (value === null || typeof value !== "object") return value;
+  const source = value;
+  const out = {};
+  for (const [key, raw] of Object.entries(source)) {
+    if (key === "allOf") continue;
+    out[key] = sanitizeTraeToolParameters(raw);
+  }
+  const combinators = source.allOf;
+  if (Array.isArray(combinators)) {
+    for (const item of combinators) {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+      const sub = sanitizeTraeToolParameters(item);
+      for (const [key, raw] of Object.entries(sub)) {
+        if (key === "required" && Array.isArray(out.required) && Array.isArray(raw)) {
+          out.required = [.../* @__PURE__ */ new Set([...out.required, ...raw])];
+        } else if (!(key in out)) {
+          out[key] = raw;
+        }
+      }
+    }
+  }
+  if ("pattern" in out && !("type" in out)) out.type = "string";
+  return out;
+}
 function normalizeTools(body) {
   const raw = body.tools;
   if (!Array.isArray(raw) || raw.length === 0) return;
@@ -38776,7 +38802,9 @@ function normalizeTools(body) {
     if (fn === void 0) continue;
     const params = fn.parameters;
     if (typeof params === "object" && params !== null) {
-      fn.parameters = JSON.stringify(params);
+      fn.parameters = JSON.stringify(
+        sanitizeTraeToolParameters(params)
+      );
     }
     out.push(t);
   }

@@ -970,6 +970,50 @@ async function verifySourceRegressions({ ctx, adapters, call, creds }) {
     console.log(`ok  source ${provider}: real host invariant/assembler, whitespace stop/tools/reasoning and preserved prose`)
   }
 
+  // trae 工具 schema 清洗：上游不认 allOf（4027 invalid JSON Schema，用户报障
+  // 2026-11-18），序列化前必须摊平。锁行为而非实现：
+  {
+    const trae = await import('../vendor/channel-pack/src/trae.ts')
+    const sanitized = trae.sanitizeTraeToolParameters({
+      type: 'object',
+      properties: {
+        expected_server_path: {
+          description: '绝对路径',
+          allOf: [{ pattern: '^[^\\x00]*$' }, { pattern: '^/' }],
+        },
+        path: { type: 'string', minLength: 1, allOf: [{ pattern: '^/w' }] },
+      },
+      required: ['path'],
+    })
+    assert.deepEqual(sanitized, {
+      type: 'object',
+      properties: {
+        // 无类型的 pattern 摊平后补 type:"string"，父级 description 保留。
+        expected_server_path: { description: '绝对路径', pattern: '^[^\\x00]*$', type: 'string' },
+        // 父级已有 type 时不会被子 schema 覆盖。
+        path: { type: 'string', minLength: 1, pattern: '^/w' },
+      },
+      required: ['path'],
+    }, 'allOf is flattened with parent keys winning')
+    // 端到端：transformToSOLOBody 后 parameters 必须是 JSON 字符串且不含 allOf。
+    const body = trae.transformToSOLOBody({
+      model: 'glm-5.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ type: 'function', function: { name: 'read', description: '', parameters: sanitized } }],
+    })
+    const fn = body.tools[0].function
+    assert.equal(typeof fn.parameters, 'string', 'parameters are serialized for SOLO')
+    assert.equal(JSON.parse(fn.parameters).properties.expected_server_path.allOf, undefined,
+      'no allOf survives serialization')
+    // required 并集：父子各有要求时合并去重，不丢任何一侧。
+    const unioned = trae.sanitizeTraeToolParameters({
+      required: ['a'],
+      allOf: [{ required: ['a', 'b'] }, { required: ['c'] }],
+    })
+    assert.deepEqual([...unioned.required].sort(), ['a', 'b', 'c'], 'required is unioned across allOf')
+    console.log('ok  source trae: tool parameter schemas are flattened (no allOf) before serialization')
+  }
+
   const { RaccoonAdapter } = await import('../vendor/channel-pack/src/raccoon-adapter.ts')
   const { LoomyAdapter } = await import('../vendor/channel-pack/src/loomy-adapter.ts')
   const { nextUtc8DayStartMs } = await import('../vendor/channel-pack/src/model-queue.ts')

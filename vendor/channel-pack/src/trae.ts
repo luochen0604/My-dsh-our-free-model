@@ -1662,11 +1662,73 @@ function normalizeToolChoice(body: Record<string, unknown>): void {
 }
 
 /**
+ * 清洗工具参数 schema 里的 `allOf` 组合器（递归摊平）。
+ *
+ * ## 为什么必须清洗（实测 4027，用户报障 2026-11-18）
+ *
+ * harness 下发的工具 schema 里，路径类参数常用这种形状：
+ *
+ * ```jsonc
+ * { "expected_server_path": { "allOf": [{ "pattern": "…" }, { "pattern": "^/" }] } }
+ * ```
+ *
+ * TRAE 上游对 `function.parameters` 做**严格 JSON Schema 校验**，不认 `allOf`
+ * （报 `…/allOf/1/pattern: invalid JSON Schema`，code=4027），整个请求被拒。
+ * `pattern`/`minLength` 这类常规键它本身是支持的 —— 拒的只是组合器。
+ *
+ * ⚠️ 本适配器从不自己造 schema —— `stream()` 原样透传
+ * `options.tools[].parameters`，脏数据来自上游 harness。但请求是我们发的，
+ * 只能在我们这一侧拦住（与 `sanitizeClineToolParameters` 同因同型）。
+ *
+ * ## 摊平规则
+ *
+ * - 父级键**优先**：子 schema 里的键只有在父级没有同名键时才并入
+ *   （两个 `pattern` 无法并存时保父级/先到的，语义近似）；
+ * - `required` 取**并集**（这是唯一语义可无损合并的组合键）；
+ * - 并入 `pattern` 后若仍无 `type`，补 `type: "string"` —— `pattern` 只约束
+ *   字符串，声明它不改变校验意图，却能避免上游对「无类型的 pattern」再报错；
+ * - 递归下钻：`properties` / `items` / 子 schema 里的嵌套 `allOf` 同罪。
+ */
+export function sanitizeTraeToolParameters(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeTraeToolParameters)
+  if (value === null || typeof value !== 'object') return value
+  const source = value as Record<string, unknown>
+  // 第一遍：父级自身的键（`allOf` 留到第二遍，保证父级键优先）。
+  const out: Record<string, unknown> = {}
+  for (const [key, raw] of Object.entries(source)) {
+    if (key === 'allOf') continue
+    out[key] = sanitizeTraeToolParameters(raw)
+  }
+  // 第二遍：把 `allOf` 子 schema 逐个并入父级。
+  const combinators = source.allOf
+  if (Array.isArray(combinators)) {
+    for (const item of combinators) {
+      if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
+      const sub = sanitizeTraeToolParameters(item) as Record<string, unknown>
+      for (const [key, raw] of Object.entries(sub)) {
+        if (key === 'required' && Array.isArray(out.required) && Array.isArray(raw)) {
+          out.required = [...new Set([...out.required, ...raw])]
+        } else if (!(key in out)) {
+          out[key] = raw
+        }
+      }
+    }
+  }
+  // `pattern` 只对字符串有意义：摊平后缺 `type` 就补上，避免上游对
+  // 「无类型的 pattern」再次拒绝（错误信息只说 invalid，不给这次机会）。
+  if ('pattern' in out && !('type' in out)) out.type = 'string'
+  return out
+}
+
+/**
  * tools.parameters 序列化。
  *
  * 对齐 Go 端 `normalizeTools`（`payload.go:160-193`）：
  * SOLO 上游要求 parameters 是 string 类型，OpenAI 标准是 object，
  * 因此须把 parameters 对象序列化为 JSON 字符串。
+ *
+ * ⚠️ 序列化前必须过 `sanitizeTraeToolParameters`：上游不认 `allOf`
+ * （见该函数注释），原样字符串化等于把拒绝原样发出去。
  */
 function normalizeTools(body: Record<string, unknown>): void {
   const raw = body.tools
@@ -1680,7 +1742,9 @@ function normalizeTools(body: Record<string, unknown>): void {
     if (fn === undefined) continue
     const params = fn.parameters
     if (typeof params === 'object' && params !== null) {
-      fn.parameters = JSON.stringify(params)
+      fn.parameters = JSON.stringify(
+        sanitizeTraeToolParameters(params as Record<string, unknown>),
+      )
     }
     out.push(t)
   }
