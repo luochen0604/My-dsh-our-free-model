@@ -513,6 +513,43 @@ export const DOUBAO_BLOCK = Object.freeze({
 })
 
 /**
+ * `patch_op[].patch_object` 的取值（实测）。
+ *
+ * | patch_object | 含义 | 位置 |
+ * |---|---|---|
+ * | `1` | 内容块（`content_block[]`） | `patch_value.content_block` |
+ * | `50` | **扩展元数据**（`ext`） | `patch_value.ext` |
+ *
+ * ⚠️ `patch_object=50` 的 `ext` 里带两个对网关至关重要的字段：
+ *
+ * | 字段 | 含义 | 用途 |
+ * |---|---|---|
+ * | `context_window_usage` | 输入 token 明细（JSON 字符串） | → `usage` 块 |
+ * | `finish_reason_chat` | 终止原因（如 `succeed:completion`） | → `finish` 块 |
+ *
+ * 没有这两个字段，适配器无法发出 `usage` / `finish` 块，
+ * 网关会报 `incomplete_stream` 502（见 `openai-gateway/stream.ts`）。
+ */
+export const DOUBAO_PATCH = Object.freeze({
+  /** 内容块 patch。 */
+  content: 1,
+  /** 扩展元数据 patch（带用量与终止原因）。 */
+  ext: 50,
+})
+
+/**
+ * `finish_reason_chat` 的取值与映射。
+ *
+ * 实测真实流里是 `succeed:completion`。映射到 DSH 的 `FinishReason`：
+ * `succeed:*` → `stop`（模型正常说完）；未知值一律回退 `stop`，
+ * 因为豆包的终止原因没有官方文档，宁可保守也不要误报 `max-tokens`。
+ */
+export const DOUBAO_FINISH_REASON = Object.freeze({
+  /** 正常说完。 */
+  completion: 'succeed:completion',
+})
+
+/**
  * 一帧对话流的**语义**解析结果。
  *
  * 与 `parseSseBlock`（只切 `event:` / `data:` 字段）不同，这里按实测的
@@ -532,6 +569,20 @@ export type DoubaoSseOutcome =
   | { kind: 'end'; endType: number; brief: string }
   /** 业务错误。 */
   | { kind: 'error'; code: number; message: string; payload: string }
+  /**
+   * **用量**（`StreamChunk` 的 `usage` 块）。
+   *
+   * ⚠️ 来自 `patch_object=50` 的 `ext.context_window_usage`。
+   * 不发这个块，网关的用量统计会缺失（`state.usage === undefined`）。
+   */
+  | { kind: 'usage'; inputTokens: number; totalWindowSize: number }
+  /**
+   * **终止原因**（`StreamChunk` 的 `finish` 块）。
+   *
+   * ⚠️ 来自 `patch_object=50` 的 `ext.finish_reason_chat`。
+   * 不发这个块，网关会抛 `incomplete_stream` 502 —— 每一次豆包调用都会失败。
+   */
+  | { kind: 'finish'; reason: 'stop' | 'max-tokens' }
 
 /** 安全 `JSON.parse`。 */
 function parseJsonOrUndefined(raw: string): unknown {
@@ -550,7 +601,7 @@ function stringField(source: unknown, key: string): string {
 }
 
 /**
- * 从 `STREAM_CHUNK` 的 `patch_op` 里抽取文本 / 思考 / 反问。
+ * 从 `STREAM_CHUNK` 的 `patch_op` 里抽取文本 / 思考 / 反问 / 用量 / 终止原因。
  *
  * 结构（实测）：
  *
@@ -584,6 +635,20 @@ function stringField(source: unknown, key: string): string {
  * 后果：若照抄参考实现的抑制规则，当 `CHUNK_DELTA` **先于**正文到达时
  * （顺序不保证），后续所有 `STREAM_CHUNK` 正文都会被丢掉 —— 用户只会收到
  * 一个句号或什么都没收到。故这里**不做抑制**，两个来源都作为增量追加。
+ *
+ * ## ⚠️ `patch_object=50` 的 `ext` patch（2026-11-19 新增）
+ *
+ * 真实流里还有一类 `patch_op`，其 `patch_value` 带的是 `ext`（不是
+ * `content_block`）：
+ *
+ * ```jsonc
+ * { "patch_op": [ { "patch_object": 50, "patch_value": { "ext": {
+ *     "context_window_usage": "{\"system_prompt\":6343,\"messages\":5601,\"skills\":0,\"tools\":32158,\"total_window_size\":256000}",
+ *     "finish_reason_chat": "succeed:completion" } } } ] }
+ * ```
+ *
+ * 这两个字段是 `usage` / `finish` 块的**唯一数据源**。没有它们，适配器无法
+ * 发出符合 `StreamChunk` 契约的终止块，网关会抛 `incomplete_stream` 502。
  */
 function collectStreamChunk(
   payload: unknown,
@@ -591,6 +656,8 @@ function collectStreamChunk(
     text: (value: string) => void
     reasoning: (value: string) => void
     clarify: (value: string[]) => void
+    usage: (inputTokens: number, totalWindowSize: number) => void
+    finish: (reason: 'stop' | 'max-tokens') => void
   },
 ): void {
   if (payload === null || typeof payload !== 'object') return
@@ -600,6 +667,59 @@ function collectStreamChunk(
     if (op === null || typeof op !== 'object') continue
     const value = (op as Record<string, unknown>)['patch_value']
     if (value === null || typeof value !== 'object') continue
+
+    // ── ext patch：用量与终止原因 ─────────────────────────────────────
+    const ext = (value as Record<string, unknown>)['ext']
+    if (ext !== null && typeof ext === 'object') {
+      const extRecord = ext as Record<string, unknown>
+
+      /**
+       * `context_window_usage` 是一段被转义的 JSON 字符串，形如：
+       * `{"system_prompt":6343,"messages":5601,"skills":0,"tools":32158,"total_window_size":256000}`
+       *
+       * ⚠️ 输入 token = 前四项之和（system_prompt + messages + skills + tools）。
+       * `total_window_size` 是窗口上限，不是用量。
+       *
+       * 不解析这个字段，`usage` 块就没数据；不发 `usage` 块，网关的用量
+       * 统计会缺失（`state.usage === undefined`）。
+       */
+      const usageRaw = stringField(extRecord, 'context_window_usage')
+      if (usageRaw.length > 0) {
+        const usageJson = parseJsonOrUndefined(usageRaw)
+        if (usageJson !== null && typeof usageJson === 'object') {
+          const usageRecord = usageJson as Record<string, unknown>
+          const sum = (key: string): number => {
+            const raw = usageRecord[key]
+            const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : 0
+            return Number.isFinite(n) && n > 0 ? n : 0
+          }
+          const inputTokens = sum('system_prompt') + sum('messages') + sum('skills') + sum('tools')
+          const totalWindowSize = sum('total_window_size')
+          if (inputTokens > 0 || totalWindowSize > 0) {
+            sink.usage(inputTokens, totalWindowSize)
+          }
+        }
+      }
+
+      /**
+       * `finish_reason_chat` 是终止原因，实测为 `succeed:completion`。
+       *
+       * ⚠️ 映射到 DSH 的 `FinishReason`：`succeed:*` → `stop`。
+       * 未知值一律回退 `stop` —— 豆包没有公开文档，宁可保守也不误报
+       * `max-tokens`（那会让宿主误以为是长度截断）。
+       */
+      const finishRaw = stringField(extRecord, 'finish_reason_chat')
+      if (finishRaw.length > 0) {
+        const reason = finishRaw.startsWith('succeed')
+          ? 'stop'
+          : /max|length|token/i.test(finishRaw)
+            ? 'max-tokens'
+            : 'stop'
+        sink.finish(reason)
+      }
+    }
+
+    // ── 内容块 patch ──────────────────────────────────────────────────
     const blocks = (value as Record<string, unknown>)['content_block']
     if (!Array.isArray(blocks)) continue
     for (const block of blocks) {
@@ -686,16 +806,25 @@ export function parseDoubaoSseFrame(
     let text = ''
     let reasoning = ''
     let clarify: string[] = []
+    let usage: { inputTokens: number; totalWindowSize: number } | undefined
+    let finish: 'stop' | 'max-tokens' | undefined
     collectStreamChunk(data, {
       text: (value) => { text += value },
       reasoning: (value) => { reasoning += value },
       clarify: (value) => { clarify = value },
+      usage: (inputTokens, totalWindowSize) => { usage = { inputTokens, totalWindowSize } },
+      finish: (reason) => { finish = reason },
     })
-    // 一帧里三种块的优先级：反问 > 正文 > 思考。
-    // 反问必须最先回，否则用户只看到引导语就去等收尾了。
+    // 一帧里多种块的优先级：反问 > 正文 > 思考 > 用量 > 终止原因。
+    //
+    // ⚠️ 反问必须最先回：它意味着豆包已暂停等回答，调用方要立即收尾。
+    // 用量与终止原因排最后：它们来自 `patch_object=50` 的 `ext` patch，
+    // 通常单独成帧（与内容块不在同一帧），但若同帧出现也不该抢占内容。
     if (clarify.length > 0) return { kind: 'clarify', questions: clarify }
     if (text.length > 0) return { kind: 'text', text }
     if (reasoning.length > 0) return { kind: 'reasoning', text: reasoning }
+    if (usage !== undefined) return { kind: 'usage', ...usage }
+    if (finish !== undefined) return { kind: 'finish', reason: finish }
     return undefined
   }
 

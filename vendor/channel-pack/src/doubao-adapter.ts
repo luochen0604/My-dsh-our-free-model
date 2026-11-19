@@ -561,6 +561,30 @@ export class DoubaoAdapter extends LlmAdapter {
     let firstFrameAt = 0
     let lastFrameAt = 0
 
+    /**
+     * 用量（`StreamChunk` 的 `usage` 块）。
+     *
+     * ⚠️ **2026-11-19 补发**：此前适配器从不发出 `usage` 块。网关的
+     * `consumeChunk` 把 `usage` 存入 `state.usage`，收流结束后用它生成
+     * OpenAI 的 `usage` 字段。缺它 → 下游拿到的每次调用都没有用量统计。
+     *
+     * 数据源：`patch_object=50` 的 `ext.context_window_usage`（实测帧）。
+     */
+    let usage: { inputTokens: number; totalWindowSize: number } | undefined
+
+    /**
+     * 终止原因（`StreamChunk` 的 `finish` 块）。
+     *
+     * ⚠️ **2026-11-19 补发（最关键）**：此前适配器从不发出 `finish` 块。
+     * 网关在收流结束后检查 `state.finishReason === undefined`，是的话
+     * 直接抛 `incomplete_stream` 502 —— **意味着通过网关的每一次豆包调用
+     * 都会失败**，无论上游是否成功返回了正文。
+     *
+     * 数据源：`patch_object=50` 的 `ext.finish_reason_chat`（实测帧）。
+     * 服务端没给时回退 `'stop'`（豆包正常说完就是 stop）。
+     */
+    let finishReason: 'stop' | 'max-tokens' | undefined
+
     /** 收尾：把还开着的块关掉（先 reasoning 后 text，与开启顺序相反）。 */
     const closeBlocks = function* closeBlocks(): Generator<StreamChunk> {
       if (sawReasoning) {
@@ -682,6 +706,19 @@ export class DoubaoAdapter extends LlmAdapter {
             continue
           }
 
+          // parsed.kind === 'usage'：记录用量，收流时统一发出。
+          // 不在此 yield，因为 `usage` 必须排在所有内容块之后、`finish` 之前。
+          if (parsed.kind === 'usage') {
+            usage = { inputTokens: parsed.inputTokens, totalWindowSize: parsed.totalWindowSize }
+            continue
+          }
+
+          // parsed.kind === 'finish'：记录终止原因，收流时统一发出。
+          if (parsed.kind === 'finish') {
+            finishReason = parsed.reason
+            continue
+          }
+
           // parsed.kind === 'text'
           if (parsed.text.length === 0) continue
           if (!sawText) {
@@ -718,7 +755,33 @@ export class DoubaoAdapter extends LlmAdapter {
         )
       }
 
+      /**
+       * 先关内容块，再发 `usage` 与 `finish`。
+       *
+       * ⚠️ 顺序必须严格：`StreamChunk` 契约要求「`usage` 在终止 `finish`
+       * 之前，且 `finish` 之后不得再有内容块」。网关的 `consumeChunk` 也按
+       * 这个顺序处理：`block-end` → `usage` → `finish`。
+       *
+       * 终止原因**必须发**：网关在收流结束后检查 `state.finishReason`，
+       * 缺失就抛 `incomplete_stream` 502。服务端没给 `finish_reason_chat`
+       * 时回退 `'stop'`（豆包正常说完就是 stop）。
+       *
+       * 用量**有就发**：服务端给了 `context_window_usage` 就发，没给就不发
+       * （网关只是跳过 `usage` 字段，不报错）。
+       */
       yield* closeBlocks()
+
+      if (usage !== undefined) {
+        yield {
+          type: 'usage',
+          usage: {
+            inputTokens: usage.inputTokens,
+            outputTokens: 0,
+            totalTokens: usage.inputTokens,
+          },
+        }
+      }
+      yield { type: 'finish', reason: { kind: finishReason ?? 'stop' } }
     } finally {
       try {
         await reader.cancel()

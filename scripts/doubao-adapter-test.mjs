@@ -122,7 +122,9 @@ function summarize(chunks) {
   const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join('')
   const starts = chunks.filter((c) => c.type === 'block-start').map((c) => `${c.blockType}#${c.index}`)
   const ends = chunks.filter((c) => c.type === 'block-end').map((c) => `#${c.index}`)
-  return { text, reasoning, starts, ends }
+  const usage = chunks.find((c) => c.type === 'usage')?.usage
+  const finish = chunks.find((c) => c.type === 'finish')?.reason
+  return { text, reasoning, starts, ends, usage, finish }
 }
 
 export async function verifyDoubaoAdapter() {
@@ -342,6 +344,135 @@ export async function verifyDoubaoAdapter() {
     assert.equal(requests[1].body.client_meta.conversation_id, '',
       '不同 DSH 会话之间不得串用豆包会话')
     console.log('ok  adapter: conversation cache is isolated per DSH session')
+  }
+
+  // ── 12. **必须发 `finish` 块**（否则网关抛 incomplete_stream 502） ──────
+  {
+    /**
+     * ⚠️ **2026-11-19 关键修复**：此前适配器从不发出 `finish` 块。
+     *
+     * 网关的 `consumeChunk` 在收流结束后检查 `state.finishReason`：
+     * 缺失就抛 `incomplete_stream` 502（见 `openai-gateway/stream.ts`）。
+     * 这意味着通过网关的**每一次**豆包调用都会失败，无论上游是否成功。
+     *
+     * 这里断言：即使上游只给了普通正文（没有 `finish_reason_chat`），
+     * 适配器也必须回退发 `stop`。
+     */
+    const { run } = await makeAdapter([ack('conv-H') + delta('回答') + end()])
+    const summary = summarize(await run())
+    assert.equal(summary.finish?.kind, 'stop',
+      '必须发 finish 块（kind=stop），否则网关抛 incomplete_stream 502')
+    console.log('ok  adapter: always emits a finish chunk (gateway requires it)')
+  }
+
+  // ── 13. 用量：服务端给了 context_window_usage 就发 `usage` 块 ──────────
+  {
+    /**
+     * 数据源：`patch_object=50` 的 `ext.context_window_usage`（实测帧）。
+     * 不发 `usage` 块，网关的用量统计会缺失（`state.usage === undefined`）。
+     */
+    const extFrame = frame('STREAM_CHUNK', {
+      patch_op: [{
+        patch_object: 50,
+        patch_value: {
+          ext: {
+            context_window_usage: JSON.stringify({
+              system_prompt: 6343,
+              messages: 5601,
+              skills: 0,
+              tools: 32158,
+              total_window_size: 256000,
+            }),
+          },
+        },
+      }],
+    })
+    const { run } = await makeAdapter([ack('conv-I') + delta('回答') + extFrame + end()])
+    const summary = summarize(await run())
+    assert.equal(summary.usage?.inputTokens, 6343 + 5601 + 0 + 32158,
+      'inputTokens = system_prompt + messages + skills + tools')
+    assert.equal(summary.usage?.totalTokens, summary.usage.inputTokens,
+      'totalTokens 应等于 inputTokens（豆包不单独给输出 token）')
+    console.log('ok  adapter: emits usage chunk from context_window_usage')
+  }
+
+  // ── 14. 用量与终止原因的发出顺序：block-end → usage → finish ───────────
+  {
+    /**
+     * `StreamChunk` 契约要求：`usage` 在终止 `finish` 之前，
+     * 且 `finish` 之后不得再有内容块。
+     *
+     * 这里检查三个块的相对顺序。
+     */
+    const extFrame = frame('STREAM_CHUNK', {
+      patch_op: [{
+        patch_object: 50,
+        patch_value: {
+          ext: {
+            context_window_usage: JSON.stringify({ system_prompt: 100, messages: 50, total_window_size: 256000 }),
+            finish_reason_chat: 'succeed:completion',
+          },
+        },
+      }],
+    })
+    const { run } = await makeAdapter([ack('conv-J') + delta('回答') + extFrame + end()])
+    const chunks = await run()
+
+    const endIndex = chunks.findIndex((c) => c.type === 'block-end')
+    const usageIndex = chunks.findIndex((c) => c.type === 'usage')
+    const finishIndex = chunks.findIndex((c) => c.type === 'finish')
+
+    assert.ok(endIndex >= 0, '必须有 block-end')
+    assert.ok(usageIndex >= 0, '必须有 usage')
+    assert.ok(finishIndex >= 0, '必须有 finish')
+    assert.ok(endIndex < usageIndex, 'block-end 必须在 usage 之前')
+    assert.ok(usageIndex < finishIndex, 'usage 必须在 finish 之前')
+    // finish 之后不得再有内容块。
+    const afterFinish = chunks.slice(finishIndex + 1)
+    assert.equal(
+      afterFinish.filter((c) => c.type === 'text-delta' || c.type === 'block-start' || c.type === 'block-end').length,
+      0,
+      'finish 之后不得再有内容块',
+    )
+    console.log('ok  adapter: usage and finish are emitted after block-end, in contract order')
+  }
+
+  // ── 15. finish_reason_chat 映射：succeed:* → stop ──────────────────────
+  {
+    const extFrame = frame('STREAM_CHUNK', {
+      patch_op: [{
+        patch_object: 50,
+        patch_value: {
+          ext: { finish_reason_chat: 'succeed:completion' },
+        },
+      }],
+    })
+    const { run } = await makeAdapter([ack('conv-K') + delta('回答') + extFrame + end()])
+    const summary = summarize(await run())
+    assert.equal(summary.finish?.kind, 'stop',
+      'finish_reason_chat=succeed:completion 必须映射为 stop')
+    console.log('ok  adapter: finish_reason_chat maps to stop')
+  }
+
+  // ── 16. 服务端没给 finish_reason_chat 时回退 stop ───────────────────────
+  {
+    /**
+     * 豆包没有公开文档说明终止原因的取值。未知值一律回退 `stop`，
+     * 宁可保守也不误报 `max-tokens`（那会让宿主误以为是长度截断）。
+     */
+    const extFrame = frame('STREAM_CHUNK', {
+      patch_op: [{
+        patch_object: 50,
+        patch_value: {
+          ext: { finish_reason_chat: 'unknown_value' },
+        },
+      }],
+    })
+    const { run } = await makeAdapter([ack('conv-L') + delta('回答') + extFrame + end()])
+    const summary = summarize(await run())
+    assert.equal(summary.finish?.kind, 'stop',
+      '未知 finish_reason_chat 必须回退 stop，不误报 max-tokens')
+    console.log('ok  adapter: unknown finish_reason_chat falls back to stop')
   }
 
   console.log('doubao-adapter: all assertions passed')

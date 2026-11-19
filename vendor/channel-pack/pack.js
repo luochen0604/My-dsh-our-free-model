@@ -42356,6 +42356,16 @@ var DOUBAO_BLOCK = Object.freeze({
   /** 工作模式反问块（豆包暂停执行、等用户补充信息）。 */
   interactionAsk: 10082
 });
+var DOUBAO_PATCH = Object.freeze({
+  /** 内容块 patch。 */
+  content: 1,
+  /** 扩展元数据 patch（带用量与终止原因）。 */
+  ext: 50
+});
+var DOUBAO_FINISH_REASON = Object.freeze({
+  /** 正常说完。 */
+  completion: "succeed:completion"
+});
 function parseJsonOrUndefined(raw) {
   try {
     return JSON.parse(raw);
@@ -42376,6 +42386,32 @@ function collectStreamChunk(payload, sink) {
     if (op === null || typeof op !== "object") continue;
     const value = op["patch_value"];
     if (value === null || typeof value !== "object") continue;
+    const ext = value["ext"];
+    if (ext !== null && typeof ext === "object") {
+      const extRecord = ext;
+      const usageRaw = stringField(extRecord, "context_window_usage");
+      if (usageRaw.length > 0) {
+        const usageJson3 = parseJsonOrUndefined(usageRaw);
+        if (usageJson3 !== null && typeof usageJson3 === "object") {
+          const usageRecord = usageJson3;
+          const sum = (key) => {
+            const raw = usageRecord[key];
+            const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : 0;
+            return Number.isFinite(n) && n > 0 ? n : 0;
+          };
+          const inputTokens = sum("system_prompt") + sum("messages") + sum("skills") + sum("tools");
+          const totalWindowSize = sum("total_window_size");
+          if (inputTokens > 0 || totalWindowSize > 0) {
+            sink.usage(inputTokens, totalWindowSize);
+          }
+        }
+      }
+      const finishRaw = stringField(extRecord, "finish_reason_chat");
+      if (finishRaw.length > 0) {
+        const reason = finishRaw.startsWith("succeed") ? "stop" : /max|length|token/i.test(finishRaw) ? "max-tokens" : "stop";
+        sink.finish(reason);
+      }
+    }
     const blocks = value["content_block"];
     if (!Array.isArray(blocks)) continue;
     for (const block of blocks) {
@@ -42434,6 +42470,8 @@ function parseDoubaoSseFrame(frame) {
     let text = "";
     let reasoning = "";
     let clarify = [];
+    let usage;
+    let finish;
     collectStreamChunk(data, {
       text: (value) => {
         text += value;
@@ -42443,11 +42481,19 @@ function parseDoubaoSseFrame(frame) {
       },
       clarify: (value) => {
         clarify = value;
+      },
+      usage: (inputTokens, totalWindowSize) => {
+        usage = { inputTokens, totalWindowSize };
+      },
+      finish: (reason) => {
+        finish = reason;
       }
     });
     if (clarify.length > 0) return { kind: "clarify", questions: clarify };
     if (text.length > 0) return { kind: "text", text };
     if (reasoning.length > 0) return { kind: "reasoning", text: reasoning };
+    if (usage !== void 0) return { kind: "usage", ...usage };
+    if (finish !== void 0) return { kind: "finish", reason: finish };
     return void 0;
   }
   if (event === DOUBAO_SSE.ack) {
@@ -43782,6 +43828,8 @@ var DoubaoAdapter = class _DoubaoAdapter extends LlmAdapter7 {
     let sectionId = resume?.sectionId ?? "";
     let firstFrameAt = 0;
     let lastFrameAt = 0;
+    let usage;
+    let finishReason2;
     const closeBlocks = function* closeBlocks2() {
       if (sawReasoning) {
         yield { type: "block-end", index: reasoningIndex, block: { type: "reasoning", text: "" } };
@@ -43850,6 +43898,14 @@ var DoubaoAdapter = class _DoubaoAdapter extends LlmAdapter7 {
             yield { type: "reasoning-delta", index: reasoningIndex, text: parsed.text };
             continue;
           }
+          if (parsed.kind === "usage") {
+            usage = { inputTokens: parsed.inputTokens, totalWindowSize: parsed.totalWindowSize };
+            continue;
+          }
+          if (parsed.kind === "finish") {
+            finishReason2 = parsed.reason;
+            continue;
+          }
           if (parsed.text.length === 0) continue;
           if (!sawText) {
             sawText = true;
@@ -43873,6 +43929,17 @@ var DoubaoAdapter = class _DoubaoAdapter extends LlmAdapter7 {
         );
       }
       yield* closeBlocks();
+      if (usage !== void 0) {
+        yield {
+          type: "usage",
+          usage: {
+            inputTokens: usage.inputTokens,
+            outputTokens: 0,
+            totalTokens: usage.inputTokens
+          }
+        };
+      }
+      yield { type: "finish", reason: { kind: finishReason2 ?? "stop" } };
     } finally {
       try {
         await reader.cancel();
